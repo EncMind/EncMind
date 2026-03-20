@@ -1,0 +1,27 @@
+[skill]
+name = "web-watch"
+version = "0.1.0"
+description = "Monitor web pages for changes and notify on updates"
+host_abi = "v1"
+
+[capabilities]
+net_outbound = ["*"]
+kv = true
+emit_events = ["web_watch.changed"]
+
+[tool]
+name = "web_watch"
+description = "Manage web page monitors. Actions: add (url + interval_minutes), remove (url), list, check (url)"
+parameters = { type = "object", properties = { action = { type = "string", enum = ["add", "remove", "list", "check"] }, url = { type = "string" }, interval_minutes = { type = "integer" } }, required = ["action"] }
+
+[[schedule.timers]]
+name = "poll_watches"
+interval_secs = 300
+export_fn = "__timer_poll"
+description = "Poll all watched URLs for changes"
+
+[resources]
+max_fuel_per_invocation = 500000000
+max_wall_clock_ms = 30000
+max_invocations_per_minute = 60
+max_concurrent = 1

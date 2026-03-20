@@ -1,0 +1,10 @@
+[skill]
+name = "plugin-smoke-javy"
+version = "0.1.0"
+description = "Smoke test exercising Javy ABI tool-only path"
+host_abi = "javy"
+
+[tool]
+name = "smoke_javy"
+description = "Echo/uppercase/reverse tool via Javy ABI"
+parameters = { type = "object", properties = { message = { type = "string" }, mode = { type = "string" } } }

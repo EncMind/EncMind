@@ -1,0 +1,26 @@
+[package]
+name = "encmind-llm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+encmind-core = { path = "../core" }
+
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+wiremock = "0.6"
+tokio = { workspace = true, features = ["test-util"] }

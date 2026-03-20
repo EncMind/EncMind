@@ -1,0 +1,19 @@
+[package]
+name = "encmind-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Ed25519 keypairs, device IDs, nonce challenges, and pairing codes for EncMind"
+
+[dependencies]
+ed25519-dalek = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
+hex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

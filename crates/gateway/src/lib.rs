@@ -1,0 +1,29 @@
+pub mod approval;
+pub mod budget;
+pub mod channel_manager;
+pub mod device_auth;
+pub mod dispatch;
+pub mod handlers;
+pub mod idempotency;
+pub mod local_tool_handler;
+pub mod local_tool_policy;
+pub mod mdns;
+pub mod node;
+pub mod node_command_handler;
+pub mod node_ws;
+pub mod pairing;
+pub mod plugin_api;
+pub mod plugin_manager;
+pub mod protocol;
+pub mod rate_limiter;
+pub mod routes;
+pub mod server;
+pub mod skill_timer;
+pub mod state;
+pub mod tls;
+pub mod tls_listener;
+pub mod wasm_channel_transform;
+pub mod ws;
+
+#[cfg(test)]
+pub(crate) mod test_utils;

@@ -1,0 +1,10 @@
+[skill]
+name = "echo-ts"
+version = "0.1.0"
+description = "Example TypeScript skill demonstrating the Javy ABI"
+host_abi = "javy"
+
+[tool]
+name = "echo_ts"
+description = "Echoes back the input as JSON"
+parameters = { type = "object", properties = { message = { type = "string" } } }

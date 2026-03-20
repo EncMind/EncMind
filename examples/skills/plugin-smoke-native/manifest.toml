@@ -1,0 +1,51 @@
+[skill]
+name = "plugin-smoke-native"
+version = "0.1.0"
+description = "Smoke test exercising all Native ABI plugin capabilities"
+host_abi = "v1"
+
+[tool]
+name = "smoke_native"
+description = "Multi-mode smoke test tool. Pass {\"mode\": \"...\"} to select behavior."
+parameters = { type = "object", properties = { mode = { type = "string" }, key = { type = "string" }, value = { type = "string" }, url = { type = "string" } } }
+
+[output]
+schema = { type = "object", required = ["result"], properties = { result = { type = "string" } } }
+
+[capabilities]
+net_outbound = ["example.com"]
+kv = true
+prompt_user = true
+emit_events = ["smoke.test"]
+hooks = ["before_tool_call", "after_tool_call"]
+
+[config]
+required_keys = ["mode"]
+
+[hooks]
+before_tool_call = "__on_before_tool"
+after_tool_call = "__on_after_tool"
+
+[[schedule.timers]]
+name = "heartbeat_ok"
+interval_secs = 60
+export_fn = "__on_heartbeat_ok"
+description = "Healthy heartbeat: increments KV counter and logs"
+
+[[schedule.timers]]
+name = "heartbeat_fail"
+interval_secs = 60
+export_fn = "__on_heartbeat_fail"
+description = "Intentional failure for auto-disable testing"
+
+[[schedule.transforms]]
+channel = "telegram"
+inbound_fn = "__transform_inbound"
+outbound_fn = "__transform_outbound"
+priority = 10
+
+[resources]
+max_fuel_per_invocation = 5000000
+max_wall_clock_ms = 10000
+max_invocations_per_minute = 60
+max_concurrent = 2

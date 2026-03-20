@@ -1,0 +1,10 @@
+[skill]
+name = "echo-rust"
+version = "0.1.0"
+description = "Example Rust skill demonstrating the Native ABI"
+host_abi = "v1"
+
+[tool]
+name = "echo_rust"
+description = "Echoes back the input as JSON"
+parameters = { type = "object", properties = { message = { type = "string" } } }

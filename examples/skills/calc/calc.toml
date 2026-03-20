@@ -1,0 +1,16 @@
+[skill]
+name = "calc"
+version = "0.1.0"
+description = "Precise calculator with unit conversion and date math"
+host_abi = "javy"
+
+[tool]
+name = "calculate"
+description = "Evaluate math expressions, convert units, or compute date differences. Examples: '15% of 847.50', '100 km to miles', 'days between 2024-01-15 and 2024-12-31', '(3.14 * 25^2) / 2'"
+parameters = { type = "object", properties = { expression = { type = "string" } }, required = ["expression"] }
+
+[resources]
+max_fuel_per_invocation = 10000000
+max_wall_clock_ms = 10000
+max_invocations_per_minute = 120
+max_concurrent = 4

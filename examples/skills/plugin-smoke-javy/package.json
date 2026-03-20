@@ -1,0 +1,11 @@
+{
+  "name": "plugin-smoke-javy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@encmind/skill-sdk",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for building EncMind WASM skills",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "default": "./dist/types.js"
+    }
+  },
+  "scripts": {
+    "build": "node -e \"const fs=require('node:fs');const p='./node_modules/typescript/bin/tsc';if(!fs.existsSync(p)){console.error('Missing local TypeScript. Run: npm -C sdk/typescript install');process.exit(1)}\" && node ./node_modules/typescript/bin/tsc",
+    "test": "node --test --experimental-default-type=module --experimental-strip-types tests/runtime.test.js tests/exports-map.test.js",
+    "test:build": "npm run build --silent && node --test --experimental-default-type=module tests/runtime.with-dist.test.js"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

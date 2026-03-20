@@ -1,0 +1,61 @@
+[package]
+name = "encmind-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "axum HTTP/WS gateway server with device pairing, TLS, and node protocol for EncMind"
+
+[features]
+default = ["qdrant"]
+qdrant = ["encmind-memory/qdrant"]
+
+[dependencies]
+encmind-core = { path = "../core" }
+encmind-edge = { path = "../local-client" }
+encmind-tee = { path = "../tee" }
+encmind-storage = { path = "../storage" }
+encmind-agent = { path = "../agent" }
+encmind-crypto = { path = "../crypto" }
+encmind-llm = { path = "../llm" }
+encmind-memory = { path = "../memory" }
+encmind-channels = { path = "../channels" }
+encmind-browser = { path = "../browser" }
+encmind-wasm-host = { path = "../wasm-host" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonschema = { workspace = true }
+chrono = { workspace = true }
+ulid = { workspace = true }
+rcgen = { workspace = true }
+arc-swap = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+rusqlite = { workspace = true }
+mdns-sd = { workspace = true }
+wasmtime = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+subtle = "2.6"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+encmind-storage = { path = "../storage", features = ["test-helpers"] }
+encmind-crypto = { path = "../crypto" }
+hex = { workspace = true }

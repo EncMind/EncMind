@@ -1,0 +1,40 @@
+[package]
+name = "encmind-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CLI binary for EncMind"
+
+[[bin]]
+name = "encmind-core"
+path = "src/main.rs"
+
+[dependencies]
+encmind-core = { path = "../core" }
+encmind-tee = { path = "../tee" }
+encmind-storage = { path = "../storage" }
+encmind-llm = { path = "../llm" }
+encmind-agent = { path = "../agent" }
+encmind-gateway = { path = "../gateway" }
+encmind-memory = { path = "../memory" }
+encmind-wasm-host = { path = "../wasm-host" }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_yml = { workspace = true }
+serde_json = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+wasmtime = { workspace = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+chrono = { workspace = true }
+flate2 = "1"
+tar = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }

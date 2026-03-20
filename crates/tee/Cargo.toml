@@ -1,0 +1,14 @@
+[package]
+name = "encmind-tee"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TEE (Trusted Execution Environment) detection and key sealing for EncMind"
+
+[dependencies]
+encmind-core = { path = "../core" }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }

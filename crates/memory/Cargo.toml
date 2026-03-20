@@ -1,0 +1,35 @@
+[package]
+name = "encmind-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Long-term memory: embeddings, vector search, FTS5, hybrid retrieval, and quality gates for EncMind"
+
+[features]
+default = []
+qdrant = ["dep:qdrant-client", "dep:uuid"]
+
+[dependencies]
+encmind-core = { path = "../core" }
+encmind-storage = { path = "../storage" }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+ulid = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
+r2d2 = { workspace = true }
+r2d2_sqlite = { workspace = true }
+rusqlite = { workspace = true }
+rand = { workspace = true }
+qdrant-client = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+encmind-storage = { path = "../storage", features = ["test-helpers"] }

@@ -1,0 +1,30 @@
+[package]
+name = "encmind-wasm-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+encmind-core = { path = "../core" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+r2d2.workspace = true
+r2d2_sqlite.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+url.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros"] }

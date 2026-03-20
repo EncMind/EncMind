@@ -1,0 +1,41 @@
+[package]
+name = "encmind-edge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Local client for discovering, pairing with, and connecting to the EncMind gateway"
+
+[lib]
+name = "encmind_edge_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "encmind-edge"
+path = "src/main.rs"
+
+[dependencies]
+encmind-crypto = { path = "../crypto" }
+ed25519-dalek = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+mdns-sd = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+libc = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros"] }
+rcgen = { workspace = true }
