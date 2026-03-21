@@ -14,6 +14,7 @@ pub mod node_ws;
 pub mod pairing;
 pub mod plugin_api;
 pub mod plugin_manager;
+pub mod plugins;
 pub mod protocol;
 pub mod rate_limiter;
 pub mod routes;

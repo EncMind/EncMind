@@ -322,6 +322,19 @@ impl AppConfig {
             }
         }
 
+        if let Some(raw_netprobe) = self.plugins.get("netprobe") {
+            match serde_json::from_value::<NetProbeConfig>(raw_netprobe.clone()) {
+                Ok(netprobe) => {
+                    if let Err(e) = netprobe.validate() {
+                        errors.push(e);
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("plugins.netprobe config is invalid: {e}"));
+                }
+            }
+        }
+
         errors
     }
 }
@@ -1424,6 +1437,111 @@ impl Default for BrowserConfig {
             max_actions_per_call: default_max_actions_per_call(),
             upload_root: None,
         }
+    }
+}
+
+// ── NetProbe (web search & fetch) ─────────────────────────────────
+
+/// Search provider backend for `netprobe_search`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchProvider {
+    #[default]
+    Tavily,
+    Brave,
+    Searxng,
+}
+
+/// Configuration for the NetProbe plugin (web search + URL fetch).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NetProbeConfig {
+    /// Whether NetProbe tools are registered.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Search provider to use.
+    #[serde(default)]
+    pub provider: SearchProvider,
+    /// Name of the environment variable holding the provider API key.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Base URL for a self-hosted SearXNG instance.
+    #[serde(default)]
+    pub searxng_url: Option<String>,
+    /// Whether to synthesize a concise answer from search results via LLM.
+    #[serde(default = "default_true")]
+    pub synthesize: bool,
+    /// Maximum bytes to fetch per URL (default 512 KiB).
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+    /// Maximum number of redirect hops to follow (default 5).
+    #[serde(default = "default_max_redirects")]
+    pub max_redirects: usize,
+}
+
+fn default_max_fetch_bytes() -> usize {
+    524_288
+}
+
+fn default_max_redirects() -> usize {
+    5
+}
+
+const NETPROBE_MAX_REDIRECTS_UPPER_BOUND: usize = 20;
+
+impl Default for NetProbeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            provider: SearchProvider::default(),
+            api_key_env: None,
+            searxng_url: None,
+            synthesize: true,
+            max_fetch_bytes: default_max_fetch_bytes(),
+            max_redirects: default_max_redirects(),
+        }
+    }
+}
+
+impl NetProbeConfig {
+    /// Validate the config, returning an error string if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_fetch_bytes == 0 {
+            return Err("netprobe: max_fetch_bytes must be > 0".to_string());
+        }
+        if self.max_redirects == 0 {
+            return Err("netprobe: max_redirects must be > 0".to_string());
+        }
+        if self.max_redirects > NETPROBE_MAX_REDIRECTS_UPPER_BOUND {
+            return Err(format!(
+                "netprobe: max_redirects must be <= {NETPROBE_MAX_REDIRECTS_UPPER_BOUND}"
+            ));
+        }
+
+        if self.provider == SearchProvider::Searxng {
+            let raw_url = self
+                .searxng_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    "netprobe: searxng provider requires searxng_url to be set".to_string()
+                })?;
+
+            let parsed = url::Url::parse(raw_url)
+                .map_err(|e| format!("netprobe: invalid searxng_url '{raw_url}': {e}"))?;
+            match parsed.scheme() {
+                "http" | "https" => {}
+                other => {
+                    return Err(format!(
+                        "netprobe: searxng_url scheme '{other}' is not supported (use http/https)"
+                    ))
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3095,6 +3213,46 @@ plugin_policy:
     }
 
     #[test]
+    fn validate_rejects_invalid_netprobe_plugin_config() {
+        let mut config = valid_config();
+        config.plugins.insert(
+            "netprobe".to_string(),
+            serde_json::json!({
+                "provider": "searxng"
+            }),
+        );
+
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("searxng provider requires searxng_url")),
+            "expected netprobe searxng validation error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_netprobe_plugin_config() {
+        let mut config = valid_config();
+        config.plugins.insert(
+            "netprobe".to_string(),
+            serde_json::json!({
+                "provider": true
+            }),
+        );
+
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("plugins.netprobe config is invalid")),
+            "expected netprobe parse validation error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
     fn gmail_config_auto_reply_defaults_to_false() {
         let cfg = GmailConfig::default();
         assert!(!cfg.auto_reply);
@@ -3270,6 +3428,118 @@ access_policy:
         assert_eq!(back.domain_allowlist, vec!["example.com"]);
         assert!(back.eval_enabled);
         assert_eq!(back.max_actions_per_call, 1);
+    }
+
+    #[test]
+    fn netprobe_config_defaults() {
+        let config = NetProbeConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.provider, SearchProvider::Tavily);
+        assert!(config.synthesize);
+        assert_eq!(config.max_fetch_bytes, 524_288);
+        assert_eq!(config.max_redirects, 5);
+        assert!(config.api_key_env.is_none());
+        assert!(config.searxng_url.is_none());
+    }
+
+    #[test]
+    fn netprobe_config_searxng_requires_url() {
+        let config = NetProbeConfig {
+            provider: SearchProvider::Searxng,
+            searxng_url: None,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+
+        let config_ok = NetProbeConfig {
+            provider: SearchProvider::Searxng,
+            searxng_url: Some("http://localhost:8888".into()),
+            ..Default::default()
+        };
+        assert!(config_ok.validate().is_ok());
+    }
+
+    #[test]
+    fn netprobe_config_disabled_skips_provider_specific_validation() {
+        let disabled = NetProbeConfig {
+            enabled: false,
+            provider: SearchProvider::Searxng,
+            searxng_url: None,
+            ..Default::default()
+        };
+        assert!(disabled.validate().is_ok());
+    }
+
+    #[test]
+    fn netprobe_config_rejects_invalid_numeric_limits() {
+        let zero_fetch = NetProbeConfig {
+            max_fetch_bytes: 0,
+            ..Default::default()
+        };
+        assert!(zero_fetch.validate().is_err());
+
+        let zero_redirects = NetProbeConfig {
+            max_redirects: 0,
+            ..Default::default()
+        };
+        assert!(zero_redirects.validate().is_err());
+
+        let too_many_redirects = NetProbeConfig {
+            max_redirects: NETPROBE_MAX_REDIRECTS_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        assert!(too_many_redirects.validate().is_err());
+    }
+
+    #[test]
+    fn netprobe_config_searxng_url_must_be_http_or_https() {
+        let invalid_scheme = NetProbeConfig {
+            provider: SearchProvider::Searxng,
+            searxng_url: Some("ftp://localhost:8888".into()),
+            ..Default::default()
+        };
+        assert!(invalid_scheme.validate().is_err());
+
+        let invalid_url = NetProbeConfig {
+            provider: SearchProvider::Searxng,
+            searxng_url: Some("not a url".into()),
+            ..Default::default()
+        };
+        assert!(invalid_url.validate().is_err());
+    }
+
+    #[test]
+    fn netprobe_config_serde_roundtrip() {
+        let config = NetProbeConfig {
+            enabled: false,
+            provider: SearchProvider::Brave,
+            api_key_env: Some("BRAVE_API_KEY".into()),
+            searxng_url: None,
+            synthesize: false,
+            max_fetch_bytes: 1_048_576,
+            max_redirects: 3,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: NetProbeConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.enabled);
+        assert_eq!(back.provider, SearchProvider::Brave);
+        assert!(!back.synthesize);
+        assert_eq!(back.max_fetch_bytes, 1_048_576);
+        assert_eq!(back.max_redirects, 3);
+    }
+
+    #[test]
+    fn search_provider_serde_roundtrip() {
+        let providers = vec![
+            SearchProvider::Tavily,
+            SearchProvider::Brave,
+            SearchProvider::Searxng,
+        ];
+        for p in providers {
+            let json = serde_json::to_string(&p).unwrap();
+            let back: SearchProvider = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, p);
+        }
     }
 
     #[test]

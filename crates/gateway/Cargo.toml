@@ -51,6 +51,8 @@ mdns-sd = { workspace = true }
 wasmtime = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+scraper = { workspace = true }
+url = { workspace = true }
 subtle = "2.6"
 
 [dev-dependencies]

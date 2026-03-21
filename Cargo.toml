@@ -90,5 +90,8 @@ wasmtime-wasi = "41"
 # Pattern matching
 regex = "1"
 
+# HTML processing
+scraper = "0.22"
+
 # Testing
 tempfile = "3"

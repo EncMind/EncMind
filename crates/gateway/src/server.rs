@@ -312,7 +312,18 @@ pub async fn run_gateway(
 
     // Initialize plugin system
     let mut hook_registry_raw = HookRegistry::new();
-    let native_plugins = build_native_plugins(&config, browser_pool.clone(), firewall.clone());
+    // Create runtime Arc early so plugins (e.g. NetProbe synthesis) can reference
+    // the LLM backend. The tool_registry will be replaced after plugin init.
+    let shared_runtime = Arc::new(RwLock::new(RuntimeResources {
+        llm_backend: llm_backend_initial.clone(),
+        tool_registry: Arc::new(ToolRegistry::new()),
+    }));
+    let native_plugins = build_native_plugins(
+        &config,
+        browser_pool.clone(),
+        firewall.clone(),
+        shared_runtime.clone(),
+    );
     let plugin_manager = if native_plugins.is_empty() {
         None
     } else {
@@ -475,10 +486,13 @@ pub async fn run_gateway(
         device_store,
         lockdown,
         agent_pool,
-        runtime: Arc::new(RwLock::new(RuntimeResources {
-            llm_backend: llm_backend_initial,
-            tool_registry: Arc::new(tool_registry),
-        })),
+        runtime: {
+            // Update the shared_runtime with the final tool_registry (after plugin init).
+            let mut rt = shared_runtime.write().await;
+            rt.tool_registry = Arc::new(tool_registry);
+            drop(rt);
+            shared_runtime.clone()
+        },
         api_key_store: Some(api_key_store),
         firewall,
         audit: audit_logger,
@@ -2221,6 +2235,7 @@ pub(crate) fn build_native_plugins(
     config: &AppConfig,
     browser_pool: Option<Arc<encmind_browser::pool::BrowserPool>>,
     firewall: Arc<EgressFirewall>,
+    runtime: Arc<tokio::sync::RwLock<RuntimeResources>>,
 ) -> Vec<Box<dyn NativePlugin>> {
     let mut plugins: Vec<Box<dyn NativePlugin>> = Vec::new();
 
@@ -2235,11 +2250,36 @@ pub(crate) fn build_native_plugins(
         plugins.push(Box::new(encmind_browser::plugin::BrowserPlugin::new(
             pool,
             session_manager,
-            firewall,
+            firewall.clone(),
             config.token_optimization.screenshot_payload_mode,
             config.browser.clone(),
             required,
         )));
+    }
+
+    // NetProbe plugin (web search & fetch) — enabled by default, but can be disabled via config.
+    let netprobe_config: encmind_core::config::NetProbeConfig = match config.plugins.get("netprobe")
+    {
+        Some(raw) => match serde_json::from_value(raw.clone()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to parse plugins.netprobe config; falling back to defaults"
+                );
+                encmind_core::config::NetProbeConfig::default()
+            }
+        },
+        None => encmind_core::config::NetProbeConfig::default(),
+    };
+    if netprobe_config.enabled {
+        plugins.push(Box::new(crate::plugins::netprobe::NetProbePlugin::new(
+            netprobe_config,
+            firewall,
+            runtime,
+        )));
+    } else {
+        info!("netprobe plugin disabled by configuration");
     }
 
     plugins
