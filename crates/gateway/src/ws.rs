@@ -4,11 +4,13 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use encmind_core::types::DevicePermissions;
 use futures::stream::SplitSink;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use tracing::{debug, warn};
 
 use crate::dispatch::dispatch_method;
+use crate::idempotency::IdempotencyCache;
 use crate::node::check_permission;
 use crate::plugin_manager::PluginManager;
 use crate::protocol::*;
@@ -35,28 +37,116 @@ async fn handle_connection(socket: WebSocket, state: AppState, _permit: OwnedSem
     let mut auth = ConnectionAuth::default();
 
     // Connection is open — process messages until close
-    while let Some(Ok(msg)) = receiver.next().await {
+    loop {
+        let next = receiver.next().await;
+        let msg = match next {
+            Some(Ok(msg)) => msg,
+            Some(Err(err)) => {
+                warn!(error = %err, "ws connection receive failed; closing connection");
+                break;
+            }
+            None => {
+                debug!("ws stream ended by peer");
+                break;
+            }
+        };
+
         match msg {
             Message::Text(text) => {
-                let response = process_text_message(&state, &mut auth, &text).await;
+                let response = process_text_message_with_recovery(&state, &mut auth, &text).await;
                 if let Some(resp) = response {
-                    let json = serde_json::to_string(&resp).unwrap_or_default();
-                    let mut s = sender.lock().await;
-                    if s.send(Message::Text(json.into())).await.is_err() {
-                        break;
+                    match serde_json::to_string(&resp) {
+                        Ok(json) => {
+                            let mut s = sender.lock().await;
+                            if let Err(err) = s.send(Message::Text(json.into())).await {
+                                warn!(
+                                    error = %err,
+                                    "ws failed to send response frame; closing connection"
+                                );
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "ws response serialization failed; dropping response");
+                        }
                     }
                 }
             }
-            Message::Close(_) => break,
-            _ => {}
+            Message::Close(frame) => {
+                debug!(?frame, "ws close frame received; closing connection");
+                break;
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
         }
     }
 }
 
 #[derive(Default)]
 struct ConnectionAuth {
-    device_id: Option<String>,
-    permissions: Option<DevicePermissions>,
+    session: Option<AuthSession>,
+}
+
+struct AuthSession {
+    device_id: String,
+    permissions: DevicePermissions,
+}
+
+fn extract_req_id_from_raw_text(text: &str) -> Option<String> {
+    serde_json::from_str::<ClientMessage>(text)
+        .ok()
+        .and_then(|msg| match msg {
+            ClientMessage::Req { id, .. } => Some(id),
+            _ => None,
+        })
+}
+
+fn recover_poisoned_idempotency_cache<'a>(
+    poisoned: std::sync::PoisonError<std::sync::MutexGuard<'a, IdempotencyCache>>,
+    context: &'static str,
+) -> std::sync::MutexGuard<'a, IdempotencyCache> {
+    let mut cache = poisoned.into_inner();
+    cache.clear();
+    warn!(
+        context,
+        "ws idempotency cache lock poisoned; cache cleared and recovered"
+    );
+    cache
+}
+
+async fn process_text_message_with_recovery(
+    state: &AppState,
+    auth: &mut ConnectionAuth,
+    text: &str,
+) -> Option<ServerMessage> {
+    let panic_response_id = extract_req_id_from_raw_text(text);
+    match std::panic::AssertUnwindSafe(process_text_message(state, auth, text))
+        .catch_unwind()
+        .await
+    {
+        Ok(response) => response,
+        Err(panic_payload) => {
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            // Drop any potentially inconsistent auth state from the panicking frame.
+            *auth = ConnectionAuth::default();
+            warn!(
+                panic = %panic_msg,
+                "ws process_text_message panicked; auth reset and connection kept alive"
+            );
+            Some(ServerMessage::Error {
+                id: panic_response_id,
+                error: ErrorPayload::new(
+                    ERR_INTERNAL,
+                    "internal server error while processing message",
+                ),
+            })
+        }
+    }
 }
 
 async fn process_text_message(
@@ -78,8 +168,10 @@ async fn process_text_message(
         ClientMessage::Connect { auth: payload } => {
             match authenticate_connection(state, &payload).await {
                 Ok((device_id, permissions)) => {
-                    auth.device_id = Some(device_id.clone());
-                    auth.permissions = Some(permissions);
+                    auth.session = Some(AuthSession {
+                        device_id: device_id.clone(),
+                        permissions,
+                    });
                     Some(ServerMessage::Connected {
                         session_id: format!("ws-{device_id}"),
                     })
@@ -91,8 +183,8 @@ async fn process_text_message(
             }
         }
         ClientMessage::Req { id, method, params } => {
-            let device_id = match auth.device_id.as_deref() {
-                Some(id) => id,
+            let session = match auth.session.as_ref() {
+                Some(session) => session,
                 None => {
                     return Some(ServerMessage::Error {
                         id: Some(id),
@@ -104,21 +196,16 @@ async fn process_text_message(
                 }
             };
 
-            let permissions = match auth.permissions.as_ref() {
-                Some(perms) => perms,
-                None => {
-                    return Some(ServerMessage::Error {
-                        id: Some(id),
-                        error: ErrorPayload::new(ERR_AUTH_FAILED, "missing device permissions"),
-                    });
-                }
-            };
+            #[cfg(test)]
+            if method == "__panic_test__" {
+                panic!("ws test panic");
+            }
 
             let plugin_manager = { state.plugin_manager.read().await.clone() };
             if !is_method_allowed_with_plugin(
                 &method,
                 &params,
-                permissions,
+                &session.permissions,
                 plugin_manager.as_deref(),
             ) {
                 return Some(ServerMessage::Error {
@@ -130,11 +217,14 @@ async fn process_text_message(
                 });
             }
 
-            let scoped_id = format!("{device_id}:{id}");
+            let scoped_id = format!("{}:{id}", session.device_id);
 
             // Check idempotency cache
             {
-                let cache = state.idempotency.lock().unwrap();
+                let cache = match state.idempotency.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => recover_poisoned_idempotency_cache(poisoned, "read"),
+                };
                 if let Some(cached) = cache.get(&scoped_id) {
                     return Some(ServerMessage::Res {
                         id: id.clone(),
@@ -147,7 +237,10 @@ async fn process_text_message(
 
             // Cache successful results
             if let ServerMessage::Res { ref result, .. } = response {
-                let mut cache = state.idempotency.lock().unwrap();
+                let mut cache = match state.idempotency.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => recover_poisoned_idempotency_cache(poisoned, "write"),
+                };
                 cache.set(scoped_id, result.clone());
                 cache.cleanup();
             }
@@ -511,6 +604,66 @@ mod tests {
                 assert_eq!(error.code, ERR_AUTH_FAILED);
             }
             _ => panic!("Expected auth error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_recovery_resets_auth_and_preserves_request_id() {
+        let state = make_test_state();
+        let connect = connect_message_with_device(
+            &state,
+            "dev-panic",
+            DevicePermissions {
+                chat: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        let mut auth = ConnectionAuth::default();
+
+        let connected = process_text_message_with_recovery(&state, &mut auth, &connect)
+            .await
+            .unwrap();
+        assert!(matches!(connected, ServerMessage::Connected { .. }));
+        assert!(auth.session.is_some(), "auth session should be established");
+
+        let panic_req = serde_json::to_string(&ClientMessage::Req {
+            id: "panic-1".into(),
+            method: "__panic_test__".into(),
+            params: serde_json::json!({}),
+        })
+        .unwrap();
+
+        let panic_result = process_text_message_with_recovery(&state, &mut auth, &panic_req)
+            .await
+            .unwrap();
+        match panic_result {
+            ServerMessage::Error { id, error } => {
+                assert_eq!(id.as_deref(), Some("panic-1"));
+                assert_eq!(error.code, ERR_INTERNAL);
+            }
+            _ => panic!("Expected internal error from panic recovery"),
+        }
+        assert!(
+            auth.session.is_none(),
+            "auth session should be cleared after panic recovery"
+        );
+
+        let follow_up_req = serde_json::to_string(&ClientMessage::Req {
+            id: "after-panic".into(),
+            method: "models.list".into(),
+            params: serde_json::json!({}),
+        })
+        .unwrap();
+        let follow_up = process_text_message_with_recovery(&state, &mut auth, &follow_up_req)
+            .await
+            .unwrap();
+        match follow_up {
+            ServerMessage::Error { id, error } => {
+                assert_eq!(id.as_deref(), Some("after-panic"));
+                assert_eq!(error.code, ERR_AUTH_FAILED);
+            }
+            _ => panic!("Expected auth error after auth reset"),
         }
     }
 

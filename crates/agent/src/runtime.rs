@@ -294,6 +294,17 @@ impl AgentRuntime {
             }
 
             // Build assistant content blocks
+            let parsed_tool_uses: Vec<(String, String, serde_json::Value)> = tool_uses
+                .iter()
+                .map(|(id, name, input_json)| {
+                    (
+                        id.clone(),
+                        name.clone(),
+                        Self::sanitize_tool_use_input(id, name, input_json),
+                    )
+                })
+                .collect();
+
             let mut content_blocks = Vec::new();
             if !thinking_buf.is_empty() {
                 content_blocks.push(ContentBlock::Thinking {
@@ -305,13 +316,11 @@ impl AgentRuntime {
                     text: text_buf.clone(),
                 });
             }
-            for (id, name, input_json) in &tool_uses {
-                let input: serde_json::Value =
-                    serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
+            for (id, name, input) in &parsed_tool_uses {
                 content_blocks.push(ContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
-                    input,
+                    input: input.clone(),
                 });
             }
 
@@ -343,9 +352,8 @@ impl AgentRuntime {
                 self.session_store
                     .append_message(session_id, &assistant_msg)
                     .await?;
-                'tool_loop: for (id, name, input_json) in &tool_uses {
-                    let mut input: serde_json::Value =
-                        serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
+                'tool_loop: for (id, name, parsed_input) in &parsed_tool_uses {
+                    let mut input = parsed_input.clone();
 
                     if let Some(override_payload) = self
                         .execute_hook(
@@ -791,6 +799,43 @@ impl AgentRuntime {
         let mut urls = HashSet::new();
         Self::collect_http_urls(input, &mut urls);
         urls.into_iter().collect()
+    }
+
+    fn sanitize_tool_use_input(
+        tool_use_id: &str,
+        tool_name: &str,
+        input_json: &str,
+    ) -> serde_json::Value {
+        let parsed = match serde_json::from_str::<serde_json::Value>(input_json) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!(
+                    tool_use_id = %tool_use_id,
+                    tool = %tool_name,
+                    error = %err,
+                    "tool_use input is invalid JSON; coercing to empty object"
+                );
+                return serde_json::json!({});
+            }
+        };
+        if parsed.is_object() {
+            parsed
+        } else {
+            warn!(
+                tool_use_id = %tool_use_id,
+                tool = %tool_name,
+                input_type = %match parsed {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "bool",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::String(_) => "string",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                },
+                "tool_use input must be an object; coercing to empty object"
+            );
+            serde_json::json!({})
+        }
     }
 
     fn collect_http_urls(value: &serde_json::Value, urls: &mut HashSet<String>) {
@@ -2630,5 +2675,74 @@ mod tests {
             }
             _ => panic!("expected ToolResult"),
         }
+    }
+
+    #[tokio::test]
+    async fn non_object_tool_use_input_is_coerced_to_object() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "echo", r#""/tmp/austin-eyedrop.pdf""#),
+            text_response("Done"),
+        ];
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(responses, 128_000));
+        let store = Arc::new(InMemorySessionStore::new());
+
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            RuntimeConfig {
+                max_tool_iterations: 10,
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("summarize austin-eyedrop.pdf"),
+                &default_agent(),
+                cancel,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(
+            result.tool_calls[0].input.is_object(),
+            "tool call input should be coerced to object"
+        );
+
+        let messages = store
+            .get_messages(
+                &session.id,
+                encmind_core::types::Pagination {
+                    offset: 0,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+
+        let assistant_tool_use = messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolUse { input, .. } => Some(input),
+                _ => None,
+            })
+            .expect("assistant tool_use block should exist");
+
+        assert!(
+            assistant_tool_use.is_object(),
+            "persisted tool_use.input should be object for Anthropic compatibility"
+        );
     }
 }

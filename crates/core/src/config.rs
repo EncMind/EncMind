@@ -335,6 +335,19 @@ impl AppConfig {
             }
         }
 
+        if let Some(raw_digest) = self.plugins.get("digest") {
+            match serde_json::from_value::<DigestConfig>(raw_digest.clone()) {
+                Ok(digest) => {
+                    if let Err(e) = digest.validate() {
+                        errors.push(e);
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!("plugins.digest config is invalid: {e}"));
+                }
+            }
+        }
+
         errors
     }
 }
@@ -1473,13 +1486,32 @@ pub struct NetProbeConfig {
     /// Maximum bytes to fetch per URL (default 512 KiB).
     #[serde(default = "default_max_fetch_bytes")]
     pub max_fetch_bytes: usize,
+    /// Maximum provider API response body bytes parsed for search responses/errors (default 1 MiB).
+    #[serde(default = "default_max_provider_body_bytes")]
+    pub max_provider_body_bytes: usize,
+    /// Maximum characters returned in netprobe_fetch `content` output.
+    #[serde(default = "default_max_fetch_output_chars")]
+    pub max_fetch_output_chars: usize,
     /// Maximum number of redirect hops to follow (default 5).
     #[serde(default = "default_max_redirects")]
     pub max_redirects: usize,
+    /// Browser-compatible POST redirect behavior for 301/302.
+    /// When true, 301/302 after POST switch to GET (legacy browser style).
+    /// When false (default), POST semantics are preserved and only 303 switches to GET.
+    #[serde(default)]
+    pub post_redirect_compat_301_302_to_get: bool,
 }
 
 fn default_max_fetch_bytes() -> usize {
     524_288
+}
+
+fn default_max_provider_body_bytes() -> usize {
+    1_048_576
+}
+
+fn default_max_fetch_output_chars() -> usize {
+    20_000
 }
 
 fn default_max_redirects() -> usize {
@@ -1487,6 +1519,9 @@ fn default_max_redirects() -> usize {
 }
 
 const NETPROBE_MAX_REDIRECTS_UPPER_BOUND: usize = 20;
+const NETPROBE_MAX_FETCH_BYTES_UPPER_BOUND: usize = 16 * 1024 * 1024; // 16 MiB
+const NETPROBE_MAX_PROVIDER_BODY_BYTES_UPPER_BOUND: usize = 8 * 1024 * 1024; // 8 MiB
+const NETPROBE_MAX_FETCH_OUTPUT_CHARS_UPPER_BOUND: usize = 200_000;
 
 impl Default for NetProbeConfig {
     fn default() -> Self {
@@ -1497,7 +1532,10 @@ impl Default for NetProbeConfig {
             searxng_url: None,
             synthesize: true,
             max_fetch_bytes: default_max_fetch_bytes(),
+            max_provider_body_bytes: default_max_provider_body_bytes(),
+            max_fetch_output_chars: default_max_fetch_output_chars(),
             max_redirects: default_max_redirects(),
+            post_redirect_compat_301_302_to_get: false,
         }
     }
 }
@@ -1510,6 +1548,27 @@ impl NetProbeConfig {
         }
         if self.max_fetch_bytes == 0 {
             return Err("netprobe: max_fetch_bytes must be > 0".to_string());
+        }
+        if self.max_fetch_bytes > NETPROBE_MAX_FETCH_BYTES_UPPER_BOUND {
+            return Err(format!(
+                "netprobe: max_fetch_bytes must be <= {NETPROBE_MAX_FETCH_BYTES_UPPER_BOUND}"
+            ));
+        }
+        if self.max_provider_body_bytes == 0 {
+            return Err("netprobe: max_provider_body_bytes must be > 0".to_string());
+        }
+        if self.max_provider_body_bytes > NETPROBE_MAX_PROVIDER_BODY_BYTES_UPPER_BOUND {
+            return Err(format!(
+                "netprobe: max_provider_body_bytes must be <= {NETPROBE_MAX_PROVIDER_BODY_BYTES_UPPER_BOUND}"
+            ));
+        }
+        if self.max_fetch_output_chars == 0 {
+            return Err("netprobe: max_fetch_output_chars must be > 0".to_string());
+        }
+        if self.max_fetch_output_chars > NETPROBE_MAX_FETCH_OUTPUT_CHARS_UPPER_BOUND {
+            return Err(format!(
+                "netprobe: max_fetch_output_chars must be <= {NETPROBE_MAX_FETCH_OUTPUT_CHARS_UPPER_BOUND}"
+            ));
         }
         if self.max_redirects == 0 {
             return Err("netprobe: max_redirects must be > 0".to_string());
@@ -1539,6 +1598,299 @@ impl NetProbeConfig {
                         "netprobe: searxng_url scheme '{other}' is not supported (use http/https)"
                     ))
                 }
+            }
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(
+                    "netprobe: searxng_url must not include URL userinfo (user:pass@)".to_string(),
+                );
+            }
+            if parsed.host_str().is_none() {
+                return Err("netprobe: searxng_url must include a host".to_string());
+            }
+            if parsed.query().is_some() || parsed.fragment().is_some() {
+                return Err(
+                    "netprobe: searxng_url must not include query parameters or fragments"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// ── Digest plugin config ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DigestConfig {
+    /// Whether Digest tools are registered.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Token threshold for single-pass vs map-reduce summarization.
+    #[serde(default = "default_max_single_pass_tokens")]
+    pub max_single_pass_tokens: u32,
+    /// Maximum chunks in map-reduce summarization.
+    #[serde(default = "default_max_map_reduce_chunks")]
+    pub max_map_reduce_chunks: u32,
+    /// OpenAI Whisper model name.
+    #[serde(default = "default_whisper_model")]
+    pub whisper_model: String,
+    /// Whether local file tools (`digest_file`, `digest_transcribe`) are registered.
+    /// Defaults to false for secure-by-default local file access.
+    #[serde(default)]
+    pub enable_file_tools: bool,
+    /// Maximum local file size in bytes accepted by digest_file/digest_transcribe.
+    #[serde(default = "default_max_digest_file_bytes")]
+    pub max_file_bytes: usize,
+    /// Maximum PDF file size in bytes accepted by digest_file.
+    #[serde(default = "default_max_pdf_file_bytes")]
+    pub max_pdf_file_bytes: usize,
+    /// Maximum audio file size in bytes (default 25 MiB).
+    #[serde(default = "default_max_audio_bytes")]
+    pub max_audio_bytes: usize,
+    /// Maximum PDF pages to extract.
+    #[serde(default = "default_max_pdf_pages")]
+    pub max_pdf_pages: u32,
+    /// Maximum extracted text size returned by digest_file.
+    #[serde(default = "default_max_extracted_chars")]
+    pub max_extracted_chars: usize,
+    /// Maximum number of chunk summaries generated concurrently during map-reduce.
+    #[serde(default = "default_max_parallel_chunk_summaries")]
+    pub max_parallel_chunk_summaries: u32,
+    /// Timeout for blocking PDF extraction work.
+    #[serde(default = "default_pdf_extract_timeout_secs")]
+    pub pdf_extract_timeout_secs: u64,
+    /// HTTP timeout (seconds) for Whisper transcription requests.
+    #[serde(default = "default_whisper_timeout_secs")]
+    pub whisper_timeout_secs: u64,
+    /// Timeout (seconds) for digest LLM completion requests.
+    #[serde(default = "default_digest_llm_timeout_secs")]
+    pub llm_timeout_secs: u64,
+    /// Path traversal boundary for file access.
+    /// Required when `enable_file_tools=true`.
+    #[serde(default)]
+    pub file_root: Option<PathBuf>,
+    /// Maximum entries returned by digest_list_files.
+    #[serde(default = "default_max_list_entries")]
+    pub max_list_entries: usize,
+    /// Maximum bytes to fetch per URL (reuses NetProbe helper default).
+    #[serde(default = "default_max_fetch_bytes")]
+    pub max_fetch_bytes: usize,
+    /// Maximum redirect hops (reuses NetProbe helper default).
+    #[serde(default = "default_max_redirects")]
+    pub max_redirects: usize,
+}
+
+fn default_max_single_pass_tokens() -> u32 {
+    8000
+}
+
+fn default_max_map_reduce_chunks() -> u32 {
+    16
+}
+
+fn default_whisper_model() -> String {
+    "whisper-1".to_string()
+}
+
+fn default_max_audio_bytes() -> usize {
+    26_214_400 // 25 MiB
+}
+
+fn default_max_digest_file_bytes() -> usize {
+    52_428_800 // 50 MiB
+}
+
+fn default_max_pdf_file_bytes() -> usize {
+    20_971_520 // 20 MiB
+}
+
+fn default_max_pdf_pages() -> u32 {
+    200
+}
+
+fn default_max_extracted_chars() -> usize {
+    400_000
+}
+
+fn default_max_parallel_chunk_summaries() -> u32 {
+    4
+}
+
+fn default_pdf_extract_timeout_secs() -> u64 {
+    30
+}
+
+fn default_whisper_timeout_secs() -> u64 {
+    180
+}
+
+fn default_digest_llm_timeout_secs() -> u64 {
+    120
+}
+
+fn default_max_list_entries() -> usize {
+    500
+}
+
+const DIGEST_MAX_LIST_ENTRIES_UPPER_BOUND: usize = 10_000;
+const DIGEST_MAX_REDIRECTS_UPPER_BOUND: usize = 20;
+const DIGEST_MAX_MAP_REDUCE_CHUNKS_UPPER_BOUND: u32 = 128;
+const DIGEST_MAX_PARALLEL_CHUNK_SUMMARIES_UPPER_BOUND: u32 = 16;
+const DIGEST_MIN_SINGLE_PASS_TOKENS: u32 = 448;
+const DIGEST_MAX_PDF_EXTRACT_TIMEOUT_SECS_UPPER_BOUND: u64 = 300;
+const DIGEST_MAX_WHISPER_TIMEOUT_SECS_UPPER_BOUND: u64 = 600;
+const DIGEST_MAX_LLM_TIMEOUT_SECS_UPPER_BOUND: u64 = 600;
+const DIGEST_MAX_FETCH_BYTES_UPPER_BOUND: usize = 16 * 1024 * 1024; // 16 MiB
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_single_pass_tokens: default_max_single_pass_tokens(),
+            max_map_reduce_chunks: default_max_map_reduce_chunks(),
+            whisper_model: default_whisper_model(),
+            enable_file_tools: false,
+            max_file_bytes: default_max_digest_file_bytes(),
+            max_pdf_file_bytes: default_max_pdf_file_bytes(),
+            max_audio_bytes: default_max_audio_bytes(),
+            max_pdf_pages: default_max_pdf_pages(),
+            max_extracted_chars: default_max_extracted_chars(),
+            max_parallel_chunk_summaries: default_max_parallel_chunk_summaries(),
+            pdf_extract_timeout_secs: default_pdf_extract_timeout_secs(),
+            whisper_timeout_secs: default_whisper_timeout_secs(),
+            llm_timeout_secs: default_digest_llm_timeout_secs(),
+            file_root: None,
+            max_list_entries: default_max_list_entries(),
+            max_fetch_bytes: default_max_fetch_bytes(),
+            max_redirects: default_max_redirects(),
+        }
+    }
+}
+
+impl DigestConfig {
+    /// Validate the config, returning an error string if invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.max_single_pass_tokens == 0 {
+            return Err("digest: max_single_pass_tokens must be > 0".to_string());
+        }
+        if self.max_single_pass_tokens < DIGEST_MIN_SINGLE_PASS_TOKENS {
+            return Err(format!(
+                "digest: max_single_pass_tokens must be >= {DIGEST_MIN_SINGLE_PASS_TOKENS}"
+            ));
+        }
+        if self.max_map_reduce_chunks == 0 {
+            return Err("digest: max_map_reduce_chunks must be > 0".to_string());
+        }
+        if self.max_map_reduce_chunks > DIGEST_MAX_MAP_REDUCE_CHUNKS_UPPER_BOUND {
+            return Err(format!(
+                "digest: max_map_reduce_chunks must be <= {DIGEST_MAX_MAP_REDUCE_CHUNKS_UPPER_BOUND}"
+            ));
+        }
+        if self.whisper_model.trim().is_empty() {
+            return Err("digest: whisper_model must not be empty".to_string());
+        }
+        if self.max_file_bytes == 0 {
+            return Err("digest: max_file_bytes must be > 0".to_string());
+        }
+        if self.max_audio_bytes == 0 {
+            return Err("digest: max_audio_bytes must be > 0".to_string());
+        }
+        if self.max_audio_bytes > self.max_file_bytes {
+            return Err("digest: max_audio_bytes must be <= max_file_bytes".to_string());
+        }
+        if self.max_pdf_file_bytes == 0 {
+            return Err("digest: max_pdf_file_bytes must be > 0".to_string());
+        }
+        if self.max_pdf_file_bytes > self.max_file_bytes {
+            return Err("digest: max_pdf_file_bytes must be <= max_file_bytes".to_string());
+        }
+        if self.max_pdf_pages == 0 {
+            return Err("digest: max_pdf_pages must be > 0".to_string());
+        }
+        if self.max_extracted_chars == 0 {
+            return Err("digest: max_extracted_chars must be > 0".to_string());
+        }
+        if self.max_parallel_chunk_summaries == 0 {
+            return Err("digest: max_parallel_chunk_summaries must be > 0".to_string());
+        }
+        if self.max_parallel_chunk_summaries > DIGEST_MAX_PARALLEL_CHUNK_SUMMARIES_UPPER_BOUND {
+            return Err(format!(
+                "digest: max_parallel_chunk_summaries must be <= {DIGEST_MAX_PARALLEL_CHUNK_SUMMARIES_UPPER_BOUND}"
+            ));
+        }
+        if self.pdf_extract_timeout_secs == 0 {
+            return Err("digest: pdf_extract_timeout_secs must be > 0".to_string());
+        }
+        if self.pdf_extract_timeout_secs > DIGEST_MAX_PDF_EXTRACT_TIMEOUT_SECS_UPPER_BOUND {
+            return Err(format!(
+                "digest: pdf_extract_timeout_secs must be <= {DIGEST_MAX_PDF_EXTRACT_TIMEOUT_SECS_UPPER_BOUND}"
+            ));
+        }
+        if self.whisper_timeout_secs == 0 {
+            return Err("digest: whisper_timeout_secs must be > 0".to_string());
+        }
+        if self.whisper_timeout_secs > DIGEST_MAX_WHISPER_TIMEOUT_SECS_UPPER_BOUND {
+            return Err(format!(
+                "digest: whisper_timeout_secs must be <= {DIGEST_MAX_WHISPER_TIMEOUT_SECS_UPPER_BOUND}"
+            ));
+        }
+        if self.llm_timeout_secs == 0 {
+            return Err("digest: llm_timeout_secs must be > 0".to_string());
+        }
+        if self.llm_timeout_secs > DIGEST_MAX_LLM_TIMEOUT_SECS_UPPER_BOUND {
+            return Err(format!(
+                "digest: llm_timeout_secs must be <= {DIGEST_MAX_LLM_TIMEOUT_SECS_UPPER_BOUND}"
+            ));
+        }
+        if self.max_list_entries == 0 {
+            return Err("digest: max_list_entries must be > 0".to_string());
+        }
+        if self.max_list_entries > DIGEST_MAX_LIST_ENTRIES_UPPER_BOUND {
+            return Err(format!(
+                "digest: max_list_entries must be <= {DIGEST_MAX_LIST_ENTRIES_UPPER_BOUND}"
+            ));
+        }
+        if self.max_fetch_bytes == 0 {
+            return Err("digest: max_fetch_bytes must be > 0".to_string());
+        }
+        if self.max_fetch_bytes > DIGEST_MAX_FETCH_BYTES_UPPER_BOUND {
+            return Err(format!(
+                "digest: max_fetch_bytes must be <= {DIGEST_MAX_FETCH_BYTES_UPPER_BOUND}"
+            ));
+        }
+        if self.max_redirects == 0 {
+            return Err("digest: max_redirects must be > 0".to_string());
+        }
+        if self.max_redirects > DIGEST_MAX_REDIRECTS_UPPER_BOUND {
+            return Err(format!(
+                "digest: max_redirects must be <= {DIGEST_MAX_REDIRECTS_UPPER_BOUND}"
+            ));
+        }
+        if self.enable_file_tools && self.file_root.is_none() {
+            return Err("digest: file_root must be set when enable_file_tools=true".to_string());
+        }
+        if self.enable_file_tools {
+            let root = self
+                .file_root
+                .as_ref()
+                .expect("file_root checked above when enable_file_tools=true");
+            if root.as_os_str().is_empty() {
+                return Err("digest: file_root must not be empty when set".to_string());
+            }
+            let canonical = root.canonicalize().map_err(|e| {
+                format!(
+                    "digest: file_root '{}' is not accessible: {e}",
+                    root.display()
+                )
+            })?;
+            if !canonical.is_dir() {
+                return Err(format!(
+                    "digest: file_root '{}' must be an existing directory",
+                    canonical.display()
+                ));
             }
         }
         Ok(())
@@ -3437,7 +3789,10 @@ access_policy:
         assert_eq!(config.provider, SearchProvider::Tavily);
         assert!(config.synthesize);
         assert_eq!(config.max_fetch_bytes, 524_288);
+        assert_eq!(config.max_provider_body_bytes, 1_048_576);
+        assert_eq!(config.max_fetch_output_chars, 20_000);
         assert_eq!(config.max_redirects, 5);
+        assert!(!config.post_redirect_compat_301_302_to_get);
         assert!(config.api_key_env.is_none());
         assert!(config.searxng_url.is_none());
     }
@@ -3478,6 +3833,36 @@ access_policy:
         };
         assert!(zero_fetch.validate().is_err());
 
+        let too_large_fetch = NetProbeConfig {
+            max_fetch_bytes: NETPROBE_MAX_FETCH_BYTES_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        assert!(too_large_fetch.validate().is_err());
+
+        let zero_provider_body = NetProbeConfig {
+            max_provider_body_bytes: 0,
+            ..Default::default()
+        };
+        assert!(zero_provider_body.validate().is_err());
+
+        let too_large_provider_body = NetProbeConfig {
+            max_provider_body_bytes: NETPROBE_MAX_PROVIDER_BODY_BYTES_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        assert!(too_large_provider_body.validate().is_err());
+
+        let zero_fetch_output_chars = NetProbeConfig {
+            max_fetch_output_chars: 0,
+            ..Default::default()
+        };
+        assert!(zero_fetch_output_chars.validate().is_err());
+
+        let too_large_fetch_output_chars = NetProbeConfig {
+            max_fetch_output_chars: NETPROBE_MAX_FETCH_OUTPUT_CHARS_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        assert!(too_large_fetch_output_chars.validate().is_err());
+
         let zero_redirects = NetProbeConfig {
             max_redirects: 0,
             ..Default::default()
@@ -3517,7 +3902,10 @@ access_policy:
             searxng_url: None,
             synthesize: false,
             max_fetch_bytes: 1_048_576,
+            max_provider_body_bytes: 2_097_152,
+            max_fetch_output_chars: 12_000,
             max_redirects: 3,
+            post_redirect_compat_301_302_to_get: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: NetProbeConfig = serde_json::from_str(&json).unwrap();
@@ -3525,7 +3913,10 @@ access_policy:
         assert_eq!(back.provider, SearchProvider::Brave);
         assert!(!back.synthesize);
         assert_eq!(back.max_fetch_bytes, 1_048_576);
+        assert_eq!(back.max_provider_body_bytes, 2_097_152);
+        assert_eq!(back.max_fetch_output_chars, 12_000);
         assert_eq!(back.max_redirects, 3);
+        assert!(back.post_redirect_compat_301_302_to_get);
     }
 
     #[test]
@@ -3555,5 +3946,307 @@ access_policy:
         assert_eq!(slack.max_attachments_per_message, 5);
         assert_eq!(slack.max_total_attachment_bytes, 25 * 1024 * 1024);
         assert_eq!(slack.download_timeout_secs, 4);
+    }
+
+    // ── DigestConfig tests ────────────────────────────────────────────
+
+    #[test]
+    fn digest_config_defaults() {
+        let config = DigestConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_single_pass_tokens, 8000);
+        assert_eq!(config.max_map_reduce_chunks, 16);
+        assert_eq!(config.whisper_model, "whisper-1");
+        assert!(!config.enable_file_tools);
+        assert_eq!(config.max_file_bytes, 52_428_800);
+        assert_eq!(config.max_pdf_file_bytes, 20_971_520);
+        assert_eq!(config.max_audio_bytes, 26_214_400);
+        assert_eq!(config.max_pdf_pages, 200);
+        assert_eq!(config.max_extracted_chars, 400_000);
+        assert_eq!(config.max_parallel_chunk_summaries, 4);
+        assert_eq!(config.pdf_extract_timeout_secs, 30);
+        assert_eq!(config.whisper_timeout_secs, 180);
+        assert_eq!(config.llm_timeout_secs, 120);
+        assert!(config.file_root.is_none());
+        assert_eq!(config.max_list_entries, 500);
+        assert_eq!(config.max_fetch_bytes, 524_288);
+        assert_eq!(config.max_redirects, 5);
+    }
+
+    #[test]
+    fn digest_config_disabled_skips_validation() {
+        let config = DigestConfig {
+            enabled: false,
+            max_single_pass_tokens: 0, // would fail if enabled
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn digest_config_zero_tokens_fails() {
+        let config = DigestConfig {
+            max_single_pass_tokens: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_single_pass_tokens"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_too_small_single_pass_tokens_fails() {
+        let config = DigestConfig {
+            max_single_pass_tokens: DIGEST_MIN_SINGLE_PASS_TOKENS - 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_single_pass_tokens"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_zero_chunks_fails() {
+        let config = DigestConfig {
+            max_map_reduce_chunks: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_map_reduce_chunks"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_too_many_chunks_fails() {
+        let config = DigestConfig {
+            max_map_reduce_chunks: DIGEST_MAX_MAP_REDUCE_CHUNKS_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_map_reduce_chunks"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_zero_max_list_entries_fails() {
+        let config = DigestConfig {
+            max_list_entries: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_list_entries"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_too_large_max_list_entries_fails() {
+        let config = DigestConfig {
+            max_list_entries: DIGEST_MAX_LIST_ENTRIES_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_list_entries"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_zero_pdf_file_bytes_fails() {
+        let config = DigestConfig {
+            max_pdf_file_bytes: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_pdf_file_bytes"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_pdf_file_bytes_cannot_exceed_global_file_bytes() {
+        let config = DigestConfig {
+            max_file_bytes: 1_000_000,
+            max_audio_bytes: 1_000_000,
+            max_pdf_file_bytes: 1_000_001,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("max_pdf_file_bytes must be <= max_file_bytes"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn digest_config_audio_bytes_cannot_exceed_global_file_bytes() {
+        let config = DigestConfig {
+            max_file_bytes: 1_000_000,
+            max_audio_bytes: 1_000_001,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("max_audio_bytes must be <= max_file_bytes"),
+            "err = {err}"
+        );
+    }
+
+    #[test]
+    fn digest_config_empty_whisper_model_fails() {
+        let config = DigestConfig {
+            whisper_model: "   ".to_string(),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("whisper_model"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_zero_pdf_extract_timeout_fails() {
+        let config = DigestConfig {
+            pdf_extract_timeout_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("pdf_extract_timeout_secs"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_zero_llm_timeout_fails() {
+        let config = DigestConfig {
+            llm_timeout_secs: 0,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("llm_timeout_secs"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_too_large_llm_timeout_fails() {
+        let config = DigestConfig {
+            llm_timeout_secs: DIGEST_MAX_LLM_TIMEOUT_SECS_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("llm_timeout_secs"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_too_large_fetch_bytes_fails() {
+        let config = DigestConfig {
+            max_fetch_bytes: DIGEST_MAX_FETCH_BYTES_UPPER_BOUND + 1,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("max_fetch_bytes"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_enable_file_tools_requires_file_root() {
+        let config = DigestConfig {
+            enable_file_tools: true,
+            file_root: None,
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("file_root"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_enable_file_tools_requires_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing-digest-file-root");
+        let config = DigestConfig {
+            enable_file_tools: true,
+            file_root: Some(missing),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("not accessible"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_enable_file_tools_rejects_file_root_that_is_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir.txt");
+        std::fs::write(&file, "x").unwrap();
+        let config = DigestConfig {
+            enable_file_tools: true,
+            file_root: Some(file),
+            ..Default::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("existing directory"), "err = {err}");
+    }
+
+    #[test]
+    fn digest_config_serde_roundtrip() {
+        let config = DigestConfig {
+            enabled: false,
+            max_single_pass_tokens: 4000,
+            max_map_reduce_chunks: 8,
+            whisper_model: "whisper-2".to_string(),
+            enable_file_tools: true,
+            max_file_bytes: 20_000_000,
+            max_pdf_file_bytes: 8_000_000,
+            max_audio_bytes: 10_000_000,
+            max_pdf_pages: 50,
+            max_extracted_chars: 123_456,
+            max_parallel_chunk_summaries: 3,
+            pdf_extract_timeout_secs: 45,
+            whisper_timeout_secs: 240,
+            llm_timeout_secs: 90,
+            file_root: Some(PathBuf::from("/data/files")),
+            max_list_entries: 250,
+            max_fetch_bytes: 1_048_576,
+            max_redirects: 3,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: DigestConfig = serde_json::from_str(&json).unwrap();
+        assert!(!back.enabled);
+        assert_eq!(back.max_single_pass_tokens, 4000);
+        assert_eq!(back.max_map_reduce_chunks, 8);
+        assert_eq!(back.whisper_model, "whisper-2");
+        assert!(back.enable_file_tools);
+        assert_eq!(back.max_file_bytes, 20_000_000);
+        assert_eq!(back.max_pdf_file_bytes, 8_000_000);
+        assert_eq!(back.max_audio_bytes, 10_000_000);
+        assert_eq!(back.max_pdf_pages, 50);
+        assert_eq!(back.max_extracted_chars, 123_456);
+        assert_eq!(back.max_parallel_chunk_summaries, 3);
+        assert_eq!(back.pdf_extract_timeout_secs, 45);
+        assert_eq!(back.whisper_timeout_secs, 240);
+        assert_eq!(back.llm_timeout_secs, 90);
+        assert_eq!(back.file_root, Some(PathBuf::from("/data/files")));
+        assert_eq!(back.max_list_entries, 250);
+        assert_eq!(back.max_fetch_bytes, 1_048_576);
+        assert_eq!(back.max_redirects, 3);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_digest_plugin_config() {
+        let mut config = valid_config();
+        config.plugins.insert(
+            "digest".to_string(),
+            serde_json::json!({
+                "max_single_pass_tokens": 0
+            }),
+        );
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("max_single_pass_tokens")),
+            "expected digest validation error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_digest_plugin_config() {
+        let mut config = valid_config();
+        config.plugins.insert(
+            "digest".to_string(),
+            serde_json::json!({
+                "enabled": "not_a_bool"
+            }),
+        );
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("plugins.digest config is invalid")),
+            "expected digest parse error, got: {:?}",
+            errors
+        );
     }
 }

@@ -5,19 +5,25 @@
 use std::sync::Arc;
 
 use encmind_agent::firewall::EgressFirewall;
+use encoding_rs::Encoding;
 use futures::StreamExt;
 use reqwest::header;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
+
+const MAX_JSON_SNIFF_BYTES: usize = 128 * 1024;
 
 /// Result of a URL fetch operation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchResult {
+    pub final_url: String,
     pub title: Option<String>,
     pub content: String,
     pub byte_length: usize,
     pub truncated: bool,
     pub content_type: String,
+    pub selector_applied: bool,
+    pub selector_ignored: bool,
 }
 
 /// Validate a URL for safety before fetching.
@@ -40,6 +46,10 @@ pub async fn validate_url(url_str: &str, firewall: &EgressFirewall) -> Result<ur
 
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("URLs with userinfo (user:pass@) are not allowed".to_string());
+    }
+
+    if parsed.host_str().is_none() {
+        return Err("URL must include a host".to_string());
     }
 
     firewall
@@ -114,7 +124,7 @@ pub async fn fetch_url(
             .filter(|v| !v.is_empty())
             .map(str::to_string);
 
-        let content_type = content_type_header
+        let mut content_type = content_type_header
             .clone()
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
@@ -158,39 +168,65 @@ pub async fn fetch_url(
         }
         let byte_length = body.len();
 
-        let (title, content) = if (mime == "text/html" || mime == "application/xhtml+xml")
+        let selector_requested = selector.is_some();
+        let (title, content, selector_applied, selector_ignored) = if (mime == "text/html"
+            || mime == "application/xhtml+xml")
             || (content_type_header.is_none() && looks_like_html(&body))
         {
-            let html = String::from_utf8_lossy(&body).to_string();
+            if content_type_header.is_none() {
+                content_type = "text/html".to_string();
+            }
+            let html = decode_body_text_with_charset(&body, content_type_header.as_deref());
             let (t, text) = html_to_text(&html, selector)
                 .map_err(|e| format!("HTML extraction failed: {e}"))?;
-            (t, text)
+            (t, text, selector_requested, false)
         } else if mime == "application/json"
             || mime.ends_with("+json")
             || (content_type_header.is_none() && looks_like_json(&body))
         {
-            let text = String::from_utf8_lossy(&body).to_string();
+            if selector_requested {
+                debug!(
+                    content_type = %content_type,
+                    "url_extract: ignoring selector for non-HTML content"
+                );
+            }
+            if content_type_header.is_none() {
+                content_type = "application/json".to_string();
+            }
+            let text = decode_body_text_with_charset(&body, content_type_header.as_deref());
             let pretty = serde_json::from_str::<serde_json::Value>(&text)
                 .map(|v| serde_json::to_string_pretty(&v).unwrap_or_else(|_| text.clone()))
                 .unwrap_or(text);
-            (None, pretty)
+            (None, pretty, false, selector_requested)
         } else {
+            if selector_requested {
+                debug!(
+                    content_type = %content_type,
+                    "url_extract: ignoring selector for non-HTML content"
+                );
+            }
             if content_type_header.is_none() && !looks_like_text(&body) {
                 return Err(
                     "unsupported content-type 'application/octet-stream'; missing Content-Type header and body is not recognized as text"
                         .to_string(),
                 );
             }
-            let text = String::from_utf8_lossy(&body).to_string();
-            (None, text)
+            if content_type_header.is_none() {
+                content_type = "text/plain".to_string();
+            }
+            let text = decode_body_text_with_charset(&body, content_type_header.as_deref());
+            (None, text, false, selector_requested)
         };
 
         return Ok(FetchResult {
+            final_url: current_url.as_str().to_string(),
             title,
             content,
             byte_length,
             truncated,
             content_type,
+            selector_applied,
+            selector_ignored,
         });
     }
 }
@@ -314,9 +350,60 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+fn extract_charset_label(content_type_header: Option<&str>) -> Option<String> {
+    let content_type = content_type_header?;
+    content_type.split(';').skip(1).find_map(|param| {
+        let (name, value) = param.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    })
+}
+
+fn decode_body_text_with_charset(body: &[u8], content_type_header: Option<&str>) -> String {
+    let Some(charset_label) = extract_charset_label(content_type_header) else {
+        return String::from_utf8_lossy(body).into_owned();
+    };
+
+    let Some(encoding) = Encoding::for_label(charset_label.as_bytes()) else {
+        debug!(
+            charset = %charset_label,
+            "url_extract: unknown charset label; falling back to UTF-8 lossy decode"
+        );
+        return String::from_utf8_lossy(body).into_owned();
+    };
+
+    let (decoded, _, had_errors) = encoding.decode(body);
+    if had_errors {
+        debug!(
+            charset = %charset_label,
+            "url_extract: charset decode had replacement errors"
+        );
+    }
+    decoded.into_owned()
+}
+
 fn looks_like_json(bytes: &[u8]) -> bool {
+    if bytes.len() > MAX_JSON_SNIFF_BYTES {
+        debug!(
+            body_bytes = bytes.len(),
+            sniff_cap_bytes = MAX_JSON_SNIFF_BYTES,
+            "url_extract: skipping JSON sniff due to body size cap"
+        );
+        return false;
+    }
+
     if let Ok(text) = std::str::from_utf8(bytes) {
-        serde_json::from_str::<serde_json::Value>(text).is_ok()
+        let s = text.trim();
+        let likely_json_document =
+            (s.starts_with('{') && s.ends_with('}')) || (s.starts_with('[') && s.ends_with(']'));
+        likely_json_document && serde_json::from_str::<serde_json::Value>(s).is_ok()
     } else {
         false
     }
@@ -351,14 +438,39 @@ fn looks_like_text(bytes: &[u8]) -> bool {
 /// - Manual redirect policy (no automatic following)
 /// - 30s timeout
 /// - Custom User-Agent
-pub fn build_fetch_client() -> reqwest::Client {
-    reqwest::Client::builder()
+pub fn build_fetch_client_with_user_agent(
+    user_agent: &str,
+) -> Result<reqwest::Client, reqwest::Error> {
+    let primary = reqwest::Client::builder()
+        // Keep outbound routing deterministic for firewall enforcement.
+        // Plugin network calls should not inherit ambient proxy settings.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent(format!("EncMind-NetProbe/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("failed to build reqwest client")
+        .user_agent(user_agent.to_string())
+        .build();
+    match primary {
+        Ok(client) => Ok(client),
+        Err(primary_err) => {
+            warn!(
+                error = %primary_err,
+                user_agent,
+                "url_extract: failed to build fetch client with custom user-agent; retrying with hardened defaults"
+            );
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .build()
+        }
+    }
+}
+
+/// Build a fetch client for NetProbe-compatible traffic.
+pub fn build_fetch_client() -> Result<reqwest::Client, reqwest::Error> {
+    build_fetch_client_with_user_agent(&format!("EncMind-NetProbe/{}", env!("CARGO_PKG_VERSION")))
 }
 
 #[cfg(test)]
@@ -476,6 +588,19 @@ mod tests {
         assert!(err.contains("matched no elements"), "err = {err}");
     }
 
+    #[test]
+    fn extract_charset_label_parses_charset_param() {
+        let label = extract_charset_label(Some("text/html; charset=ISO-8859-1"));
+        assert_eq!(label.as_deref(), Some("ISO-8859-1"));
+    }
+
+    #[test]
+    fn decode_body_text_with_charset_decodes_latin1() {
+        let body = [0x63, 0x61, 0x66, 0xE9]; // "café" in ISO-8859-1
+        let decoded = decode_body_text_with_charset(&body, Some("text/plain; charset=ISO-8859-1"));
+        assert_eq!(decoded, "café");
+    }
+
     #[tokio::test]
     async fn fetch_truncates_at_max_bytes() {
         let app = Router::new().route("/big", get(|| async move { "x".repeat(2000) }));
@@ -497,7 +622,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/big"),
             &client,
@@ -548,7 +673,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/doc"),
             &client,
@@ -591,7 +716,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let err = fetch_url(
             &format!("http://{addr}/img"),
             &client,
@@ -640,7 +765,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/no-ct-html"),
             &client,
@@ -652,7 +777,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.content_type, "application/octet-stream");
+        assert_eq!(result.content_type, "text/html");
         assert!(
             result.content.contains("Hello"),
             "content = {}",
@@ -690,7 +815,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let err = fetch_url(
             &format!("http://{addr}/no-ct-bin"),
             &client,
@@ -742,7 +867,7 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client();
+        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/no-ct-uppercase-html"),
             &client,
@@ -754,7 +879,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result.content_type, "application/octet-stream");
+        assert_eq!(result.content_type, "text/html");
         assert!(
             result.content.contains("Hello"),
             "content = {}",
@@ -773,6 +898,6 @@ mod tests {
 
     #[test]
     fn build_fetch_client_succeeds() {
-        let _client = build_fetch_client();
+        let _client = build_fetch_client().expect("failed to build fetch client");
     }
 }

@@ -2275,11 +2275,35 @@ pub(crate) fn build_native_plugins(
     if netprobe_config.enabled {
         plugins.push(Box::new(crate::plugins::netprobe::NetProbePlugin::new(
             netprobe_config,
+            firewall.clone(),
+            runtime.clone(),
+        )));
+    } else {
+        info!("netprobe plugin disabled by configuration");
+    }
+
+    // Digest plugin (summarize, PDF, transcribe) — enabled by default.
+    let digest_config: encmind_core::config::DigestConfig = match config.plugins.get("digest") {
+        Some(raw) => match serde_json::from_value(raw.clone()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "failed to parse plugins.digest config; falling back to defaults"
+                );
+                encmind_core::config::DigestConfig::default()
+            }
+        },
+        None => encmind_core::config::DigestConfig::default(),
+    };
+    if digest_config.enabled {
+        plugins.push(Box::new(crate::plugins::digest::DigestPlugin::new(
+            digest_config,
             firewall,
             runtime,
         )));
     } else {
-        info!("netprobe plugin disabled by configuration");
+        info!("digest plugin disabled by configuration");
     }
 
     plugins
