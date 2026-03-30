@@ -1155,6 +1155,12 @@ fn list_dir_entries(
         let entry = entry_result.map_err(|e| {
             AppError::Internal(format!("digest: error reading requested directory: {e}"))
         })?;
+        let file_type = entry.file_type().ok();
+        if file_type.as_ref().is_some_and(|m| m.is_symlink()) {
+            // Do not disclose symlink names/types to avoid filesystem topology leakage.
+            continue;
+        }
+
         total_entries = total_entries.saturating_add(1);
 
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -1162,12 +1168,6 @@ fn list_dir_entries(
             if !name.to_ascii_lowercase().contains(filter) {
                 continue;
             }
-        }
-
-        let file_type = entry.file_type().ok();
-        if file_type.as_ref().is_some_and(|m| m.is_symlink()) {
-            // Do not disclose symlink names/types to avoid filesystem topology leakage.
-            continue;
         }
         matched_entries = matched_entries.saturating_add(1);
         let entry_type = if file_type.as_ref().is_some_and(|m| m.is_dir()) {

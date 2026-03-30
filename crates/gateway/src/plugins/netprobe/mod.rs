@@ -591,14 +591,18 @@ fn build_searxng_api_url(base_url: &str, query: &str) -> Result<reqwest::Url, Ap
     Ok(url)
 }
 
+struct RedirectPolicy {
+    max_redirects: usize,
+    allow_cross_origin: bool,
+    allow_same_host_https_upgrade: bool,
+}
+
 fn resolve_redirect_target(
     start: &reqwest::Url,
     current_url: &str,
     response: &reqwest::Response,
     hops: &mut usize,
-    max_redirects: usize,
-    allow_cross_origin_redirects: bool,
-    allow_same_host_redirects: bool,
+    policy: &RedirectPolicy,
     request_label: &str,
 ) -> Result<Option<reqwest::Url>, AppError> {
     if !response.status().is_redirection() {
@@ -606,9 +610,10 @@ fn resolve_redirect_target(
     }
 
     *hops += 1;
-    if *hops > max_redirects {
+    if *hops > policy.max_redirects {
         return Err(AppError::Internal(format!(
-            "{request_label}: too many redirects (>{max_redirects}) from {start}"
+            "{request_label}: too many redirects (>{}) from {start}",
+            policy.max_redirects
         )));
     }
 
@@ -632,10 +637,10 @@ fn resolve_redirect_target(
         ))
     })?;
     ensure_http_url(&next, request_label, "redirect target")?;
-    if !allow_cross_origin_redirects
-        && !same_origin(start, &next)
-        && !(allow_same_host_redirects && same_host_https_upgrade(start, &next))
-    {
+    let redirect_allowed = policy.allow_cross_origin
+        || same_origin(start, &next)
+        || (policy.allow_same_host_https_upgrade && same_host_https_upgrade(start, &next));
+    if !redirect_allowed {
         return Err(AppError::Internal(format!(
             "{request_label}: cross-origin redirect blocked from '{start}' to '{next}'"
         )));
@@ -708,9 +713,7 @@ async fn parse_json_response_capped(
 async fn send_with_manual_redirects<F, Fut>(
     firewall: &EgressFirewall,
     start_url: &str,
-    max_redirects: usize,
-    allow_cross_origin_redirects: bool,
-    allow_same_host_redirects: bool,
+    redirect_policy: &RedirectPolicy,
     request_label: &str,
     mut send_once: F,
 ) -> Result<reqwest::Response, AppError>
@@ -745,9 +748,7 @@ where
             &current_url,
             &response,
             &mut hops,
-            max_redirects,
-            allow_cross_origin_redirects,
-            allow_same_host_redirects,
+            redirect_policy,
             request_label,
         )?;
         let Some(next) = maybe_next else {
@@ -759,8 +760,7 @@ where
 
 struct PostJsonRedirectRequest<'a> {
     start_url: &'a str,
-    max_redirects: usize,
-    allow_cross_origin_redirects: bool,
+    redirect_policy: RedirectPolicy,
     compat_301_302_to_get: bool,
     request_label: &'a str,
     body: &'a serde_json::Value,
@@ -772,8 +772,7 @@ async fn send_post_json_with_manual_redirects(
 ) -> Result<reqwest::Response, AppError> {
     let PostJsonRedirectRequest {
         start_url,
-        max_redirects,
-        allow_cross_origin_redirects,
+        redirect_policy,
         compat_301_302_to_get,
         request_label,
         body,
@@ -821,9 +820,7 @@ async fn send_post_json_with_manual_redirects(
             &current_url,
             &response,
             &mut hops,
-            max_redirects,
-            allow_cross_origin_redirects,
-            false,
+            &redirect_policy,
             request_label,
         )?;
         let Some(next) = maybe_next else {
@@ -868,8 +865,11 @@ async fn tavily_search(
         firewall,
         PostJsonRedirectRequest {
             start_url: api_url,
-            max_redirects: config.max_redirects,
-            allow_cross_origin_redirects: false,
+            redirect_policy: RedirectPolicy {
+                max_redirects: config.max_redirects,
+                allow_cross_origin: false,
+                allow_same_host_https_upgrade: false,
+            },
             compat_301_302_to_get: config.post_redirect_compat_301_302_to_get,
             request_label: "Tavily API",
             body: &body,
@@ -941,9 +941,11 @@ async fn brave_search(
     let resp = send_with_manual_redirects(
         firewall,
         &api_url,
-        max_redirects,
-        false,
-        false,
+        &RedirectPolicy {
+            max_redirects,
+            allow_cross_origin: false,
+            allow_same_host_https_upgrade: false,
+        },
         "Brave API",
         |client, url| {
             client
@@ -1019,11 +1021,12 @@ async fn searxng_search(
     let resp = send_with_manual_redirects(
         firewall,
         api_url.as_ref(),
-        max_redirects,
-        false,
-        // Allow same-host scheme/port canonicalization (e.g. http->https),
-        // but block cross-host redirects.
-        true,
+        &RedirectPolicy {
+            max_redirects,
+            allow_cross_origin: false,
+            // Allow same-host http->https upgrade, but block cross-host redirects.
+            allow_same_host_https_upgrade: true,
+        },
         "SearXNG API",
         |client, url| client.get(url).send(),
     )
@@ -1620,9 +1623,11 @@ mod tests {
         let response = send_with_manual_redirects(
             &firewall,
             &start_url,
-            5,
-            true,
-            false,
+            &RedirectPolicy {
+                max_redirects: 5,
+                allow_cross_origin: true,
+                allow_same_host_https_upgrade: false,
+            },
             "test",
             |client, url| client.get(url).send(),
         )
@@ -1671,9 +1676,11 @@ mod tests {
         let err = send_with_manual_redirects(
             &firewall,
             &start_url,
-            1,
-            true,
-            false,
+            &RedirectPolicy {
+                max_redirects: 1,
+                allow_cross_origin: true,
+                allow_same_host_https_upgrade: false,
+            },
             "test",
             |client, url| client.get(url).send(),
         )
@@ -1739,8 +1746,11 @@ mod tests {
             &firewall,
             PostJsonRedirectRequest {
                 start_url: &start_url,
-                max_redirects: 5,
-                allow_cross_origin_redirects: true,
+                redirect_policy: RedirectPolicy {
+                    max_redirects: 5,
+                    allow_cross_origin: true,
+                    allow_same_host_https_upgrade: false,
+                },
                 compat_301_302_to_get,
                 request_label: "test",
                 body: &body,
