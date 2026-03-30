@@ -900,7 +900,6 @@ async fn digest_url_output_includes_fetch_metadata() {
     }));
     let handler = DigestUrlHandler {
         config: DigestConfig::default(),
-        http_client: url_extract::build_fetch_client().expect("failed to build fetch client"),
         firewall: Arc::new(EgressFirewall::new(&fw_cfg)),
         runtime,
     };
@@ -1147,24 +1146,25 @@ async fn whisper_transcribe_reports_error_for_non_success_response() {
     let dir = tempfile::tempdir().unwrap();
     let audio_path = dir.path().join("test.mp3");
     std::fs::write(&audio_path, vec![1_u8, 2_u8, 3_u8]).unwrap();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let fw_cfg = encmind_core::config::EgressFirewallConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let firewall = EgressFirewall::new(&fw_cfg);
     let url = format!("http://{addr}/v1/audio/transcriptions");
     let request = WhisperTranscribeRequest {
         api_key: "test-key",
         file_path: &audio_path,
-        source_path_for_errors: &audio_path,
         filename: "test.mp3",
         model: "whisper-1",
         language: None,
         url: &url,
     };
-    let err = whisper_transcribe(&client, &request).await.unwrap_err();
+    let err = whisper_transcribe(&firewall, 180, &request)
+        .await
+        .unwrap_err();
     assert!(
-        err.to_string().contains("400") && err.to_string().contains("invalid request payload"),
+        err.to_string().contains("400") && err.to_string().contains("upstream request failed"),
         "err = {err}"
     );
     server.abort();
@@ -1211,18 +1211,21 @@ async fn whisper_transcribe_retries_429_with_retry_after_then_succeeds() {
     let dir = tempfile::tempdir().unwrap();
     let audio_path = dir.path().join("test.mp3");
     std::fs::write(&audio_path, vec![1_u8, 2_u8, 3_u8]).unwrap();
-    let client = reqwest::Client::new();
+    let fw_cfg = encmind_core::config::EgressFirewallConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let firewall = EgressFirewall::new(&fw_cfg);
     let url = format!("http://{addr}/v1/audio/transcriptions");
     let request = WhisperTranscribeRequest {
         api_key: "test-key",
         file_path: &audio_path,
-        source_path_for_errors: &audio_path,
         filename: "test.mp3",
         model: "whisper-1",
         language: None,
         url: &url,
     };
-    let transcript = whisper_transcribe(&client, &request)
+    let transcript = whisper_transcribe(&firewall, 180, &request)
         .await
         .expect("whisper should eventually succeed");
     assert_eq!(transcript, "transcript ok");
@@ -1412,17 +1415,20 @@ fn truncate_to_max_chars_reports_source_and_returned_word_counts() {
 async fn transcribe_integration() {
     // Requires OPENAI_API_KEY and a short audio file at /tmp/test_audio.mp3
     let api_key = std::env::var("OPENAI_API_KEY").expect("OPENAI_API_KEY must be set");
-    let client = reqwest::Client::new();
+    let fw_cfg = encmind_core::config::EgressFirewallConfig {
+        enabled: false,
+        ..Default::default()
+    };
+    let firewall = EgressFirewall::new(&fw_cfg);
     let request = WhisperTranscribeRequest {
         api_key: &api_key,
         file_path: Path::new("/tmp/test_audio.mp3"),
-        source_path_for_errors: Path::new("/tmp/test_audio.mp3"),
         filename: "test_audio.mp3",
         model: "whisper-1",
         language: Some("en"),
         url: OPENAI_WHISPER_TRANSCRIBE_URL,
     };
-    let result = whisper_transcribe(&client, &request).await;
+    let result = whisper_transcribe(&firewall, 180, &request).await;
     assert!(result.is_ok(), "transcription failed: {:?}", result.err());
     assert!(!result.unwrap().is_empty());
 }
@@ -1622,10 +1628,7 @@ async fn digest_list_files_handler_defaults_to_file_root() {
         .await
         .unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(
-        parsed["directory"].as_str().unwrap(),
-        dir.path().canonicalize().unwrap().display().to_string()
-    );
+    assert_eq!(parsed["directory"].as_str().unwrap(), ".");
     assert_eq!(parsed["total_entries"], 1);
 }
 

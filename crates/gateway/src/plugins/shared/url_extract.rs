@@ -2,7 +2,10 @@
 //!
 //! Reusable by any plugin that needs to retrieve web content (NetProbe, Digest, etc.).
 
+use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use encmind_agent::firewall::EgressFirewall;
 use encoding_rs::Encoding;
@@ -60,9 +63,32 @@ pub async fn validate_url(url_str: &str, firewall: &EgressFirewall) -> Result<ur
     Ok(parsed)
 }
 
-/// Fetch a URL with redirect following and size limits.
+/// Build a per-hop pinned client using pre-resolved addresses.
+fn build_pinned_fetch_client(
+    url: &url::Url,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, String> {
+    let host = url.host_str().unwrap_or_default();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10));
+
+    // Pin DNS answers for domain hosts so transport uses the same checked IPs.
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+
+    builder
+        .build()
+        .map_err(|e| format!("failed to build pinned fetch client: {e}"))
+}
+
+/// Fetch a URL with redirect following, DNS pinning, and size limits.
 ///
-/// - Manual redirect following (re-validates each hop via firewall)
+/// - DNS resolved atomically with firewall policy checks per hop
+/// - Manual redirect following (re-validates + re-pins each hop)
 /// - Truncates response body at `max_bytes`
 /// - Routes on Content-Type:
 ///   - HTML → extracted text
@@ -71,7 +97,6 @@ pub async fn validate_url(url_str: &str, firewall: &EgressFirewall) -> Result<ur
 ///   - others → rejected as unsupported
 pub async fn fetch_url(
     url_str: &str,
-    client: &reqwest::Client,
     firewall: &Arc<EgressFirewall>,
     max_bytes: usize,
     max_redirects: usize,
@@ -81,12 +106,18 @@ pub async fn fetch_url(
     let mut hops = 0;
 
     loop {
-        debug!(url = %current_url, hop = hops, "fetch_url");
-        let resp = client
+        debug!(url = %current_url, hop = hops, "fetch_url: resolving + pinning DNS");
+        let addrs = firewall
+            .resolve_checked_addrs(current_url.as_str())
+            .await
+            .map_err(|e| format!("egress check failed for {current_url}: {e}"))?;
+        let pinned_client = build_pinned_fetch_client(&current_url, &addrs)?;
+        let resp = pinned_client
             .get(current_url.as_str())
             .send()
             .await
             .map_err(|e| format!("HTTP request failed: {e}"))?;
+        ensure_response_remote_addr_allowed(firewall, &resp, &current_url)?;
 
         let status = resp.status();
 
@@ -105,9 +136,11 @@ pub async fn fetch_url(
             let next = current_url
                 .join(location)
                 .map_err(|e| format!("invalid redirect URL '{location}': {e}"))?;
+            if !next.username().is_empty() || next.password().is_some() {
+                return Err("redirect target with userinfo (user:pass@) is not allowed".to_string());
+            }
 
-            // Re-validate the redirect target through the firewall.
-            validate_url(next.as_str(), firewall).await?;
+            // Redirect target will be validated + DNS-pinned at the top of the next loop iteration.
             current_url = next;
             continue;
         }
@@ -229,6 +262,31 @@ pub async fn fetch_url(
             selector_ignored,
         });
     }
+}
+
+fn ensure_response_remote_addr_allowed(
+    firewall: &EgressFirewall,
+    response: &reqwest::Response,
+    request_url: &url::Url,
+) -> Result<(), String> {
+    if !firewall.blocks_private_ranges() {
+        return Ok(());
+    }
+
+    if let Some(remote) = response.remote_addr() {
+        if EgressFirewall::is_private_ip(&remote.ip()) {
+            warn!(
+                remote = %remote,
+                url = %request_url,
+                "url_extract: response from private IP blocked"
+            );
+            return Err(format!("destination is not allowed for {request_url}"));
+        }
+    } else {
+        return Err(format!("unable to verify remote address for {request_url}"));
+    }
+
+    Ok(())
 }
 
 /// Convert HTML to readable text, stripping navigation/script/style elements.
@@ -622,17 +680,9 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
-        let result = fetch_url(
-            &format!("http://{addr}/big"),
-            &client,
-            &firewall,
-            100,
-            2,
-            None,
-        )
-        .await
-        .unwrap();
+        let result = fetch_url(&format!("http://{addr}/big"), &firewall, 100, 2, None)
+            .await
+            .unwrap();
 
         assert_eq!(result.byte_length, 100);
         assert!(result.truncated);
@@ -673,10 +723,8 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/doc"),
-            &client,
             &firewall,
             4096,
             2,
@@ -716,17 +764,9 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
-        let err = fetch_url(
-            &format!("http://{addr}/img"),
-            &client,
-            &firewall,
-            4096,
-            2,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = fetch_url(&format!("http://{addr}/img"), &firewall, 4096, 2, None)
+            .await
+            .unwrap_err();
         assert!(err.contains("unsupported content-type"), "err = {err}");
         server.abort();
     }
@@ -765,10 +805,8 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/no-ct-html"),
-            &client,
             &firewall,
             4096,
             2,
@@ -815,10 +853,8 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
         let err = fetch_url(
             &format!("http://{addr}/no-ct-bin"),
-            &client,
             &firewall,
             4096,
             2,
@@ -867,10 +903,8 @@ mod tests {
             ..Default::default()
         };
         let firewall = Arc::new(EgressFirewall::new(&fw_cfg));
-        let client = build_fetch_client().expect("failed to build fetch client");
         let result = fetch_url(
             &format!("http://{addr}/no-ct-uppercase-html"),
-            &client,
             &firewall,
             4096,
             2,

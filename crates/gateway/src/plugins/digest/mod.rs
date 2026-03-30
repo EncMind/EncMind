@@ -7,9 +7,12 @@
 //! - `digest_file`: Extract text from PDF or text files.
 //! - `digest_transcribe`: Audio transcription via OpenAI Whisper API.
 
-use std::collections::HashMap;
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap};
 use std::env::VarError;
+use std::fs::{File, Metadata};
 use std::io::{Read, Write};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,7 +134,7 @@ impl NativePlugin for DigestPlugin {
                 }),
             )?;
 
-            if let Some(http_client) = self.http_client.as_ref().cloned() {
+            if self.http_client.is_some() {
                 // ── digest_url ────────────────────────────────────────────
                 api.register_tool(
                     "url",
@@ -157,7 +160,6 @@ impl NativePlugin for DigestPlugin {
                 }),
                     Arc::new(DigestUrlHandler {
                         config: self.config.clone(),
-                        http_client,
                         firewall: self.firewall.clone(),
                         runtime: self.runtime.clone(),
                     }),
@@ -269,6 +271,7 @@ const OPENAI_WHISPER_TRANSCRIBE_URL: &str = "https://api.openai.com/v1/audio/tra
 const REDUCE_PROMPT_OVERHEAD_TOKENS: u32 = 384;
 const MAX_REDUCE_PASSES: usize = 6;
 const PDF_EXTRACT_CONCURRENCY_LIMIT: usize = 1;
+const PDF_EXTRACT_GLOBAL_CONCURRENCY_LIMIT: usize = 2;
 const PDF_EXTRACT_SEMAPHORE_CACHE_SOFT_LIMIT: usize = 512;
 const DIGEST_MAX_WHISPER_RESPONSE_BODY_BYTES: usize = 1_048_576;
 const PDF_EXTRACT_SEMAPHORE_CACHE_HARD_LIMIT: usize = 4096;
@@ -306,6 +309,62 @@ fn build_default_hardened_whisper_builder(timeout_secs: u64) -> reqwest::ClientB
 fn build_whisper_client(timeout_secs: u64) -> Result<reqwest::Client, reqwest::Error> {
     let user_agent = format!("EncMind-Digest/{}", env!("CARGO_PKG_VERSION"));
     build_whisper_client_with_user_agent(timeout_secs, &user_agent)
+}
+
+fn build_pinned_whisper_client(
+    timeout_secs: u64,
+    request_url: &str,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, AppError> {
+    let parsed = reqwest::Url::parse(request_url).map_err(|e| {
+        AppError::Internal(format!(
+            "digest_transcribe: invalid request URL '{request_url}': {e}"
+        ))
+    })?;
+    let host = parsed.host_str().ok_or_else(|| {
+        AppError::Internal(format!(
+            "digest_transcribe: request URL missing host: {request_url}"
+        ))
+    })?;
+    let user_agent = format!("EncMind-Digest/{}", env!("CARGO_PKG_VERSION"));
+    let mut builder = build_default_hardened_whisper_builder(timeout_secs).user_agent(user_agent);
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    builder.build().map_err(|e| {
+        AppError::Internal(format!(
+            "digest_transcribe: failed to build pinned Whisper client for '{request_url}': {e}"
+        ))
+    })
+}
+
+fn ensure_whisper_remote_addr_allowed(
+    firewall: &EgressFirewall,
+    response: &reqwest::Response,
+    request_url: &str,
+) -> Result<(), AppError> {
+    if !firewall.blocks_private_ranges() {
+        return Ok(());
+    }
+
+    if let Some(remote) = response.remote_addr() {
+        if EgressFirewall::is_private_ip(&remote.ip()) {
+            warn!(
+                remote = %remote,
+                url = request_url,
+                "digest_transcribe: response from private IP blocked"
+            );
+            return Err(AppError::Internal(
+                "digest_transcribe: destination is not allowed".to_string(),
+            ));
+        }
+    } else {
+        return Err(AppError::Internal(format!(
+            "digest_transcribe: unable to verify remote address for {request_url}"
+        )));
+    }
+
+    Ok(())
 }
 
 fn serialize_output(output: &serde_json::Value, context: &str) -> Result<String, AppError> {
@@ -890,63 +949,147 @@ async fn summarize_text(
         .map(|result| result.summary)
 }
 
-/// Validate that a file path is within the configured canonical root and exists.
-fn validate_file_path(path_str: &str, file_root: Option<&Path>) -> Result<PathBuf, AppError> {
+struct ValidatedFile {
+    canonical_path: PathBuf,
+    file: File,
+    metadata: Metadata,
+}
+
+#[cfg(unix)]
+fn same_file_metadata(opened: &Metadata, current_path: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    opened.dev() == current_path.dev() && opened.ino() == current_path.ino()
+}
+
+#[cfg(windows)]
+fn same_file_metadata(opened: &Metadata, current_path: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    match (
+        opened.volume_serial_number(),
+        opened.file_index(),
+        current_path.volume_serial_number(),
+        current_path.file_index(),
+    ) {
+        (Some(opened_volume), Some(opened_index), Some(current_volume), Some(current_index)) => {
+            opened_volume == current_volume && opened_index == current_index
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file_metadata(_opened: &Metadata, _current_path: &Metadata) -> bool {
+    // Fail closed when file identity metadata is unavailable on this target.
+    false
+}
+
+/// Validate that a file path is within the configured canonical root and exists, then
+/// open it and verify metadata did not change between validation and open.
+fn validate_and_open_file(
+    path_str: &str,
+    file_root: Option<&Path>,
+) -> Result<ValidatedFile, AppError> {
     let path = PathBuf::from(path_str);
     if !path.is_absolute() {
-        return Err(AppError::Internal(format!(
-            "digest: file path must be absolute: '{path_str}'"
-        )));
+        return Err(AppError::Internal(
+            "digest: file path must be absolute".to_string(),
+        ));
     }
 
     let canonical = path
         .canonicalize()
-        .map_err(|e| AppError::Internal(format!("digest: cannot access file '{path_str}': {e}")))?;
+        .map_err(|_| AppError::Internal("digest: cannot access requested file".to_string()))?;
 
     if !canonical.is_file() {
-        return Err(AppError::Internal(format!(
-            "digest: '{path_str}' is not a file"
-        )));
+        return Err(AppError::Internal(
+            "digest: requested path is not a file".to_string(),
+        ));
     }
 
     if let Some(root) = file_root {
         if !canonical.starts_with(root) {
-            return Err(AppError::Internal(format!(
-                "digest: file path '{}' is outside the allowed file_root '{}'",
-                canonical.display(),
-                root.display()
-            )));
+            return Err(AppError::Internal(
+                "digest: file path is outside the allowed file_root".to_string(),
+            ));
         }
     }
 
-    Ok(canonical)
+    let pre_open_path_metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|_| AppError::Internal("digest: cannot access requested file".to_string()))?;
+    if pre_open_path_metadata.file_type().is_symlink() {
+        return Err(AppError::Internal(
+            "digest: symlink paths are not allowed".to_string(),
+        ));
+    }
+    if !pre_open_path_metadata.is_file() {
+        return Err(AppError::Internal(
+            "digest: requested path is not a regular file".to_string(),
+        ));
+    }
+
+    let file = File::open(&canonical)
+        .map_err(|_| AppError::Internal("digest: cannot open requested file".to_string()))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| AppError::Internal("digest: cannot read file metadata".to_string()))?;
+    if !opened_metadata.is_file() {
+        return Err(AppError::Internal(
+            "digest: requested path is not a regular file".to_string(),
+        ));
+    }
+
+    // TOCTOU hardening: re-check path metadata and reject if the opened descriptor
+    // no longer points at the same file object.
+    let current_path_metadata = std::fs::symlink_metadata(&canonical)
+        .map_err(|_| AppError::Internal("digest: cannot re-check file metadata".to_string()))?;
+    if current_path_metadata.file_type().is_symlink() {
+        return Err(AppError::Internal(
+            "digest: symlink paths are not allowed".to_string(),
+        ));
+    }
+    if !same_file_metadata(&opened_metadata, &pre_open_path_metadata)
+        || !same_file_metadata(&opened_metadata, &current_path_metadata)
+    {
+        return Err(AppError::Internal(
+            "digest: file changed during validation/open; retry".to_string(),
+        ));
+    }
+
+    Ok(ValidatedFile {
+        canonical_path: canonical,
+        file,
+        metadata: opened_metadata,
+    })
+}
+
+#[cfg(test)]
+fn validate_file_path(path_str: &str, file_root: Option<&Path>) -> Result<PathBuf, AppError> {
+    validate_and_open_file(path_str, file_root).map(|validated| validated.canonical_path)
 }
 
 /// Validate that a directory path is within the configured canonical root and exists.
 fn validate_dir_path(path_str: &str, file_root: &Path) -> Result<PathBuf, AppError> {
     let path = PathBuf::from(path_str);
     if !path.is_absolute() {
-        return Err(AppError::Internal(format!(
-            "digest: directory path must be absolute: '{path_str}'"
-        )));
+        return Err(AppError::Internal(
+            "digest: directory path must be absolute".to_string(),
+        ));
     }
 
-    let canonical = path.canonicalize().map_err(|e| {
-        AppError::Internal(format!("digest: cannot access directory '{path_str}': {e}"))
-    })?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| AppError::Internal("digest: cannot access requested directory".to_string()))?;
 
     if !canonical.is_dir() {
-        return Err(AppError::Internal(format!(
-            "digest: '{path_str}' is not a directory"
-        )));
+        return Err(AppError::Internal(
+            "digest: requested path is not a directory".to_string(),
+        ));
     }
 
     if !canonical.starts_with(file_root) {
-        return Err(AppError::Internal(format!(
-            "digest: directory '{}' is outside the allowed file_root '{}'",
-            canonical.display(),
-            file_root.display()
-        )));
+        return Err(AppError::Internal(
+            "digest: directory path is outside the allowed file_root".to_string(),
+        ));
     }
 
     Ok(canonical)
@@ -959,6 +1102,29 @@ struct DirEntry {
     #[serde(rename = "type")]
     entry_type: &'static str,
     size_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+struct DirEntryByName(DirEntry);
+
+impl PartialEq for DirEntryByName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for DirEntryByName {}
+
+impl PartialOrd for DirEntryByName {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DirEntryByName {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        self.0.name.cmp(&other.0.name)
+    }
 }
 
 struct ListDirEntriesResult {
@@ -977,23 +1143,17 @@ fn list_dir_entries(
     filter: Option<&str>,
     max_entries: usize,
 ) -> Result<ListDirEntriesResult, AppError> {
-    let read_dir = std::fs::read_dir(dir).map_err(|e| {
-        AppError::Internal(format!(
-            "digest: cannot read directory '{}': {e}",
-            dir.display()
-        ))
-    })?;
+    let read_dir = std::fs::read_dir(dir)
+        .map_err(|e| AppError::Internal(format!("digest: cannot read requested directory: {e}")))?;
 
     let filter_lc = filter.map(|f| f.to_ascii_lowercase());
     let mut total_entries = 0usize;
-    let mut matched = Vec::new();
+    let mut matched_entries = 0usize;
+    let mut top_entries = BinaryHeap::with_capacity(max_entries.saturating_add(1));
 
     for entry_result in read_dir {
         let entry = entry_result.map_err(|e| {
-            AppError::Internal(format!(
-                "digest: error reading entry in '{}': {e}",
-                dir.display()
-            ))
+            AppError::Internal(format!("digest: error reading requested directory: {e}"))
         })?;
         total_entries = total_entries.saturating_add(1);
 
@@ -1005,12 +1165,15 @@ fn list_dir_entries(
         }
 
         let file_type = entry.file_type().ok();
+        if file_type.as_ref().is_some_and(|m| m.is_symlink()) {
+            // Do not disclose symlink names/types to avoid filesystem topology leakage.
+            continue;
+        }
+        matched_entries = matched_entries.saturating_add(1);
         let entry_type = if file_type.as_ref().is_some_and(|m| m.is_dir()) {
             "directory"
         } else if file_type.as_ref().is_some_and(|m| m.is_file()) {
             "file"
-        } else if file_type.as_ref().is_some_and(|m| m.is_symlink()) {
-            "symlink"
         } else {
             "other"
         };
@@ -1020,19 +1183,29 @@ fn list_dir_entries(
             None
         };
 
-        matched.push(DirEntry {
+        let candidate = DirEntry {
             name,
             entry_type,
             size_bytes,
-        });
+        };
+        if max_entries == 0 {
+            continue;
+        }
+        if top_entries.len() < max_entries {
+            top_entries.push(DirEntryByName(candidate));
+            continue;
+        }
+        if let Some(largest) = top_entries.peek() {
+            if candidate.name < largest.0.name {
+                let _ = top_entries.pop();
+                top_entries.push(DirEntryByName(candidate));
+            }
+        }
     }
 
+    let mut matched: Vec<DirEntry> = top_entries.into_iter().map(|item| item.0).collect();
     matched.sort_by(|a, b| a.name.cmp(&b.name));
-    let matched_entries = matched.len();
     let truncated = matched_entries > max_entries;
-    if truncated {
-        matched.truncate(max_entries);
-    }
 
     Ok(ListDirEntriesResult {
         entries: matched,
@@ -1092,14 +1265,11 @@ fn extract_pdf(path: &Path, max_pages: u32) -> Result<(String, u32), AppError> {
     Ok((result, effective_pages))
 }
 
-fn validate_file_size(path: &Path, max_bytes: usize, limit_name: &str) -> Result<(), AppError> {
-    let metadata = std::fs::metadata(path).map_err(|e| {
-        AppError::Internal(format!(
-            "digest: cannot access file '{}': {e}",
-            path.display()
-        ))
-    })?;
-
+fn validate_file_size_metadata(
+    metadata: &Metadata,
+    max_bytes: usize,
+    limit_name: &str,
+) -> Result<(), AppError> {
     if metadata.len() as usize > max_bytes {
         return Err(AppError::Internal(format!(
             "digest: file is {} bytes, exceeding {limit_name} of {} bytes",
@@ -1109,6 +1279,17 @@ fn validate_file_size(path: &Path, max_bytes: usize, limit_name: &str) -> Result
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn validate_file_size(path: &Path, max_bytes: usize, limit_name: &str) -> Result<(), AppError> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        AppError::Internal(format!(
+            "digest: cannot access file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    validate_file_size_metadata(&metadata, max_bytes, limit_name)
 }
 
 struct TruncateResult {
@@ -1217,10 +1398,26 @@ fn validate_audio_extension(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Validate an audio file: check extension and size.
-fn validate_audio_file(path: &Path, max_audio_bytes: usize) -> Result<(), AppError> {
+/// Validate an audio file with already-read metadata: check extension and size.
+fn validate_audio_file_with_metadata(
+    path: &Path,
+    metadata: &Metadata,
+    max_audio_bytes: usize,
+) -> Result<(), AppError> {
     validate_audio_extension(path)?;
-    validate_file_size(path, max_audio_bytes, "max_audio_bytes")
+    validate_file_size_metadata(metadata, max_audio_bytes, "max_audio_bytes")
+}
+
+/// Validate an audio file by path: check extension and size.
+#[cfg(test)]
+fn validate_audio_file(path: &Path, max_audio_bytes: usize) -> Result<(), AppError> {
+    let metadata = std::fs::metadata(path).map_err(|e| {
+        AppError::Internal(format!(
+            "digest: cannot access file '{}': {e}",
+            path.display()
+        ))
+    })?;
+    validate_audio_file_with_metadata(path, &metadata, max_audio_bytes)
 }
 
 fn decode_utf8_chunk_with_pending(
@@ -1288,17 +1485,11 @@ fn decode_utf8_chunk_with_pending(
     Ok(())
 }
 
-fn read_text_file_capped_streaming(
-    path: &Path,
+fn read_text_open_file_capped_streaming(
+    mut file: File,
+    _source_path_for_errors: &Path,
     max_bytes: usize,
 ) -> Result<(String, bool, usize), AppError> {
-    let mut file = std::fs::File::open(path).map_err(|e| {
-        AppError::Internal(format!(
-            "digest_file: failed to read '{}': {e}",
-            path.display()
-        ))
-    })?;
-
     let mut out = String::new();
     let mut pending = Vec::new();
     let mut lossy = false;
@@ -1306,12 +1497,9 @@ fn read_text_file_capped_streaming(
     let mut total_bytes = 0usize;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| {
-            AppError::Internal(format!(
-                "digest_file: failed to read '{}': {e}",
-                path.display()
-            ))
-        })?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| AppError::Internal(format!("digest_file: failed to read file: {e}")))?;
         if n == 0 {
             break;
         }
@@ -1346,21 +1534,29 @@ fn read_text_file_capped_streaming(
     Ok((out, lossy, replacement_count))
 }
 
-fn snapshot_file_capped(
+#[cfg(test)]
+fn read_text_file_capped_streaming(
     path: &Path,
+    max_bytes: usize,
+) -> Result<(String, bool, usize), AppError> {
+    let file = File::open(path).map_err(|e| {
+        AppError::Internal(format!(
+            "digest_file: failed to read '{}': {e}",
+            path.display()
+        ))
+    })?;
+    read_text_open_file_capped_streaming(file, path, max_bytes)
+}
+
+fn snapshot_open_file_capped(
+    mut source: File,
+    source_path_for_errors: &Path,
     temp_prefix: &str,
     max_bytes: usize,
     limit_name: &str,
     context: &str,
 ) -> Result<tempfile::NamedTempFile, AppError> {
-    let mut source = std::fs::File::open(path).map_err(|e| {
-        AppError::Internal(format!(
-            "{context}: failed to read '{}': {e}",
-            path.display()
-        ))
-    })?;
-
-    let suffix = path
+    let suffix = source_path_for_errors
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
@@ -1377,12 +1573,9 @@ fn snapshot_file_capped(
     let mut total = 0usize;
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = source.read(&mut buf).map_err(|e| {
-            AppError::Internal(format!(
-                "{context}: failed to read '{}': {e}",
-                path.display()
-            ))
-        })?;
+        let n = source
+            .read(&mut buf)
+            .map_err(|e| AppError::Internal(format!("{context}: failed to read file: {e}")))?;
         if n == 0 {
             break;
         }
@@ -1392,22 +1585,19 @@ fn snapshot_file_capped(
                 "digest: file is {total} bytes, exceeding {limit_name} of {max_bytes} bytes"
             )));
         }
-        snapshot.as_file_mut().write_all(&buf[..n]).map_err(|e| {
-            AppError::Internal(format!(
-                "{context}: failed to write snapshot for '{}': {e}",
-                path.display()
-            ))
-        })?;
+        snapshot
+            .as_file_mut()
+            .write_all(&buf[..n])
+            .map_err(|e| AppError::Internal(format!("{context}: failed to write snapshot: {e}")))?;
     }
-    snapshot.as_file_mut().flush().map_err(|e| {
-        AppError::Internal(format!(
-            "{context}: failed to flush snapshot for '{}': {e}",
-            path.display()
-        ))
-    })?;
+    snapshot
+        .as_file_mut()
+        .flush()
+        .map_err(|e| AppError::Internal(format!("{context}: failed to flush snapshot: {e}")))?;
     Ok(snapshot)
 }
 
+#[cfg(test)]
 async fn read_text_file_capped_async(
     path: &Path,
     max_bytes: usize,
@@ -1418,9 +1608,26 @@ async fn read_text_file_capped_async(
         .map_err(|e| AppError::Internal(format!("digest: text read task failed: {e}")))?
 }
 
+async fn read_text_open_file_capped_async(
+    file: File,
+    source_path_for_errors: PathBuf,
+    max_bytes: usize,
+) -> Result<(String, bool, usize), AppError> {
+    tokio::task::spawn_blocking(move || {
+        read_text_open_file_capped_streaming(file, &source_path_for_errors, max_bytes)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("digest: text read task failed: {e}")))?
+}
+
 fn pdf_extract_semaphore_map() -> &'static Mutex<HashMap<PathBuf, Arc<Semaphore>>> {
     static SEM_MAP: OnceLock<Mutex<HashMap<PathBuf, Arc<Semaphore>>>> = OnceLock::new();
     SEM_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pdf_extract_global_semaphore() -> &'static Arc<Semaphore> {
+    static GLOBAL_SEM: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GLOBAL_SEM.get_or_init(|| Arc::new(Semaphore::new(PDF_EXTRACT_GLOBAL_CONCURRENCY_LIMIT)))
 }
 
 fn sweep_idle_pdf_extract_semaphores(map: &mut HashMap<PathBuf, Arc<Semaphore>>) -> usize {
@@ -1497,6 +1704,15 @@ fn try_acquire_extract_permit_from(
     })
 }
 
+fn try_acquire_global_extract_permit() -> Result<OwnedSemaphorePermit, AppError> {
+    pdf_extract_global_semaphore()
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| {
+            AppError::Internal("digest: PDF extraction capacity reached; try again".to_string())
+        })
+}
+
 #[cfg(test)]
 async fn run_blocking_with_timeout<T, F>(
     timeout_secs: u64,
@@ -1532,6 +1748,20 @@ async fn extract_pdf_async(
     max_pages: u32,
     timeout_secs: u64,
 ) -> Result<(String, u32), AppError> {
+    let global_permit = match try_acquire_global_extract_permit() {
+        Ok(permit) => permit,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                source_path = %source_path_for_errors.display(),
+                timeout_secs,
+                error = %err,
+                "digest: global PDF extraction gate busy"
+            );
+            return Err(err);
+        }
+    };
+
     // Gate per-source-path extraction attempts to avoid piling up retries for the same document.
     let semaphore = pdf_extract_semaphore_for(source_path_for_errors)?;
     let permit = match try_acquire_extract_permit_from(&semaphore) {
@@ -1548,8 +1778,8 @@ async fn extract_pdf_async(
         }
     };
     let path_buf = path.to_path_buf();
-    let source_path = source_path_for_errors.to_path_buf();
     let mut task = tokio::task::spawn_blocking(move || {
+        let _global_permit = global_permit;
         let _permit = permit;
         #[cfg(test)]
         {
@@ -1559,10 +1789,7 @@ async fn extract_pdf_async(
             }
         }
         extract_pdf(&path_buf, max_pages).map_err(|e| {
-            AppError::Internal(format!(
-                "digest: failed to extract text from PDF '{}': {e}",
-                source_path.display()
-            ))
+            AppError::Internal(format!("digest: failed to extract text from PDF: {e}"))
         })
     });
     let timeout = Duration::from_secs(timeout_secs.max(1));
@@ -1584,8 +1811,7 @@ async fn extract_pdf_async(
                 "digest: PDF extraction timed out; concurrent extraction for this source remains blocked until the in-flight worker exits"
             );
             Err(AppError::Internal(format!(
-                "digest: PDF extraction timed out after {timeout_secs}s for '{}'",
-                source_path_for_errors.display()
+                "digest: PDF extraction timed out after {timeout_secs}s"
             )))
         }
     }
@@ -1622,14 +1848,15 @@ fn validate_transcribe_language(input: Option<String>) -> Result<Option<String>,
     Ok(Some(lang))
 }
 
-async fn snapshot_audio_file_async(
-    path: &Path,
+async fn snapshot_audio_file_from_open_file_async(
+    file: File,
+    source_path_for_errors: PathBuf,
     max_audio_bytes: usize,
 ) -> Result<tempfile::NamedTempFile, AppError> {
-    let src = path.to_path_buf();
     let snapshot = tokio::task::spawn_blocking(move || {
-        snapshot_file_capped(
-            &src,
+        snapshot_open_file_capped(
+            file,
+            &source_path_for_errors,
             "encmind-digest-transcribe-",
             max_audio_bytes,
             "max_audio_bytes",
@@ -1641,8 +1868,7 @@ async fn snapshot_audio_file_async(
 
     let metadata = snapshot.path().metadata().map_err(|e| {
         AppError::Internal(format!(
-            "digest_transcribe: cannot access snapshot metadata '{}': {e}",
-            snapshot.path().display()
+            "digest_transcribe: cannot access snapshot metadata: {e}"
         ))
     })?;
     debug!(
@@ -1653,6 +1879,21 @@ async fn snapshot_audio_file_async(
         "digest_transcribe: validated audio snapshot before upload"
     );
     Ok(snapshot)
+}
+
+#[cfg(test)]
+async fn snapshot_audio_file_async(
+    path: &Path,
+    max_audio_bytes: usize,
+) -> Result<tempfile::NamedTempFile, AppError> {
+    let source_path = path.to_path_buf();
+    let source_file = File::open(path).map_err(|e| {
+        AppError::Internal(format!(
+            "digest_transcribe: failed to read '{}': {e}",
+            path.display()
+        ))
+    })?;
+    snapshot_audio_file_from_open_file_async(source_file, source_path, max_audio_bytes).await
 }
 
 fn resolve_openai_api_key_with<F>(lookup: F) -> Result<String, AppError>
@@ -1682,7 +1923,6 @@ fn resolve_openai_api_key() -> Result<String, AppError> {
 struct WhisperTranscribeRequest<'a> {
     api_key: &'a str,
     file_path: &'a Path,
-    source_path_for_errors: &'a Path,
     filename: &'a str,
     model: &'a str,
     language: Option<&'a str>,
@@ -1691,19 +1931,26 @@ struct WhisperTranscribeRequest<'a> {
 
 /// Transcribe audio via OpenAI Whisper API with retries.
 async fn whisper_transcribe(
-    client: &reqwest::Client,
+    firewall: &EgressFirewall,
+    timeout_secs: u64,
     req: &WhisperTranscribeRequest<'_>,
 ) -> Result<String, AppError> {
     let mut retries = 0;
     let max_retries = 2;
 
     loop {
+        let addrs = firewall.resolve_checked_addrs(req.url).await.map_err(|e| {
+            AppError::Internal(format!(
+                "digest_transcribe: egress firewall blocked {}: {e}",
+                req.url
+            ))
+        })?;
+        let client = build_pinned_whisper_client(timeout_secs, req.url, &addrs)?;
         let file_part = reqwest::multipart::Part::file(req.file_path)
             .await
             .map_err(|e| {
                 AppError::Internal(format!(
-                    "digest_transcribe: failed to open '{}' for upload: {e}",
-                    req.source_path_for_errors.display()
+                    "digest_transcribe: failed to open audio for upload: {e}"
                 ))
             })?
             .file_name(req.filename.to_string())
@@ -1746,6 +1993,7 @@ async fn whisper_transcribe(
         };
 
         let status = resp.status();
+        ensure_whisper_remote_addr_allowed(firewall, &resp, req.url)?;
 
         if status.is_success() {
             let text = read_response_text_capped(
@@ -1783,8 +2031,13 @@ async fn whisper_transcribe(
                 "digest: Whisper API returned HTTP {status} and failed to read error body: {e}"
             ))
         })?;
+        warn!(
+            status = %status,
+            error_body_bytes = body.len(),
+            "digest: Whisper API returned non-success status"
+        );
         return Err(AppError::Internal(format!(
-            "digest: Whisper API returned HTTP {status}: {body}"
+            "digest: Whisper API returned HTTP {status}; upstream request failed"
         )));
     }
 }
@@ -1864,7 +2117,6 @@ impl InternalToolHandler for DigestSummarizeHandler {
 
 struct DigestUrlHandler {
     config: DigestConfig,
-    http_client: reqwest::Client,
     firewall: Arc<EgressFirewall>,
     runtime: Arc<RwLock<RuntimeResources>>,
 }
@@ -1896,7 +2148,6 @@ impl InternalToolHandler for DigestUrlHandler {
         // Fetch the URL content using the shared url_extract module.
         let fetch_result = url_extract::fetch_url(
             &url_str,
-            &self.http_client,
             &self.firewall,
             self.config.max_fetch_bytes,
             self.config.max_redirects,
@@ -1984,7 +2235,8 @@ impl InternalToolHandler for DigestFileHandler {
                 "digest_file: file_root is not configured; file tools must be disabled".to_string(),
             )
         })?;
-        let canonical = validate_file_path(&path_str, Some(file_root))?;
+        let validated = validate_and_open_file(&path_str, Some(file_root))?;
+        let canonical = validated.canonical_path;
 
         let ext = canonical
             .extension()
@@ -1992,13 +2244,22 @@ impl InternalToolHandler for DigestFileHandler {
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
 
+        let source_metadata = validated.metadata;
+        let source_file = validated.file;
         let (content, pages, encoding_lossy, encoding_replacement_count) = if ext == "pdf" {
+            validate_file_size_metadata(
+                &source_metadata,
+                self.config.max_pdf_file_bytes,
+                "max_pdf_file_bytes",
+            )?;
+            let source_path = canonical.clone();
             let pdf_snapshot = tokio::task::spawn_blocking({
-                let source = canonical.clone();
+                let source = source_file;
                 let max_pdf_bytes = self.config.max_pdf_file_bytes;
                 move || {
-                    snapshot_file_capped(
-                        &source,
+                    snapshot_open_file_capped(
+                        source,
+                        &source_path,
                         "encmind-digest-pdf-",
                         max_pdf_bytes,
                         "max_pdf_file_bytes",
@@ -2020,8 +2281,17 @@ impl InternalToolHandler for DigestFileHandler {
             .await?;
             (text, Some(page_count), false, 0usize)
         } else if TEXT_EXTENSIONS.contains(&ext.as_str()) {
-            let (text, lossy, replacement_count) =
-                read_text_file_capped_async(&canonical, self.config.max_file_bytes).await?;
+            validate_file_size_metadata(
+                &source_metadata,
+                self.config.max_file_bytes,
+                "max_file_bytes",
+            )?;
+            let (text, lossy, replacement_count) = read_text_open_file_capped_async(
+                source_file,
+                canonical.clone(),
+                self.config.max_file_bytes,
+            )
+            .await?;
             (text, None, lossy, replacement_count)
         } else {
             let supported: Vec<String> = std::iter::once("pdf".to_string())
@@ -2138,9 +2408,14 @@ impl InternalToolHandler for DigestTranscribeHandler {
                     .to_string(),
             )
         })?;
-        let canonical = validate_file_path(&path_str, Some(file_root))?;
+        let validated = validate_and_open_file(&path_str, Some(file_root))?;
+        let canonical = validated.canonical_path;
         // Fail fast before snapshot copy so oversized/unsupported files never hit temp storage.
-        validate_audio_file(&canonical, self.config.max_audio_bytes)?;
+        validate_audio_file_with_metadata(
+            &canonical,
+            &validated.metadata,
+            self.config.max_audio_bytes,
+        )?;
 
         let api_key = resolve_openai_api_key()?;
 
@@ -2159,28 +2434,31 @@ impl InternalToolHandler for DigestTranscribeHandler {
             .and_then(|n| n.to_str())
             .unwrap_or("audio.mp3")
             .to_string();
-        let whisper_client =
+        let _whisper_client_ready =
             ensure_whisper_client(&self.whisper_client, self.config.whisper_timeout_secs).await?;
         // Snapshot once so retries always upload identical bytes even if source file changes.
-        let audio_snapshot = snapshot_audio_file_async(&canonical, self.config.max_audio_bytes)
-            .await
-            .map_err(|e| {
-                AppError::Internal(format!(
-                    "digest_transcribe: failed to prepare '{}' for upload: {e}",
-                    canonical.display()
-                ))
-            })?;
+        let audio_snapshot = snapshot_audio_file_from_open_file_async(
+            validated.file,
+            canonical.clone(),
+            self.config.max_audio_bytes,
+        )
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "digest_transcribe: failed to prepare audio for upload: {e}"
+            ))
+        })?;
 
         let request = WhisperTranscribeRequest {
             api_key: &api_key,
             file_path: audio_snapshot.path(),
-            source_path_for_errors: &canonical,
             filename: &filename,
             model: &self.config.whisper_model,
             language: language.as_deref(),
             url: transcribe_url,
         };
-        let transcript = whisper_transcribe(&whisper_client, &request).await?;
+        let transcript =
+            whisper_transcribe(&self.firewall, self.config.whisper_timeout_secs, &request).await?;
 
         let output = json!({
             "transcript": transcript,
@@ -2237,9 +2515,15 @@ impl InternalToolHandler for DigestListFilesHandler {
         .await
         .map_err(|e| AppError::Internal(format!("digest_list_files: list task failed: {e}")))??;
         let shown_entries = listed.entries.len();
+        let relative_directory = target_dir
+            .strip_prefix(file_root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| ".".to_string());
 
         let output = json!({
-            "directory": target_dir.display().to_string(),
+            "directory": relative_directory,
             "entries": listed.entries,
             "total_entries": listed.total_entries,
             "matched_entries": listed.matched_entries,

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +46,158 @@ impl EgressFirewall {
             .await
     }
 
+    /// Resolve connect addresses for a URL with atomic policy + DNS checks.
+    ///
+    /// All policy validation (scheme, allowlist, private-range) is performed using
+    /// the **same** DNS resolution that produces the returned addresses. This
+    /// eliminates the TOCTOU window where DNS could change between a policy check
+    /// and a separate resolution for transport pinning.
+    pub async fn resolve_checked_addrs(&self, url_str: &str) -> Result<Vec<SocketAddr>, AppError> {
+        if !self.enabled {
+            // Firewall disabled — still resolve DNS for pinning but skip policy.
+            return self.resolve_addrs_only(url_str).await;
+        }
+
+        let parsed = url::Url::parse(url_str)
+            .map_err(|e| AppError::Internal(format!("invalid URL '{url_str}': {e}")))?;
+        Self::ensure_supported_scheme(&parsed, url_str)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| AppError::Internal(format!("URL has no host: {url_str}")))?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+
+        // IP literal detection + private-range check.
+        let ip_literal = if let Ok(ip) = host.parse::<IpAddr>() {
+            if self.block_private_ranges && Self::is_private_ip(&ip) {
+                self.emit_audit_blocked(url_str, host, None);
+                return Err(AppError::Internal(
+                    "egress blocked: destination is not allowed".to_string(),
+                ));
+            }
+            true
+        } else if let Some(ip_str) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                if self.block_private_ranges && Self::is_private_ip(&ip) {
+                    self.emit_audit_blocked(url_str, host, None);
+                    return Err(AppError::Internal(
+                        "egress blocked: destination is not allowed".to_string(),
+                    ));
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Allowlist check.
+        if self.mode != FirewallMode::AllowPublicInternet
+            && !Self::is_domain_allowed_in(host, &self.allowed_domains)
+        {
+            self.emit_audit_blocked(url_str, host, None);
+            return Err(AppError::Internal(format!(
+                "egress blocked: domain '{host}' not in allowlist"
+            )));
+        }
+
+        // For IP literals, return the address directly (no DNS needed).
+        if ip_literal {
+            let ip: IpAddr = host
+                .parse()
+                .or_else(|_| {
+                    host.strip_prefix('[')
+                        .and_then(|s| s.strip_suffix(']'))
+                        .ok_or(())
+                        .and_then(|s| s.parse().map_err(|_| ()))
+                })
+                .map_err(|_| {
+                    AppError::Internal(format!("egress blocked: invalid IP in URL: {url_str}"))
+                })?;
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+
+        // Local hostname check.
+        if self.block_private_ranges && Self::is_local_hostname(host) {
+            self.emit_audit_blocked(url_str, host, None);
+            return Err(AppError::Internal(
+                "egress blocked: destination is not allowed".to_string(),
+            ));
+        }
+
+        // Single DNS resolution — the same addresses are checked AND returned.
+        let lookup_target = format!("{host}:{port}");
+        let resolved =
+            tokio::time::timeout(Self::DNS_TIMEOUT, tokio::net::lookup_host(&lookup_target))
+                .await
+                .map_err(|_| {
+                    self.emit_audit_blocked(url_str, host, None);
+                    AppError::Internal(format!("egress blocked: DNS lookup for '{host}' timed out"))
+                })?
+                .map_err(|e| {
+                    self.emit_audit_blocked(url_str, host, None);
+                    AppError::Internal(format!(
+                        "egress blocked: DNS lookup for '{host}' failed: {e}"
+                    ))
+                })?;
+        let addrs: Vec<SocketAddr> = resolved.collect();
+
+        if addrs.is_empty() {
+            self.emit_audit_blocked(url_str, host, None);
+            return Err(AppError::Internal(format!(
+                "egress blocked: DNS lookup for '{host}' returned no addresses"
+            )));
+        }
+
+        if self.block_private_ranges && addrs.iter().any(|addr| Self::is_private_ip(&addr.ip())) {
+            self.emit_audit_blocked(url_str, host, None);
+            return Err(AppError::Internal(
+                "egress blocked: destination is not allowed".to_string(),
+            ));
+        }
+
+        Ok(addrs)
+    }
+
+    /// Resolve DNS without policy checks (used when firewall is disabled).
+    async fn resolve_addrs_only(&self, url_str: &str) -> Result<Vec<SocketAddr>, AppError> {
+        let parsed = url::Url::parse(url_str)
+            .map_err(|e| AppError::Internal(format!("invalid URL '{url_str}': {e}")))?;
+        Self::ensure_supported_scheme(&parsed, url_str)?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| AppError::Internal(format!("URL has no host: {url_str}")))?;
+        let port = parsed.port_or_known_default().unwrap_or(443);
+
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![SocketAddr::new(ip, port)]);
+        }
+        if let Some(ip_str) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                return Ok(vec![SocketAddr::new(ip, port)]);
+            }
+        }
+
+        let lookup_target = format!("{host}:{port}");
+        let resolved =
+            tokio::time::timeout(Self::DNS_TIMEOUT, tokio::net::lookup_host(&lookup_target))
+                .await
+                .map_err(|_| AppError::Internal(format!("DNS lookup for '{host}' timed out")))?
+                .map_err(|e| AppError::Internal(format!("DNS lookup for '{host}' failed: {e}")))?;
+        let addrs: Vec<SocketAddr> = resolved.collect();
+        if addrs.is_empty() {
+            return Err(AppError::Internal(format!(
+                "DNS lookup for '{host}' returned no addresses"
+            )));
+        }
+        Ok(addrs)
+    }
+
+    /// Expose whether private-range blocking is active (requires firewall to be enabled).
+    pub fn blocks_private_ranges(&self) -> bool {
+        self.enabled && self.block_private_ranges
+    }
+
     /// Check whether a URL is allowed for a specific agent.
     /// Merges the agent's per-agent overrides with the global allowlist.
     pub async fn check_url_for_agent(&self, url_str: &str, agent_id: &str) -> Result<(), AppError> {
@@ -69,6 +221,7 @@ impl EgressFirewall {
 
         let parsed = url::Url::parse(url_str)
             .map_err(|e| AppError::Internal(format!("invalid URL '{url_str}': {e}")))?;
+        Self::ensure_supported_scheme(&parsed, url_str)?;
 
         let host = parsed
             .host_str()
@@ -78,18 +231,18 @@ impl EgressFirewall {
         let ip_literal = if let Ok(ip) = host.parse::<IpAddr>() {
             if self.block_private_ranges && Self::is_private_ip(&ip) {
                 self.emit_audit_blocked(url_str, host, agent_id);
-                return Err(AppError::Internal(format!(
-                    "egress blocked: private IP {ip}"
-                )));
+                return Err(AppError::Internal(
+                    "egress blocked: destination is not allowed".to_string(),
+                ));
             }
             true
         } else if let Some(ip_str) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
             if let Ok(ip) = ip_str.parse::<IpAddr>() {
                 if self.block_private_ranges && Self::is_private_ip(&ip) {
                     self.emit_audit_blocked(url_str, host, agent_id);
-                    return Err(AppError::Internal(format!(
-                        "egress blocked: private IP {ip}"
-                    )));
+                    return Err(AppError::Internal(
+                        "egress blocked: destination is not allowed".to_string(),
+                    ));
                 }
                 true
             } else {
@@ -144,9 +297,9 @@ impl EgressFirewall {
             for addr in addrs {
                 if Self::is_private_ip(&addr.ip()) {
                     self.emit_audit_blocked(url_str, host, agent_id);
-                    return Err(AppError::Internal(format!(
-                        "egress blocked: domain '{host}' resolves to private IP"
-                    )));
+                    return Err(AppError::Internal(
+                        "egress blocked: destination is not allowed".to_string(),
+                    ));
                 }
             }
         }
@@ -198,10 +351,21 @@ impl EgressFirewall {
                 || octets[0] == 127
                 // 169.254.0.0/16 (link-local)
                 || (octets[0] == 169 && octets[1] == 254)
+                // 100.64.0.0/10 (carrier-grade NAT)
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                // 198.18.0.0/15 (benchmarking)
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                // 224.0.0.0/4 (multicast and reserved)
+                || octets[0] >= 224
                 // 0.0.0.0
                 || v4.is_unspecified()
             }
             IpAddr::V6(v6) => {
+                // Treat IPv4-mapped IPv6 (::ffff:a.b.c.d) using IPv4 policy.
+                if let Some(v4_mapped) = v6.to_ipv4_mapped() {
+                    return Self::is_private_ip(&IpAddr::V4(v4_mapped));
+                }
+
                 // ::1 (loopback)
                 v6.is_loopback()
                 // :: (unspecified)
@@ -210,6 +374,8 @@ impl EgressFirewall {
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
                 // fc00::/7 (unique local)
                 || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // ff00::/8 (multicast)
+                || (v6.segments()[0] & 0xff00) == 0xff00
             }
         }
     }
@@ -224,6 +390,15 @@ impl EgressFirewall {
     fn is_local_hostname(host: &str) -> bool {
         let host = host.to_ascii_lowercase();
         host == "localhost" || host.ends_with(".localhost")
+    }
+
+    fn ensure_supported_scheme(parsed: &url::Url, url_str: &str) -> Result<(), AppError> {
+        match parsed.scheme() {
+            "http" | "https" => Ok(()),
+            other => Err(AppError::Internal(format!(
+                "unsupported URL scheme '{other}' for egress target: {url_str}"
+            ))),
+        }
     }
 }
 
@@ -348,8 +523,8 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("private IP"),
-            "expected private IP error: {err}"
+            err.contains("destination is not allowed"),
+            "expected blocked destination error: {err}"
         );
     }
 
@@ -581,7 +756,10 @@ mod tests {
         let fw = EgressFirewall::new(&make_config_allow_public(true, vec![], true));
         let result = fw.check_url("http://10.0.0.1/admin").await;
         assert!(result.is_err(), "should still block private 10.x IPs");
-        assert!(result.unwrap_err().to_string().contains("private IP"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("destination is not allowed"));
     }
 
     #[tokio::test]

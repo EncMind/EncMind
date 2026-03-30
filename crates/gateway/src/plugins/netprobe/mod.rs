@@ -4,7 +4,12 @@
 //! - `netprobe_search`: Web search via Tavily, Brave, or SearXNG with optional LLM synthesis.
 //! - `netprobe_fetch`: Fetch a URL and extract readable content.
 
-use std::{future::Future, sync::Arc};
+use std::{
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -34,6 +39,8 @@ const NETPROBE_SYNTHESIS_QUERY_MAX_CHARS: usize = 400;
 const NETPROBE_SYNTHESIS_URL_MAX_CHARS: usize = 500;
 const NETPROBE_RESULT_TITLE_MAX_CHARS: usize = 300;
 const NETPROBE_RESULT_SNIPPET_MAX_CHARS: usize = 1_200;
+const NETPROBE_HTTP_TIMEOUT_SECS: u64 = 30;
+const NETPROBE_HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 // ── Search result type ────────────────────────────────────────────
 
@@ -106,7 +113,7 @@ impl NativePlugin for NetProbePlugin {
     }
 
     async fn register(&self, api: &mut dyn PluginRegistrar) -> Result<(), PluginError> {
-        if let Some(search_client) = self.search_client.as_ref().cloned() {
+        if self.search_client.is_some() {
             // ── netprobe_search ───────────────────────────────────────
             api.register_tool(
                 "search",
@@ -133,7 +140,6 @@ impl NativePlugin for NetProbePlugin {
                 }),
                 Arc::new(NetProbeSearchHandler {
                     config: self.config.clone(),
-                    search_client,
                     firewall: self.firewall.clone(),
                     runtime: self.runtime.clone(),
                 }),
@@ -144,7 +150,7 @@ impl NativePlugin for NetProbePlugin {
             );
         }
 
-        if let Some(fetch_client) = self.fetch_client.as_ref().cloned() {
+        if self.fetch_client.is_some() {
             // ── netprobe_fetch ────────────────────────────────────────
             api.register_tool(
                 "fetch",
@@ -165,7 +171,6 @@ impl NativePlugin for NetProbePlugin {
                 }),
                 Arc::new(NetProbeFetchHandler {
                     config: self.config.clone(),
-                    fetch_client,
                     firewall: self.firewall.clone(),
                 }),
             )?;
@@ -183,7 +188,6 @@ impl NativePlugin for NetProbePlugin {
 
 struct NetProbeSearchHandler {
     config: NetProbeConfig,
-    search_client: reqwest::Client,
     firewall: Arc<EgressFirewall>,
     runtime: Arc<RwLock<RuntimeResources>>,
 }
@@ -221,22 +225,13 @@ impl InternalToolHandler for NetProbeSearchHandler {
                 let key = api_key.as_deref().ok_or_else(|| {
                     missing_api_key_error(&self.config.provider, self.config.api_key_env.as_deref())
                 })?;
-                tavily_search(
-                    &self.search_client,
-                    &self.firewall,
-                    key,
-                    &query,
-                    max_results,
-                    &self.config,
-                )
-                .await?
+                tavily_search(&self.firewall, key, &query, max_results, &self.config).await?
             }
             SearchProvider::Brave => {
                 let key = api_key.as_deref().ok_or_else(|| {
                     missing_api_key_error(&self.config.provider, self.config.api_key_env.as_deref())
                 })?;
                 brave_search(
-                    &self.search_client,
                     &self.firewall,
                     key,
                     &query,
@@ -251,7 +246,6 @@ impl InternalToolHandler for NetProbeSearchHandler {
                     AppError::Internal("netprobe_search: searxng_url not configured".to_string())
                 })?;
                 searxng_search(
-                    &self.search_client,
                     &self.firewall,
                     base_url,
                     &query,
@@ -287,7 +281,6 @@ impl InternalToolHandler for NetProbeSearchHandler {
 
 struct NetProbeFetchHandler {
     config: NetProbeConfig,
-    fetch_client: reqwest::Client,
     firewall: Arc<EgressFirewall>,
 }
 
@@ -316,7 +309,6 @@ impl InternalToolHandler for NetProbeFetchHandler {
 
         let fetch_result = url_extract::fetch_url(
             &url,
-            &self.fetch_client,
             &self.firewall,
             self.config.max_fetch_bytes,
             self.config.max_redirects,
@@ -393,19 +385,6 @@ fn serialize_output(output: &serde_json::Value, context: &str) -> Result<String,
         .map_err(|e| AppError::Internal(format!("{context}: failed to serialize output: {e}")))
 }
 
-fn provider_error_text(data: &serde_json::Value) -> Option<String> {
-    if let Some(msg) = data.get("error").and_then(|v| v.as_str()) {
-        return Some(msg.to_string());
-    }
-    if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
-        return Some(msg.to_string());
-    }
-    if let Some(error_obj) = data.get("error") {
-        return Some(error_obj.to_string());
-    }
-    None
-}
-
 fn ensure_parse_retains_valid_urls(
     provider_name: &str,
     original_count: usize,
@@ -447,6 +426,10 @@ fn truncate_prompt_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn netprobe_user_agent() -> String {
+    format!("EncMind-NetProbe/{}", env!("CARGO_PKG_VERSION"))
+}
+
 fn build_search_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         // Keep network path deterministic for firewall enforcement.
@@ -455,16 +438,99 @@ fn build_search_client() -> Result<reqwest::Client, reqwest::Error> {
         // Keep redirects disabled at the client level; provider calls use a
         // manual redirect loop with per-hop egress firewall validation.
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent(format!("EncMind-NetProbe/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(NETPROBE_HTTP_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(NETPROBE_HTTP_CONNECT_TIMEOUT_SECS))
+        .user_agent(netprobe_user_agent())
         .build()
+}
+
+fn build_pinned_request_client(
+    url: &str,
+    addrs: &[SocketAddr],
+) -> Result<reqwest::Client, AppError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::Internal(format!("netprobe: invalid request URL '{url}': {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| AppError::Internal(format!("netprobe: URL missing host: {url}")))?;
+
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(NETPROBE_HTTP_TIMEOUT_SECS))
+        .connect_timeout(Duration::from_secs(NETPROBE_HTTP_CONNECT_TIMEOUT_SECS))
+        .user_agent(netprobe_user_agent());
+
+    // Pin DNS answers for domain hosts so transport uses the same checked IPs.
+    if host.parse::<IpAddr>().is_err() {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+
+    builder.build().map_err(|e| {
+        AppError::Internal(format!(
+            "netprobe: failed to build pinned HTTP client for '{url}': {e}"
+        ))
+    })
+}
+
+fn ensure_remote_addr_allowed(
+    firewall: &EgressFirewall,
+    response: &reqwest::Response,
+    current_url: &str,
+    request_label: &str,
+) -> Result<(), AppError> {
+    if !firewall.blocks_private_ranges() {
+        return Ok(());
+    }
+
+    if let Some(remote) = response.remote_addr() {
+        if EgressFirewall::is_private_ip(&remote.ip()) {
+            warn!(
+                remote = %remote,
+                url = current_url,
+                label = request_label,
+                "netprobe: response from private IP blocked"
+            );
+            return Err(AppError::Internal(format!(
+                "{request_label}: destination is not allowed for {current_url}"
+            )));
+        }
+    } else {
+        return Err(AppError::Internal(format!(
+            "{request_label}: unable to verify remote address for {current_url}"
+        )));
+    }
+    Ok(())
+}
+
+fn provider_http_status_error(provider: &str, status: reqwest::StatusCode, body: &str) -> AppError {
+    warn!(
+        provider,
+        %status,
+        error_body_bytes = body.len(),
+        "netprobe: provider request failed"
+    );
+    AppError::Internal(format!(
+        "{provider} returned HTTP {status}; upstream request failed"
+    ))
 }
 
 fn same_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
     left.scheme().eq_ignore_ascii_case(right.scheme())
         && left.host_str() == right.host_str()
         && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn same_host(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    left.host_str() == right.host_str()
+}
+
+fn same_host_https_upgrade(left: &reqwest::Url, right: &reqwest::Url) -> bool {
+    same_host(left, right)
+        && left.scheme().eq_ignore_ascii_case("http")
+        && right.scheme().eq_ignore_ascii_case("https")
+        && left.port_or_known_default() == Some(80)
+        && right.port_or_known_default() == Some(443)
 }
 
 fn parse_start_url(start_url: &str, request_label: &str) -> Result<reqwest::Url, AppError> {
@@ -532,6 +598,7 @@ fn resolve_redirect_target(
     hops: &mut usize,
     max_redirects: usize,
     allow_cross_origin_redirects: bool,
+    allow_same_host_redirects: bool,
     request_label: &str,
 ) -> Result<Option<reqwest::Url>, AppError> {
     if !response.status().is_redirection() {
@@ -565,7 +632,10 @@ fn resolve_redirect_target(
         ))
     })?;
     ensure_http_url(&next, request_label, "redirect target")?;
-    if !allow_cross_origin_redirects && !same_origin(start, &next) {
+    if !allow_cross_origin_redirects
+        && !same_origin(start, &next)
+        && !(allow_same_host_redirects && same_host_https_upgrade(start, &next))
+    {
         return Err(AppError::Internal(format!(
             "{request_label}: cross-origin redirect blocked from '{start}' to '{next}'"
         )));
@@ -606,13 +676,14 @@ fn resolve_api_key_from_env(provider: &SearchProvider, configured: Option<&str>)
 
 fn missing_api_key_error(provider: &SearchProvider, configured: Option<&str>) -> AppError {
     let checked = api_key_env_candidates(provider, configured);
-    if checked.is_empty() {
-        return AppError::Internal("netprobe_search: API key is not configured".to_string());
+    if !checked.is_empty() {
+        warn!(
+            provider = ?provider,
+            checked_env_vars = ?checked,
+            "netprobe: API key not configured"
+        );
     }
-    AppError::Internal(format!(
-        "netprobe_search: API key not set; checked env vars: {}",
-        checked.join(", ")
-    ))
+    AppError::Internal("netprobe_search: search provider API key is not configured".to_string())
 }
 
 async fn read_error_text_capped(
@@ -639,11 +710,12 @@ async fn send_with_manual_redirects<F, Fut>(
     start_url: &str,
     max_redirects: usize,
     allow_cross_origin_redirects: bool,
+    allow_same_host_redirects: bool,
     request_label: &str,
     mut send_once: F,
 ) -> Result<reqwest::Response, AppError>
 where
-    F: FnMut(&str) -> Fut,
+    F: FnMut(&reqwest::Client, &str) -> Fut,
     Fut: Future<Output = Result<reqwest::Response, reqwest::Error>>,
 {
     let start = parse_start_url(start_url, request_label)?;
@@ -651,16 +723,23 @@ where
     let mut hops = 0usize;
 
     loop {
-        firewall.check_url(&current_url).await.map_err(|e| {
-            AppError::Internal(format!(
-                "{request_label}: egress firewall blocked {current_url}: {e}"
-            ))
-        })?;
-        let response = send_once(&current_url).await.map_err(|e| {
-            AppError::Internal(format!(
-                "{request_label}: request failed for {current_url}: {e}"
-            ))
-        })?;
+        let addrs = firewall
+            .resolve_checked_addrs(&current_url)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "{request_label}: egress firewall blocked {current_url}: {e}"
+                ))
+            })?;
+        let request_client = build_pinned_request_client(&current_url, &addrs)?;
+        let response = send_once(&request_client, &current_url)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "{request_label}: request failed for {current_url}: {e}"
+                ))
+            })?;
+        ensure_remote_addr_allowed(firewall, &response, &current_url, request_label)?;
         let maybe_next = resolve_redirect_target(
             &start,
             &current_url,
@@ -668,6 +747,7 @@ where
             &mut hops,
             max_redirects,
             allow_cross_origin_redirects,
+            allow_same_host_redirects,
             request_label,
         )?;
         let Some(next) = maybe_next else {
@@ -687,7 +767,6 @@ struct PostJsonRedirectRequest<'a> {
 }
 
 async fn send_post_json_with_manual_redirects(
-    client: &reqwest::Client,
     firewall: &EgressFirewall,
     request: PostJsonRedirectRequest<'_>,
 ) -> Result<reqwest::Response, AppError> {
@@ -706,14 +785,18 @@ async fn send_post_json_with_manual_redirects(
     let mut method = reqwest::Method::POST;
 
     loop {
-        firewall.check_url(&current_url).await.map_err(|e| {
-            AppError::Internal(format!(
-                "{request_label}: egress firewall blocked {current_url}: {e}"
-            ))
-        })?;
+        let addrs = firewall
+            .resolve_checked_addrs(&current_url)
+            .await
+            .map_err(|e| {
+                AppError::Internal(format!(
+                    "{request_label}: egress firewall blocked {current_url}: {e}"
+                ))
+            })?;
+        let request_client = build_pinned_request_client(&current_url, &addrs)?;
 
         let response = if method == reqwest::Method::POST {
-            client
+            request_client
                 .post(&current_url)
                 .json(body)
                 .send()
@@ -724,12 +807,13 @@ async fn send_post_json_with_manual_redirects(
                     ))
                 })?
         } else {
-            client.get(&current_url).send().await.map_err(|e| {
+            request_client.get(&current_url).send().await.map_err(|e| {
                 AppError::Internal(format!(
                     "{request_label}: request failed for {current_url}: {e}"
                 ))
             })?
         };
+        ensure_remote_addr_allowed(firewall, &response, &current_url, request_label)?;
 
         let status = response.status();
         let maybe_next = resolve_redirect_target(
@@ -739,6 +823,7 @@ async fn send_post_json_with_manual_redirects(
             &mut hops,
             max_redirects,
             allow_cross_origin_redirects,
+            false,
             request_label,
         )?;
         let Some(next) = maybe_next else {
@@ -765,7 +850,6 @@ async fn send_post_json_with_manual_redirects(
 // ── Provider implementations ──────────────────────────────────────
 
 async fn tavily_search(
-    client: &reqwest::Client,
     firewall: &EgressFirewall,
     api_key: &str,
     query: &str,
@@ -781,7 +865,6 @@ async fn tavily_search(
     });
 
     let resp = send_post_json_with_manual_redirects(
-        client,
         firewall,
         PostJsonRedirectRequest {
             start_url: api_url,
@@ -803,9 +886,7 @@ async fn tavily_search(
                     "Tavily API returned HTTP {status}; failed to read error body: {e}"
                 ))
             })?;
-        return Err(AppError::Internal(format!(
-            "Tavily API returned HTTP {status}: {text}"
-        )));
+        return Err(provider_http_status_error("Tavily API", status, &text));
     }
 
     let data = parse_json_response_capped(resp, config.max_provider_body_bytes, "Tavily").await?;
@@ -820,12 +901,7 @@ pub(crate) fn parse_tavily_response(
         .get("results")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            let detail = provider_error_text(data)
-                .map(|m| format!(": {m}"))
-                .unwrap_or_default();
-            AppError::Internal(format!(
-                "Tavily response missing required 'results' array{detail}"
-            ))
+            AppError::Internal("Tavily response missing required 'results' array".to_string())
         })?;
     let results = arr
         .iter()
@@ -851,7 +927,6 @@ pub(crate) fn parse_tavily_response(
 }
 
 async fn brave_search(
-    client: &reqwest::Client,
     firewall: &EgressFirewall,
     api_key: &str,
     query: &str,
@@ -868,8 +943,9 @@ async fn brave_search(
         &api_url,
         max_redirects,
         false,
+        false,
         "Brave API",
-        |url| {
+        |client, url| {
             client
                 .get(url)
                 .header("X-Subscription-Token", api_key)
@@ -888,9 +964,7 @@ async fn brave_search(
                     "Brave API returned HTTP {status}; failed to read error body: {e}"
                 ))
             })?;
-        return Err(AppError::Internal(format!(
-            "Brave API returned HTTP {status}: {text}"
-        )));
+        return Err(provider_http_status_error("Brave API", status, &text));
     }
 
     let data = parse_json_response_capped(resp, max_provider_body_bytes, "Brave").await?;
@@ -906,12 +980,7 @@ pub(crate) fn parse_brave_response(
         .and_then(|w| w.get("results"))
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            let detail = provider_error_text(data)
-                .map(|m| format!(": {m}"))
-                .unwrap_or_default();
-            AppError::Internal(format!(
-                "Brave response missing required 'web.results' array{detail}"
-            ))
+            AppError::Internal("Brave response missing required 'web.results' array".to_string())
         })?;
     let results = arr
         .iter()
@@ -939,7 +1008,6 @@ pub(crate) fn parse_brave_response(
 }
 
 async fn searxng_search(
-    client: &reqwest::Client,
     firewall: &EgressFirewall,
     base_url: &str,
     query: &str,
@@ -952,12 +1020,12 @@ async fn searxng_search(
         firewall,
         api_url.as_ref(),
         max_redirects,
-        // Self-hosted instances commonly redirect across origin boundaries
-        // (http->https, canonical host redirects). No credential headers are
-        // sent for SearXNG, and each hop is still firewall-validated.
+        false,
+        // Allow same-host scheme/port canonicalization (e.g. http->https),
+        // but block cross-host redirects.
         true,
         "SearXNG API",
-        |url| client.get(url).send(),
+        |client, url| client.get(url).send(),
     )
     .await?;
 
@@ -970,9 +1038,7 @@ async fn searxng_search(
                     "SearXNG returned HTTP {status}; failed to read error body: {e}"
                 ))
             })?;
-        return Err(AppError::Internal(format!(
-            "SearXNG returned HTTP {status}: {text}"
-        )));
+        return Err(provider_http_status_error("SearXNG API", status, &text));
     }
 
     let data = parse_json_response_capped(resp, max_provider_body_bytes, "SearXNG").await?;
@@ -988,12 +1054,7 @@ pub(crate) fn parse_searxng_response(
         .get("results")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            let detail = provider_error_text(data)
-                .map(|m| format!(": {m}"))
-                .unwrap_or_default();
-            AppError::Internal(format!(
-                "SearXNG response missing required 'results' array{detail}"
-            ))
+            AppError::Internal("SearXNG response missing required 'results' array".to_string())
         })?;
     let results = arr
         .iter()
@@ -1314,12 +1375,16 @@ mod tests {
     }
 
     #[test]
-    fn missing_api_key_error_lists_checked_env_vars() {
+    fn missing_api_key_error_is_generic() {
         let err = missing_api_key_error(&SearchProvider::Tavily, Some("CUSTOM_TAVILY_KEY"));
         let msg = err.to_string();
         assert!(
-            msg.contains("CUSTOM_TAVILY_KEY") && msg.contains("TAVILY_API_KEY"),
-            "message should list checked env vars, got: {msg}"
+            msg.contains("search provider API key is not configured"),
+            "message should be generic, got: {msg}"
+        );
+        assert!(
+            !msg.contains("CUSTOM_TAVILY_KEY") && !msg.contains("TAVILY_API_KEY"),
+            "message should not disclose env var names, got: {msg}"
         );
     }
 
@@ -1550,12 +1615,17 @@ mod tests {
             ..Default::default()
         };
         let firewall = EgressFirewall::new(&fw_cfg);
-        let client = build_search_client().expect("failed to build search client");
         let start_url = format!("http://{addr}/start");
 
-        let response = send_with_manual_redirects(&firewall, &start_url, 5, true, "test", |url| {
-            client.get(url).send()
-        })
+        let response = send_with_manual_redirects(
+            &firewall,
+            &start_url,
+            5,
+            true,
+            false,
+            "test",
+            |client, url| client.get(url).send(),
+        )
         .await
         .expect("manual redirects should follow to final response");
 
@@ -1596,12 +1666,17 @@ mod tests {
             ..Default::default()
         };
         let firewall = EgressFirewall::new(&fw_cfg);
-        let client = build_search_client().expect("failed to build search client");
         let start_url = format!("http://{addr}/loop");
 
-        let err = send_with_manual_redirects(&firewall, &start_url, 1, true, "test", |url| {
-            client.get(url).send()
-        })
+        let err = send_with_manual_redirects(
+            &firewall,
+            &start_url,
+            1,
+            true,
+            false,
+            "test",
+            |client, url| client.get(url).send(),
+        )
         .await
         .expect_err("redirect loop should hit redirect cap");
 
@@ -1657,12 +1732,10 @@ mod tests {
             ..Default::default()
         };
         let firewall = EgressFirewall::new(&fw_cfg);
-        let client = build_search_client().expect("failed to build search client");
         let start_url = format!("http://{addr}/start");
         let body = serde_json::json!({ "query": "rust" });
 
         let response = send_post_json_with_manual_redirects(
-            &client,
             &firewall,
             PostJsonRedirectRequest {
                 start_url: &start_url,
