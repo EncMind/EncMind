@@ -56,7 +56,8 @@ r2d2_sqlite = "0.32"
 clap = { version = "4.5", features = ["derive"] }
 
 # HTTP
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "multipart"] }
+httpdate = "1.0"
 url = "2.5"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
@@ -89,6 +90,13 @@ wasmtime-wasi = "41"
 
 # Pattern matching
 regex = "1"
+
+# HTML processing
+scraper = "0.22"
+encoding_rs = "0.8"
+
+# PDF extraction
+pdf-extract = "0.10"
 
 # Testing
 tempfile = "3"

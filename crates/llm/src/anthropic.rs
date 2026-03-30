@@ -177,7 +177,7 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
                 ContentBlock::ToolUse { id, name, input } => Some(ApiContentBlock::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
-                    input: input.clone(),
+                    input: sanitize_tool_use_input_for_anthropic(input),
                 }),
                 ContentBlock::ToolResult {
                     tool_use_id,
@@ -198,6 +198,13 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
     }
 
     (system, api_messages)
+}
+
+fn sanitize_tool_use_input_for_anthropic(input: &serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(_) => input.clone(),
+        _ => serde_json::json!({}),
+    }
 }
 
 fn convert_tools(tools: &[ToolDefinition]) -> Vec<ApiTool> {
@@ -498,6 +505,30 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let count = rt.block_on(backend.count_tokens(&messages)).unwrap();
         assert_eq!(count, 100); // 400 chars / 4
+    }
+
+    #[test]
+    fn convert_messages_coerces_non_object_tool_input() {
+        let messages = vec![Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "t1".into(),
+                name: "digest_file".into(),
+                input: serde_json::Value::String("/tmp/x.pdf".into()),
+            }],
+            created_at: chrono::Utc::now(),
+            token_count: None,
+        }];
+
+        let (_system, api_msgs) = convert_messages(&messages);
+        assert_eq!(api_msgs.len(), 1);
+        match &api_msgs[0].content[0] {
+            ApiContentBlock::ToolUse { input, .. } => {
+                assert!(input.is_object(), "tool_use.input must be object");
+            }
+            _ => panic!("expected tool_use block"),
+        }
     }
 
     #[tokio::test]

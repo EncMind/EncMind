@@ -103,6 +103,7 @@ pub async fn handle_reload(
             config_snapshot,
             state.browser_pool.clone(),
             state.firewall.clone(),
+            state.runtime.clone(),
         )
     })
     .await
@@ -424,14 +425,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_succeeds_when_no_native_plugins_configured() {
+    async fn reload_succeeds_with_default_netprobe_enabled() {
         let state = make_test_state();
         let resp = handle_reload(&state, serde_json::json!({}), "req-reload").await;
         match resp {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-reload");
                 assert_eq!(result["reloaded"], true);
-                assert_eq!(result["loaded_count"], 0);
+                // NetProbe is enabled by default (unless explicitly disabled in config).
+                assert!(
+                    result["loaded_count"].as_u64().unwrap() >= 1,
+                    "expected at least 1 plugin (netprobe), got {}",
+                    result["loaded_count"]
+                );
                 assert_eq!(result["plugin_degraded"], false);
             }
             other => panic!("expected Res, got {other:?}"),
@@ -716,9 +722,18 @@ mod tests {
             !hook_ids.contains("old_plugin_hook"),
             "concurrent refresh must not reintroduce hooks from pre-reload manager"
         );
+        // NetProbe is enabled in this test config, so plugin_manager is Some after reload.
+        let pm = state.plugin_manager.read().await;
         assert!(
-            state.plugin_manager.read().await.is_none(),
-            "reload with no configured native plugins should publish empty manager"
+            pm.is_some(),
+            "reload should publish a plugin manager when netprobe is enabled"
         );
+        // Verify the old hook plugin was replaced, not kept.
+        if let Some(ref mgr) = *pm {
+            assert!(
+                !mgr.plugin_ids().contains(&"old_plugin_hook".to_string()),
+                "old_plugin_hook should not survive reload"
+            );
+        }
     }
 }

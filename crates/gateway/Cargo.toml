@@ -51,10 +51,15 @@ mdns-sd = { workspace = true }
 wasmtime = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
+httpdate = { workspace = true }
+scraper = { workspace = true }
+encoding_rs = { workspace = true }
+url = { workspace = true }
+pdf-extract = { workspace = true }
 subtle = "2.6"
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 encmind-storage = { path = "../storage", features = ["test-helpers"] }
 encmind-crypto = { path = "../crypto" }

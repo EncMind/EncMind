@@ -48,6 +48,11 @@ impl IdempotencyCache {
         self.entries
             .retain(|_, entry| entry.inserted_at.elapsed() < self.ttl);
     }
+
+    /// Drop all cached entries.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +97,14 @@ mod tests {
         cache.set("req-1".into(), serde_json::json!({"ok": true}));
         cache.cleanup();
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn clear_removes_all_entries() {
+        let mut cache = IdempotencyCache::new(300);
+        cache.set("req-1".into(), serde_json::json!({"ok": true}));
+        cache.set("req-2".into(), serde_json::json!({"ok": false}));
+        cache.clear();
+        assert!(cache.entries.is_empty());
     }
 }

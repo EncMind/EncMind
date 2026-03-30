@@ -2,7 +2,7 @@
 
 **Open-source, self-hostable private AI assistant written in Rust.**
 
-Deploy on any Linux VM, a home server, or a TEE-capable VM (AMD SEV-SNP, under development) for a hardened self-hosted setup. Interact via Telegram, Slack, Gmail, web chat, or a local edge CLI.
+Deploy on any Linux VM, a home server, or a TEE-capable VM (AMD SEV-SNP, under development) for a hardened self-hosted setup. Interact via Slack, Gmail, web chat, or a local edge CLI.
 
 *An open-source, cross-platform AI assistant built for privacy and auditability.*
 
@@ -399,6 +399,110 @@ Skills and timers are managed via gateway RPC:
 
 - `skills.list` / `skills.toggle` — list loaded skills, enable/disable
 - `timers.list` / `timers.toggle` — list scheduled timers, enable/disable
+
+---
+
+## Plugins
+
+EncMind includes two built-in native plugins, enabled by default:
+
+| Plugin | Tools | README |
+|--------|-------|--------|
+| **NetProbe** | `netprobe_search`, `netprobe_fetch` | [crates/gateway/src/plugins/netprobe/](crates/gateway/src/plugins/netprobe/) |
+| **Digest** | `digest_summarize`, `digest_url`, `digest_file`, `digest_transcribe` | [crates/gateway/src/plugins/digest/](crates/gateway/src/plugins/digest/) |
+
+### Choose native plugin vs WASM skill
+
+Use this decision table when adding new functionality:
+
+| Requirement | Prefer native gateway plugin | Prefer WASM skill |
+|-------------|------------------------------|-------------------|
+| Trust model | First-party, fully trusted Rust code reviewed in-repo | Third-party or less-trusted code |
+| Isolation need | Lower (runs in gateway process) | Higher (WASM sandbox + capability gating + fuel limits) |
+| Throughput/latency sensitivity | High-throughput IO, low-latency hot path | Normal tool latency is acceptable |
+| API surface needed | Needs gateway-only APIs (RPC methods, channel transforms, native timers, direct runtime resources) | Tool-style skills are enough |
+| Deployment model | Compiled into gateway binary and released with server | Dropped into `~/.encmind/skills` without rebuilding gateway |
+
+### Native plugin benefits and trade-offs
+
+- **Security (operational):** no runtime plugin download path; code is versioned, reviewed, and shipped with the gateway binary.
+- **Security (policy):** still benefits from global gateway controls (egress firewall, rate limits, auth/policy checks).
+- **Performance:** no Wasmtime runtime boundary, no ABI marshalling overhead, and direct reuse of shared Rust clients/pools.
+- **Trade-off:** native plugins are **not sandboxed** like WASM skills. Use native plugins only for trusted code.
+
+### Create a native gateway plugin (compiled-in)
+
+1. Create a plugin module, for example `crates/gateway/src/plugins/myplugin/mod.rs`.
+2. Implement `NativePlugin` and register tools with `PluginRegistrar`.
+3. Export the module in `crates/gateway/src/plugins/mod.rs` (`pub mod myplugin;`).
+4. Wire construction into `build_native_plugins(...)` in `crates/gateway/src/server.rs`.
+5. Add plugin config under `plugins.myplugin` in `~/.encmind/config.yaml` and parse it in `build_native_plugins(...)`.
+
+Minimal skeleton:
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use encmind_core::error::{AppError, PluginError};
+use encmind_core::plugin::{NativePlugin, PluginKind, PluginManifest, PluginRegistrar};
+use encmind_core::traits::InternalToolHandler;
+use encmind_core::types::{AgentId, SessionId};
+
+pub struct MyPlugin;
+
+#[async_trait]
+impl NativePlugin for MyPlugin {
+    fn manifest(&self) -> PluginManifest {
+        PluginManifest {
+            id: "myplugin".into(),
+            name: "My Plugin".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            description: "Example native gateway plugin".into(),
+            kind: PluginKind::General,
+            required: false,
+        }
+    }
+
+    async fn register(&self, api: &mut dyn PluginRegistrar) -> Result<(), PluginError> {
+        api.register_tool(
+            "hello",
+            "Return a greeting",
+            serde_json::json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } }
+            }),
+            Arc::new(HelloHandler),
+        )
+    }
+}
+
+struct HelloHandler;
+
+#[async_trait]
+impl InternalToolHandler for HelloHandler {
+    async fn handle(
+        &self,
+        input: serde_json::Value,
+        _session_id: &SessionId,
+        _agent_id: &AgentId,
+    ) -> Result<String, AppError> {
+        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("world");
+        Ok(serde_json::json!({ "message": format!("hello, {name}") }).to_string())
+    }
+}
+```
+
+### Build and run with your native plugin
+
+```bash
+# Build gateway binary (and related CLIs)
+cargo build --release -p encmind-cli -p encmind-edge -p encmind-skill-cli
+
+# Start gateway
+./target/release/encmind-core --config ~/.encmind/config.yaml serve
+```
+
+Check startup logs for plugin registration and tool count changes.
 
 ---
 
