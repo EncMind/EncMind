@@ -2,7 +2,7 @@
 
 **Open-source, self-hostable private AI assistant written in Rust.**
 
-Deploy on any Linux VM, a home server, or a TEE-capable VM (AMD SEV-SNP, under development) for a hardened self-hosted setup. Interact via Telegram, Slack, Gmail, web chat, or a local edge CLI.
+Deploy on any Linux VM, a home server, or a TEE-capable VM (AMD SEV-SNP, under development) for a hardened self-hosted setup. Interact via Slack, Gmail, web chat, or a local edge CLI.
 
 *An open-source, cross-platform AI assistant built for privacy and auditability.*
 
