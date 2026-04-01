@@ -6,6 +6,7 @@ pub mod loop_detector;
 pub mod message_validation;
 pub mod pool;
 pub mod registry;
+pub mod risk_classifier;
 pub mod runtime;
 pub mod subagent;
 pub mod tool_registry;

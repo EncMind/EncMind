@@ -298,7 +298,7 @@ fn block_type_name(block: &ContentBlock) -> &'static str {
     }
 }
 
-fn json_type_name(v: &serde_json::Value) -> &'static str {
+pub fn json_type_name(v: &serde_json::Value) -> &'static str {
     match v {
         serde_json::Value::Null => "null",
         serde_json::Value::Bool(_) => "bool",

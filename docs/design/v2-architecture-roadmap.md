@@ -480,23 +480,22 @@ Trust persisted per workspace path in user settings.
 **Immutable deny-list (enforced even in bypass mode):**
 These operations are never auto-allowed regardless of permission mode:
 - `rm -rf /` and path-destructive shell patterns (regex match)
-- `git push --force` to protected branches (main/master)
 - Credential file writes (`.ssh/`, `.gnupg/`, `.env`)
+- Fork bombs, raw disk writes (`dd if=`, `mkfs`)
 - Network operations to private IP ranges when `block_private_ranges` is enabled
 
-The deny-list is compiled into the binary, not configurable — preventing accidental override.
+The deny-list is compiled into the binary, not configurable — preventing accidental override. The core deny-list covers universally dangerous operations only. Domain-specific policies (e.g., git force-push to protected branches) belong in their respective plugins (e.g., CodeOps plugin).
 
 **Enforcement points by tool family:**
 
 | Tool family | Deny-list check | Enforcement location |
 |-------------|----------------|---------------------|
-| `bash.exec` | Regex match on command string (rm -rf, git push --force, DROP TABLE, etc.) | `risk_classifier.rs` |
+| `bash.exec` | Regex match on command string (rm -rf, fork bomb, mkfs, dd if=, DROP TABLE) | `risk_classifier.rs` |
 | `file.write` / `file.edit` | Path match against credential patterns (`.ssh/`, `.gnupg/`, `.env`) | `risk_classifier.rs` + `local_tool_policy.rs` / edge `LocalPolicy` (defense-in-depth: file policy layers also enforce credential-path deny independently of the classifier) |
 | `netprobe_fetch` / any HTTP | Destination IP checked against private ranges when `block_private_ranges` enabled | `firewall.rs` (existing) |
-| `git commit/push` | Protected branch detection (main/master) for force-push | `risk_classifier.rs` (if exposed as a dedicated tool; otherwise enforced via `bash.exec` command classification) |
 
 **Implementation phasing:**
-- **Phase A:** Deny-list enforced as a hardcoded check in `risk_classifier.rs` covering all tool families above (not just bash). This is the safety-critical path — it works without the full permission mode system. Network deny-list reuses existing `firewall.rs`.
+- **Phase A:** Deny-list enforced as a hardcoded check in `risk_classifier.rs` covering bash and file-write tool families. This is the safety-critical path — it works without the full permission mode system. Network deny-list reuses existing `firewall.rs`.
 - **Phase B:** `PermissionMode` enum added to `policy.rs`, integrating the deny-list check into the formal permission decision flow. The A-phase runtime check remains as a defense-in-depth backstop.
 
 **Files:** `crates/agent/src/risk_classifier.rs` (Phase A), `crates/core/src/policy.rs` (Phase B), `crates/agent/src/runtime.rs`
@@ -694,9 +693,9 @@ Phase B (full hook expansion):
 **Speculative risk classifier (for bash commands):**
 ```rust
 pub fn classify_bash_risk(command: &str) -> RiskLevel {
-    // Pattern-match for destructive operations before execution
-    // rm -rf, git push --force, DROP TABLE, etc.
-    // Returns Low/Sensitive/Critical
+    // Pattern-match for universally dangerous operations before execution
+    // rm -rf, fork bomb, mkfs, dd if=, DROP TABLE, credential path writes
+    // Returns Low/Sensitive/Critical/Denied
 }
 ```
 
@@ -935,7 +934,7 @@ agents:
 **Risk levels:**
 - LOW: read-only operations (ls, cat, git status)
 - MEDIUM: recoverable changes (file edits, package install)
-- HIGH: destructive/irreversible (rm -rf, DROP TABLE, force push)
+- HIGH: destructive/irreversible (rm -rf, DROP TABLE, credential writes)
 
 **Files:** `crates/gateway/src/handlers/chat.rs`, new `crates/gateway/src/permission_explainer.rs`
 

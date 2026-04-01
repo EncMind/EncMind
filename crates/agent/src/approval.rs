@@ -55,8 +55,14 @@ impl ToolApprovalChecker {
     }
 
     fn is_bash_tool(name: &str) -> bool {
-        // Support both legacy dotted names and current underscore names.
-        name == "bash.exec" || name == "bash_exec" || name == "bash" || name.ends_with("_bash_exec")
+        // Match bash/shell tools including prefixed variants (node_bash_exec, local_bash_exec).
+        // Kept in sync with risk_classifier::is_bash_tool().
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with("bash_exec")
+            || lower.ends_with("bash.exec")
+            || lower == "bash"
+            || lower == "shell"
+            || lower.ends_with("execute_command")
     }
 
     /// Simple pattern matching: supports prefix-glob (e.g. "ls *" matches "ls -la /tmp").

@@ -381,6 +381,60 @@ impl AgentRuntime {
                 'tool_loop: for (id, name, parsed_input) in &parsed_tool_uses {
                     let mut input = parsed_input.clone();
 
+                    // --- Governance step 1: Risk classification (immutable deny-list) ---
+                    let risk = crate::risk_classifier::classify_tool_risk(
+                        name,
+                        &input,
+                        session_id,
+                    );
+                    if risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+                        warn!(
+                            tool = %name,
+                            reason = %risk.reason,
+                            "tool call blocked by immutable deny-list"
+                        );
+                        self.record_tool_error(
+                            session_id,
+                            &mut tool_calls,
+                            id,
+                            name,
+                            &input,
+                            format!(
+                                "Error: operation denied by security policy — {}",
+                                risk.reason
+                            ),
+                        )
+                        .await?;
+                        let _ = self
+                            .execute_hook(
+                                HookPoint::AfterToolCall,
+                                session_id,
+                                &agent_config.id,
+                                Some(name.clone()),
+                                serde_json::json!({
+                                    "tool_name": name,
+                                    "input": input.clone(),
+                                    "output": format!("Error: denied — {}", risk.reason),
+                                    "is_error": true,
+                                    "risk_level": format!("{:?}", risk.level),
+                                    "deny_reason": "immutable_deny_list",
+                                }),
+                            )
+                            .await;
+                        continue 'tool_loop;
+                    }
+
+                    // --- Governance step 2: Input validation (schema check) ---
+                    if !input.is_object() {
+                        warn!(
+                            tool = %name,
+                            input_type = %crate::message_validation::json_type_name(&input),
+                            "tool_use input is not an object — coercing to empty object"
+                        );
+                        input = serde_json::json!({});
+                    }
+
+                    // --- Governance step 3: Pre-tool hook (BeforeToolCall) ---
                     if let Some(override_payload) = self
                         .execute_hook(
                             HookPoint::BeforeToolCall,
@@ -404,6 +458,59 @@ impl AgentRuntime {
                             .cloned()
                             .unwrap_or(override_payload);
                         input = new_input;
+
+                        // Re-validate object shape after hook override.
+                        if !input.is_object() {
+                            warn!(
+                                tool = %name,
+                                "hook set non-object input — coercing to empty object"
+                            );
+                            input = serde_json::json!({});
+                        }
+
+                        // Re-classify after hook modified input — hooks must not
+                        // bypass the immutable deny-list by transforming input.
+                        let post_hook_risk = crate::risk_classifier::classify_tool_risk(
+                            name,
+                            &input,
+                            session_id,
+                        );
+                        if post_hook_risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+                            warn!(
+                                tool = %name,
+                                reason = %post_hook_risk.reason,
+                                "tool call blocked after hook modified input — deny-list match"
+                            );
+                            self.record_tool_error(
+                                session_id,
+                                &mut tool_calls,
+                                id,
+                                name,
+                                &input,
+                                format!(
+                                    "Error: operation denied by security policy — {}",
+                                    post_hook_risk.reason
+                                ),
+                            )
+                            .await?;
+                            let _ = self
+                                .execute_hook(
+                                    HookPoint::AfterToolCall,
+                                    session_id,
+                                    &agent_config.id,
+                                    Some(name.clone()),
+                                    serde_json::json!({
+                                        "tool_name": name,
+                                        "input": input.clone(),
+                                        "output": format!("Error: denied — {}", post_hook_risk.reason),
+                                        "is_error": true,
+                                        "risk_level": format!("{:?}", post_hook_risk.level),
+                                        "deny_reason": "immutable_deny_list",
+                                    }),
+                                )
+                                .await;
+                            continue 'tool_loop;
+                        }
                     }
 
                     if let Some(ref firewall) = self.firewall {
@@ -443,6 +550,7 @@ impl AgentRuntime {
                                             "input": input.clone(),
                                             "output": format!("Error: {e}"),
                                             "is_error": true,
+                                            "deny_reason": "egress_firewall",
                                         }),
                                     )
                                     .await;
@@ -476,6 +584,7 @@ impl AgentRuntime {
                                         "input": input.clone(),
                                         "output": format!("Error: tool '{}' is denied by security policy", name),
                                         "is_error": true,
+                                        "deny_reason": "policy_denied",
                                     }),
                                 )
                                 .await;
@@ -513,6 +622,7 @@ impl AgentRuntime {
                                             "input": input.clone(),
                                             "output": format!("Error: tool '{}' denied: {}", name, reason),
                                             "is_error": true,
+                                            "deny_reason": "approval_denied",
                                         }),
                                     )
                                     .await;
@@ -1822,8 +1932,11 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
 
+        // Use a non-denied bash command (ls is Sensitive, not Denied).
+        // The deny-list blocks rm -rf / before approval; this tests the
+        // approval flow for commands that pass the deny-list.
         let responses = vec![
-            tool_use_response("t1", "bash.exec", r#"{"command":"rm -rf /"}"#),
+            tool_use_response("t1", "bash.exec", r#"{"command":"ls -la /tmp"}"#),
             text_response("ok"),
         ];
 
@@ -1927,6 +2040,36 @@ mod tests {
             Ok(HookResult::Override(
                 serde_json::json!({"input": {"text": "rewritten"}}),
             ))
+        }
+    }
+
+    /// Hook that returns a non-object input override (should be coerced to {}).
+    struct NonObjectInputHook;
+    #[async_trait::async_trait]
+    impl HookHandler for NonObjectInputHook {
+        async fn execute(
+            &self,
+            _ctx: &mut encmind_core::hooks::HookContext,
+        ) -> Result<HookResult, PluginError> {
+            // Return a string instead of an object — runtime should coerce to {}.
+            Ok(HookResult::Override(
+                serde_json::json!({"input": "not an object"}),
+            ))
+        }
+    }
+
+    /// Hook that captures AfterToolCall payloads for test assertions.
+    struct CaptureAfterToolHook {
+        payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl HookHandler for CaptureAfterToolHook {
+        async fn execute(
+            &self,
+            ctx: &mut encmind_core::hooks::HookContext,
+        ) -> Result<HookResult, PluginError> {
+            self.payloads.lock().unwrap().push(ctx.payload.clone());
+            Ok(HookResult::Continue)
         }
     }
 
@@ -2223,6 +2366,51 @@ mod tests {
             .unwrap();
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].input["text"], "rewritten");
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_hook_non_object_input_coerced() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+        let responses = vec![
+            tool_use_response("t1", "echo", r#"{"text":"hello"}"#),
+            text_response("ok"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::BeforeToolCall,
+                100,
+                "test",
+                Arc::new(NonObjectInputHook),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("trigger"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // The hook returned a string input which should be coerced to {}.
+        // TestEchoSkill echoes input.text — with {} input, text is absent
+        // so output should be empty or "null".
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(!result.tool_calls[0].is_error);
+        // Input should have been coerced to empty object.
+        assert!(
+            result.tool_calls[0].input.is_object(),
+            "non-object input should be coerced to object"
+        );
     }
 
     #[tokio::test]
@@ -2770,5 +2958,59 @@ mod tests {
             assistant_tool_use.is_object(),
             "persisted tool_use.input should be object for Anthropic compatibility"
         );
+    }
+
+    #[tokio::test]
+    async fn deny_list_block_emits_deny_reason_in_hook_payload() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+
+        // bash.exec with rm -rf / triggers the immutable deny-list.
+        let responses = vec![
+            tool_use_response("t1", "bash.exec", r#"{"command":"rm -rf /"}"#),
+            text_response("ok"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::AfterToolCall,
+                100,
+                "capture",
+                Arc::new(CaptureAfterToolHook {
+                    payloads: payloads.clone(),
+                }),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("delete everything"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Tool should have been denied.
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].is_error);
+
+        // AfterToolCall hook should have received a payload with deny_reason.
+        let captured = payloads.lock().unwrap();
+        assert_eq!(captured.len(), 1, "expected exactly 1 AfterToolCall hook call");
+        let payload = &captured[0];
+        assert_eq!(payload["is_error"], true);
+        assert!(
+            payload.get("deny_reason").is_some(),
+            "AfterToolCall payload on deny path must include deny_reason, got: {payload}"
+        );
+        assert_eq!(payload["deny_reason"], "immutable_deny_list");
     }
 }

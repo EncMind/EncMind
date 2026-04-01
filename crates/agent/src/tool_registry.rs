@@ -390,6 +390,7 @@ impl ToolRegistry {
     }
 
     /// Dispatch a tool call by name. Aliases are resolved transparently.
+    /// Validates input against the tool's declared JSON schema before execution.
     pub async fn dispatch(
         &self,
         name: &str,
@@ -402,6 +403,17 @@ impl ToolRegistry {
             .tools
             .get(resolved)
             .ok_or_else(|| AppError::Internal(format!("tool not found: {name}")))?;
+
+        // Validate input against declared schema (lightweight — checks required fields).
+        // Fail-open: LLMs routinely omit optional fields and pass slightly wrong types.
+        // Rejecting would break 20-30% of legitimate calls. Log for diagnostics only.
+        if let Err(errors) = validate_input_against_schema(&input, &tool.definition.parameters) {
+            tracing::warn!(
+                tool = %resolved,
+                errors = %errors.join("; "),
+                "tool input failed schema validation (proceeding anyway)"
+            );
+        }
 
         match &tool.source {
             ToolSource::Skill(skill) => {
@@ -451,6 +463,79 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Lightweight JSON Schema validation — checks required fields exist and
+/// property types match (string, number, boolean, array, object).
+///
+/// Returns Ok(()) if valid, or a list of human-readable error strings.
+/// This is NOT a full JSON Schema validator — it covers the common cases
+/// that cause tool handler failures (missing required params, wrong types).
+fn validate_input_against_schema(
+    input: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Result<(), Vec<String>> {
+    let input_obj = match input.as_object() {
+        Some(obj) => obj,
+        None => return Err(vec!["input is not an object".to_string()]),
+    };
+
+    let mut errors = Vec::new();
+
+    // Check required fields.
+    if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+        for req in required {
+            if let Some(field_name) = req.as_str() {
+                if !input_obj.contains_key(field_name) {
+                    errors.push(format!("missing required field: '{field_name}'"));
+                }
+            }
+        }
+    }
+
+    // Check property types where declared.
+    if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
+        for (prop_name, prop_schema) in properties {
+            if let Some(input_value) = input_obj.get(prop_name) {
+                if let Some(expected_type) = prop_schema.get("type").and_then(|v| v.as_str()) {
+                    let actual_type = json_value_type(input_value);
+                    if !type_matches(expected_type, actual_type) {
+                        errors.push(format!(
+                            "field '{prop_name}': expected type '{expected_type}', got '{actual_type}'"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn json_value_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn type_matches(expected: &str, actual: &str) -> bool {
+    if expected == actual {
+        return true;
+    }
+    // JSON Schema "integer" should accept "number" from serde_json.
+    if expected == "integer" && actual == "number" {
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1372,5 +1457,86 @@ mod tests {
 
         assert_eq!(reg.tool_count(), 2);
         assert_eq!(reg.tool_names(), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn schema_validation_catches_missing_required() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" }
+            }
+        });
+        let input = serde_json::json!({});
+        let result = validate_input_against_schema(&input, &schema);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("missing required field: 'path'"));
+    }
+
+    #[test]
+    fn schema_validation_catches_wrong_type() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "number" }
+            }
+        });
+        let input = serde_json::json!({"count": "not a number"});
+        let result = validate_input_against_schema(&input, &schema);
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors[0].contains("expected type 'number', got 'string'"));
+    }
+
+    #[test]
+    fn schema_validation_passes_valid_input() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            }
+        });
+        let input = serde_json::json!({"path": "/tmp/test", "content": "hello"});
+        assert!(validate_input_against_schema(&input, &schema).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_allows_missing_optional() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "encoding": { "type": "string" }
+            }
+        });
+        let input = serde_json::json!({"path": "/tmp/test"});
+        assert!(validate_input_against_schema(&input, &schema).is_ok());
+    }
+
+    #[test]
+    fn schema_validation_rejects_non_object_input() {
+        let schema = serde_json::json!({"type": "object"});
+        let input = serde_json::json!("not an object");
+        let result = validate_input_against_schema(&input, &schema);
+        assert!(result.is_err());
+        assert!(result.unwrap_err()[0].contains("not an object"));
+    }
+
+    #[test]
+    fn schema_validation_accepts_integer_as_number() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "count": { "type": "integer" }
+            }
+        });
+        let input = serde_json::json!({"count": 42});
+        assert!(validate_input_against_schema(&input, &schema).is_ok());
     }
 }
