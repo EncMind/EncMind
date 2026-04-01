@@ -28,12 +28,22 @@ impl EmbeddingModeEnforcer {
     pub fn create_embedder(&self, config: &MemoryConfig) -> Result<Arc<dyn Embedder>, MemoryError> {
         match &self.mode {
             EmbeddingMode::Private => {
-                // Private mode requires a local embedding model (not yet implemented).
-                // Use External mode with an OpenAI-compatible embedding API instead.
-                let _ = config;
-                Err(MemoryError::ModelNotLoaded(
-                    "private embedding mode is not yet supported; use external mode with an embedding API".into(),
-                ))
+                #[cfg(feature = "local-embedding")]
+                {
+                    let embedder = crate::embedder::local::LocalEmbedder::default_model(
+                        config.local_model_path.as_ref(),
+                    )?;
+                    Ok(Arc::new(embedder))
+                }
+                #[cfg(not(feature = "local-embedding"))]
+                {
+                    let _ = config;
+                    Err(MemoryError::ModelNotLoaded(
+                        "private embedding mode requires the 'local-embedding' feature; \
+                         rebuild with: cargo build --features local-embedding"
+                            .into(),
+                    ))
+                }
             }
             EmbeddingMode::External {
                 provider,
@@ -136,15 +146,23 @@ mod tests {
     }
 
     #[test]
-    fn private_mode_errors_not_supported() {
+    fn private_mode_creates_local_embedder() {
+        let config = default_config();
         let enforcer = EmbeddingModeEnforcer::new(EmbeddingMode::Private);
-        let result = enforcer.create_embedder(&default_config());
+        let result = enforcer.create_embedder(&config);
+        // With the local-embedding feature, this either succeeds (model cached)
+        // or fails with a download error (no network). Both are acceptable.
         match result {
-            Err(e) => assert!(
-                e.to_string().contains("not yet supported"),
-                "unexpected error: {e}"
-            ),
-            Ok(_) => panic!("expected error for private mode"),
+            Ok(embedder) => {
+                assert_eq!(embedder.dimensions(), 384);
+            }
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("failed") || err.contains("download") || err.contains("model"),
+                    "unexpected error: {err}"
+                );
+            }
         }
     }
 

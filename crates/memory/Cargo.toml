@@ -7,8 +7,9 @@ license.workspace = true
 description = "Long-term memory: embeddings, vector search, FTS5, hybrid retrieval, and quality gates for EncMind"
 
 [features]
-default = []
+default = ["local-embedding"]
 qdrant = ["dep:qdrant-client", "dep:uuid"]
+local-embedding = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers"]
 
 [dependencies]
 encmind-core = { path = "../core" }
@@ -28,6 +29,11 @@ rusqlite = { workspace = true }
 rand = { workspace = true }
 qdrant-client = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
+candle-core = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -205,18 +205,31 @@ llm:
   - name: openai
     model: gpt-4o
 
+# Option A: Local embedding (private — no data leaves your server)
 memory:
   enabled: true
   embedding_mode:
-    type: external
-    provider: openai
-    api_base_url: https://api.openai.com
-  model_name: text-embedding-3-small
-  embedding_dimensions: 1536
+    type: private
+  model_name: BAAI/bge-small-en-v1.5
+  embedding_dimensions: 384
   vector_backend:
     type: qdrant
     url: http://localhost:6334
     collection: encmind_memories
+
+# Option B: External embedding (OpenAI API)
+# memory:
+#   enabled: true
+#   embedding_mode:
+#     type: external
+#     provider: openai
+#     api_base_url: https://api.openai.com
+#   model_name: text-embedding-3-small
+#   embedding_dimensions: 1536
+#   vector_backend:
+#     type: qdrant
+#     url: http://localhost:6334
+#     collection: encmind_memories
 
 tee:
   enabled: true
@@ -295,6 +308,59 @@ gateway:
     file_list: true
     bash_exec: true
     admin: false
+```
+
+### Embedding modes
+
+EncMind supports two embedding modes for memory/RAG:
+
+| Mode | Config `type` | Dimensions | Privacy | Requires |
+|------|--------------|------------|---------|----------|
+| **Private (local)** | `private` | 384 | Full — no data leaves your server | CPU only, ~130MB model download on first use |
+| **External (API)** | `external` | 1536 | Text sent to provider for embedding | `OPENAI_API_KEY` (or other provider key) |
+
+Private mode uses `BAAI/bge-small-en-v1.5` via [candle](https://github.com/huggingface/candle) (pure Rust, no ONNX Runtime). The model is downloaded from HuggingFace Hub on first startup and cached at `~/.cache/huggingface/`.
+
+**Switching between modes:**
+
+Switching embedding modes changes the vector dimensions (384 vs 1536). Existing memories stored with the old dimensions **cannot be searched** with the new embedding model — the vectors are incompatible.
+
+To switch cleanly:
+
+1. Change `embedding_mode`, `model_name`, `embedding_dimensions`, and `collection` in config
+2. Use a **new Qdrant collection name** (e.g., `encmind_memories_local`) to avoid dimension conflicts
+3. Restart the server
+
+Old memories in the previous collection are preserved but will not appear in search results. There is currently no built-in re-embedding migration — this is a known limitation.
+
+**Private mode config:**
+```yaml
+memory:
+  enabled: true
+  embedding_mode:
+    type: private
+  model_name: BAAI/bge-small-en-v1.5
+  embedding_dimensions: 384
+  vector_backend:
+    type: qdrant
+    url: http://localhost:6334
+    collection: encmind_memories
+```
+
+**External mode config (OpenAI):**
+```yaml
+memory:
+  enabled: true
+  embedding_mode:
+    type: external
+    provider: openai
+    api_base_url: https://api.openai.com
+  model_name: text-embedding-3-small
+  embedding_dimensions: 1536
+  vector_backend:
+    type: qdrant
+    url: http://localhost:6334
+    collection: encmind_memories
 ```
 
 ### Install as a system service
