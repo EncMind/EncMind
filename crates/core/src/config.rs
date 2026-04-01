@@ -2065,6 +2065,10 @@ pub struct GatewayConfig {
     pub max_connections: u32,
     #[serde(default)]
     pub mdns_enabled: bool,
+    /// Maximum total requests per session (1 active + N-1 queued) for the
+    /// per-session query guard. Set to 0 for unlimited (not recommended).
+    #[serde(default = "default_max_queued_per_session")]
+    pub max_queued_per_session: usize,
     /// Default permissions granted to newly paired devices.
     /// Fields not specified default to `false`.
     /// The first paired device is always promoted to admin regardless of this setting.
@@ -2081,6 +2085,9 @@ fn default_idempotency_ttl_secs() -> u64 {
 fn default_max_connections() -> u32 {
     64
 }
+fn default_max_queued_per_session() -> usize {
+    5
+}
 fn default_device_permissions() -> crate::types::DevicePermissions {
     crate::types::DevicePermissions {
         chat: true,
@@ -2094,6 +2101,7 @@ impl Default for GatewayConfig {
             heartbeat_interval_ms: default_heartbeat_interval_ms(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             max_connections: default_max_connections(),
+            max_queued_per_session: default_max_queued_per_session(),
             mdns_enabled: false,
             default_device_permissions: default_device_permissions(),
         }

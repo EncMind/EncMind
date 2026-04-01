@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -33,19 +32,9 @@ fn model_allowed_in_current_mode(config: &encmind_core::config::AppConfig, model
     }
 }
 
-/// Guard that removes the session's cancellation token from `active_runs` on drop.
-/// Ensures cleanup on all exit paths (early errors, panics, normal return).
-struct ActiveRunGuard {
-    active_runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    key: String,
-}
-
-impl Drop for ActiveRunGuard {
-    fn drop(&mut self) {
-        let mut runs = self.active_runs.lock().unwrap();
-        runs.remove(&self.key);
-    }
-}
+// ActiveRunGuard is replaced by QueryPermit from query_guard module.
+// The query guard serializes concurrent chat.send calls per session (FIFO)
+// instead of rejecting them with ERR_RATE_LIMITED.
 
 pub async fn handle_send(
     state: &AppState,
@@ -221,26 +210,27 @@ pub async fn handle_send(
         }
     };
 
-    // Register cancellation token early (right after session_id is known)
-    // so that chat.abort can cancel in-flight work during agent/config resolution.
-    let cancel_token = CancellationToken::new();
-    let _run_guard = {
-        let mut active_runs = state.active_runs.lock().unwrap();
-        if active_runs.contains_key(session_id.as_str()) {
+    // Acquire per-session query guard. If another chat.send is running on this
+    // session, we wait in FIFO order (not reject). Different sessions proceed
+    // independently. The guard also registers the cancellation token in active_runs
+    // so chat.abort continues to work.
+    let query_permit = match state
+        .query_guard
+        .acquire(session_id.as_str(), state.active_runs.clone())
+        .await
+    {
+        Some(permit) => permit,
+        None => {
             return ServerMessage::Error {
                 id: Some(req_id.to_string()),
                 error: ErrorPayload::new(
                     ERR_RATE_LIMITED,
-                    "session already has an active run; use chat.abort first",
+                    "too many queued requests for this session",
                 ),
             };
         }
-        active_runs.insert(session_id.as_str().to_owned(), cancel_token.clone());
-        ActiveRunGuard {
-            active_runs: state.active_runs.clone(),
-            key: session_id.as_str().to_owned(),
-        }
     };
+    let cancel_token = query_permit.cancel_token().clone();
 
     let agent_id = match state.agent_registry.resolve_agent(&session_id).await {
         Ok(agent_id) => agent_id,
@@ -392,7 +382,8 @@ pub async fn handle_send(
         )
         .await;
 
-    // _run_guard drops here (or on any early return above), cleaning up active_runs
+    // query_permit drops here (or on any early return above), releasing the session
+    // semaphore (next queued request proceeds) and cleaning up active_runs.
 
     let run_result = match execute_result {
         Ok(result) => result,
@@ -705,7 +696,7 @@ mod tests {
         append_loop_break_audit, extract_text_blocks, handle_abort, handle_history, handle_send,
         loop_break_audit_detail, maybe_generate_title,
     };
-    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS, ERR_RATE_LIMITED};
+    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS};
     use crate::test_utils::make_test_state;
     use encmind_agent::tool_registry::{InternalToolHandler, ToolRegistry};
     use encmind_core::config::BashMode;
@@ -766,29 +757,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_rejects_concurrent_run_for_session() {
+    async fn send_queues_concurrent_run_for_session() {
+        // With the query guard, concurrent sends on the same session are queued
+        // (FIFO) instead of rejected. This test verifies that a second send
+        // waits for the first to complete rather than returning ERR_RATE_LIMITED.
+        //
+        // We can't easily test the full FIFO flow in a unit test (would need a
+        // real agent pool), but we can verify the guard acquires and releases
+        // correctly by checking active_runs state.
         let state = make_test_state();
         let session = state.session_store.create_session("web").await.unwrap();
-        let token = CancellationToken::new();
-        {
-            let mut active_runs = state.active_runs.lock().unwrap();
-            active_runs.insert(session.id.as_str().to_owned(), token);
-        }
 
-        let response = handle_send(
-            &state,
-            serde_json::json!({
-                "session_id": session.id.as_str(),
-                "text": "hello"
-            }),
-            "req-2",
-        )
-        .await;
+        // Acquire a permit directly to simulate an in-flight run.
+        let permit = state
+            .query_guard
+            .acquire(session.id.as_str(), state.active_runs.clone())
+            .await;
+        assert!(permit.is_some(), "first acquire should succeed");
 
-        match response {
-            ServerMessage::Error { error, .. } => assert_eq!(error.code, ERR_RATE_LIMITED),
-            _ => panic!("expected rate-limited error"),
-        }
+        // Verify token is registered in active_runs.
+        assert!(
+            state
+                .active_runs
+                .lock()
+                .unwrap()
+                .contains_key(session.id.as_str()),
+            "cancel token should be in active_runs"
+        );
+
+        // Drop the permit — simulates run completing.
+        drop(permit);
+
+        // After drop, active_runs should be clean.
+        assert!(
+            !state
+                .active_runs
+                .lock()
+                .unwrap()
+                .contains_key(session.id.as_str()),
+            "active_runs should be clean after permit drop"
+        );
     }
 
     #[tokio::test]

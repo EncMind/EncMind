@@ -199,6 +199,9 @@ pub async fn run_gateway(
     let pairing_sessions = Arc::new(Mutex::new(HashMap::<String, PairingSession>::new()));
     let admin_bootstrap_lock = Arc::new(AsyncMutex::new(()));
     let active_runs = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+    let query_guard = Arc::new(crate::query_guard::QueryGuardRegistry::new(
+        config.gateway.max_queued_per_session,
+    ));
     let api_key_store: Arc<dyn ApiKeyStore> = Arc::new(
         encmind_storage::api_key_store::SqliteApiKeyStore::new(pool.clone(), encryption.clone()),
     );
@@ -505,6 +508,7 @@ pub async fn run_gateway(
         pairing_sessions,
         admin_bootstrap_lock,
         active_runs,
+        query_guard,
         timeline_store: Some(Arc::new(
             encmind_storage::timeline_store::SqliteTimelineStore::new(pool.clone()),
         )),

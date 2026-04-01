@@ -469,6 +469,9 @@ mod tests {
             pairing_sessions: Arc::new(Mutex::new(HashMap::new())),
             admin_bootstrap_lock: Arc::new(AsyncMutex::new(())),
             active_runs: Arc::new(Mutex::new(HashMap::new())),
+            query_guard: Arc::new(crate::query_guard::QueryGuardRegistry::new(
+                encmind_core::config::GatewayConfig::default().max_queued_per_session,
+            )),
             db_pool: pool,
             memory_store: None,
             cron_store: None,

@@ -246,10 +246,36 @@ impl AgentRuntime {
             }
 
             // 2a. Build context
-            let (context, max_output) = self
+            let (mut context, max_output) = self
                 .context_manager
                 .build_context(session_id, agent_config, &self.session_store, &self.llm)
                 .await?;
+
+            // 2b. Normalize messages before token counting and LLM call.
+            // Must run before count_tokens so telemetry reflects actual payload.
+            let norm_report = crate::message_validation::normalize_for_api(&mut context);
+            if norm_report.tool_use_inputs_coerced > 0
+                || norm_report.orphaned_tool_results_removed > 0
+                || norm_report.consecutive_roles_merged > 0
+                || norm_report.empty_messages_removed > 0
+                || norm_report.role_incompatible_blocks_dropped > 0
+                || norm_report.synthetic_tool_results_injected > 0
+                || norm_report.duplicate_tool_uses_removed > 0
+                || norm_report.duplicate_tool_results_removed > 0
+            {
+                tracing::info!(
+                    coerced = norm_report.tool_use_inputs_coerced,
+                    orphans = norm_report.orphaned_tool_results_removed,
+                    merged = norm_report.consecutive_roles_merged,
+                    empty = norm_report.empty_messages_removed,
+                    role_drops = norm_report.role_incompatible_blocks_dropped,
+                    synthetics = norm_report.synthetic_tool_results_injected,
+                    dup_uses = norm_report.duplicate_tool_uses_removed,
+                    dup_results = norm_report.duplicate_tool_results_removed,
+                    "message normalization applied before LLM call"
+                );
+            }
+
             let prompt_tokens = match self.llm.count_tokens(&context).await {
                 Ok(tokens) => tokens,
                 Err(e) => {
@@ -260,7 +286,7 @@ impl AgentRuntime {
             input_tokens = input_tokens.saturating_add(prompt_tokens);
             total_tokens = total_tokens.saturating_add(prompt_tokens);
 
-            // 2b. Call LLM
+            // 2c. Call LLM
             let params = CompletionParams {
                 model: agent_config.model.clone(),
                 max_tokens: max_output,

@@ -67,6 +67,9 @@ fn make_state() -> AppState {
     let pairing_sessions = Arc::new(Mutex::new(HashMap::<String, PairingSession>::new()));
     let admin_bootstrap_lock = Arc::new(AsyncMutex::new(()));
     let active_runs = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+    let query_guard = Arc::new(encmind_gateway::query_guard::QueryGuardRegistry::new(
+        config.gateway.max_queued_per_session,
+    ));
 
     AppState {
         session_store,
@@ -90,6 +93,7 @@ fn make_state() -> AppState {
         pairing_sessions,
         admin_bootstrap_lock,
         active_runs,
+        query_guard,
         timeline_store: Some(Arc::new(
             encmind_storage::timeline_store::SqliteTimelineStore::new(pool.clone()),
         )),

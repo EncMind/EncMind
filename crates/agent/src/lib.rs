@@ -3,6 +3,7 @@ pub mod context;
 pub mod firewall;
 pub mod lockdown;
 pub mod loop_detector;
+pub mod message_validation;
 pub mod pool;
 pub mod registry;
 pub mod runtime;
