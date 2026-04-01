@@ -210,6 +210,9 @@ memory:
   enabled: true
   embedding_mode:
     type: private
+  # Optional: load model files from a local directory containing
+  # config.json, tokenizer.json, and model.safetensors.
+  # local_model_path: /path/to/local-embedding-model
   model_name: BAAI/bge-small-en-v1.5
   embedding_dimensions: 384
   vector_backend:
@@ -319,7 +322,7 @@ EncMind supports two embedding modes for memory/RAG:
 | **Private (local)** | `private` | 384 | Full — no data leaves your server | CPU only, ~130MB model download on first use |
 | **External (API)** | `external` | 1536 | Text sent to provider for embedding | `OPENAI_API_KEY` (or other provider key) |
 
-Private mode uses `BAAI/bge-small-en-v1.5` via [candle](https://github.com/huggingface/candle) (pure Rust, no ONNX Runtime). The model is downloaded from HuggingFace Hub on first startup and cached at `~/.cache/huggingface/`.
+Private mode uses `model_name` (default: `BAAI/bge-small-en-v1.5`) via [candle](https://github.com/huggingface/candle) (pure Rust, no ONNX Runtime). By default, the model is downloaded from HuggingFace Hub on first startup and cached at `~/.cache/huggingface/`. If `local_model_path` is set, EncMind loads the model from local files instead.
 
 **Switching between modes:**
 
@@ -333,12 +336,15 @@ To switch cleanly:
 
 Old memories in the previous collection are preserved but will not appear in search results. There is currently no built-in re-embedding migration — this is a known limitation.
 
+When switching to external mode, set `model_name` and `embedding_dimensions` explicitly for your provider.
+
 **Private mode config:**
 ```yaml
 memory:
   enabled: true
   embedding_mode:
     type: private
+  # local_model_path: /path/to/local-embedding-model
   model_name: BAAI/bge-small-en-v1.5
   embedding_dimensions: 384
   vector_backend:

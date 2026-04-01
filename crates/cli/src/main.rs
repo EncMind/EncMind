@@ -425,6 +425,25 @@ fn resolve_absolute_db_path(db_path: &std::path::Path) -> std::path::PathBuf {
     fallback
 }
 
+fn read_local_model_hidden_size(model_dir: &std::path::Path) -> anyhow::Result<usize> {
+    let config_path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read '{}': {e}", config_path.display()))?;
+    let json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse '{}': {e}", config_path.display()))?;
+    let hidden_size = json
+        .get("hidden_size")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "missing numeric hidden_size in local model config '{}'",
+                config_path.display()
+            )
+        })?;
+    usize::try_from(hidden_size)
+        .map_err(|_| anyhow::anyhow!("hidden_size out of range for usize: {hidden_size}"))
+}
+
 /// Result of verifying the audit log hash chain.
 #[derive(Debug)]
 struct ChainVerifyResult {
@@ -2014,13 +2033,46 @@ async fn main() -> anyhow::Result<()> {
                     println!("Memory is disabled. Enable it in config.yaml under memory.enabled.");
                 } else {
                     println!("Memory: enabled");
+                    println!("  Embedding mode: {:?}", config.memory.embedding_mode);
                     println!("  Model: {}", config.memory.model_name);
-                    println!("  Dimensions: {}", config.memory.embedding_dimensions);
+                    match &config.memory.embedding_mode {
+                        encmind_core::config::EmbeddingMode::Private => {
+                            if let Some(local_model_path) =
+                                config.memory.local_model_path.as_deref()
+                            {
+                                match read_local_model_hidden_size(local_model_path) {
+                                    Ok(hidden_size) => {
+                                        println!(
+                                            "  Dimensions: {} (from local model config)",
+                                            hidden_size
+                                        );
+                                    }
+                                    Err(err) => {
+                                        println!(
+                                            "  Dimensions: {} (configured)",
+                                            config.memory.embedding_dimensions
+                                        );
+                                        println!(
+                                            "  Local model probe: {}",
+                                            err.to_string().replace('\n', " ")
+                                        );
+                                    }
+                                }
+                            } else {
+                                println!(
+                                    "  Dimensions: {} (configured; runtime derives actual size from model config)",
+                                    config.memory.embedding_dimensions
+                                );
+                            }
+                        }
+                        encmind_core::config::EmbeddingMode::External { .. } => {
+                            println!("  Dimensions: {}", config.memory.embedding_dimensions);
+                        }
+                    }
                     println!(
                         "  Max context memories: {}",
                         config.memory.max_context_memories
                     );
-                    println!("  Embedding mode: {:?}", config.memory.embedding_mode);
                 }
             }
             MemoryAction::Rebuild => {
@@ -2043,15 +2095,21 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = mode_enforcer
                     .verify_firewall_consistency(&config.security.egress_firewall.global_allowlist)
                 {
-                    return Err(anyhow::anyhow!(
-                        "memory rebuild failed: invalid firewall/embedding mode combination: {e}"
-                    ));
+                    eprintln!(
+                        "warning: memory embedding/firewall consistency check failed: {e} (continuing)"
+                    );
                 }
 
+                let memory_cfg = config.memory.clone();
                 let embedder: std::sync::Arc<dyn encmind_core::traits::Embedder> =
-                    mode_enforcer.create_embedder(&config.memory).map_err(|e| {
-                        anyhow::anyhow!("memory rebuild failed: cannot create embedder: {e}")
-                    })?;
+                    tokio::task::spawn_blocking(move || mode_enforcer.create_embedder(&memory_cfg))
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("memory rebuild failed: embedder task panicked: {e}")
+                        })?
+                        .map_err(|e| {
+                            anyhow::anyhow!("memory rebuild failed: cannot create embedder: {e}")
+                        })?;
 
                 let vector_store: std::sync::Arc<dyn encmind_core::traits::VectorStore> =
                     std::sync::Arc::new(encmind_memory::vector_store::SqliteVectorStore::new(

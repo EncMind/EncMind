@@ -3,14 +3,17 @@
 //! Uses a BERT-family sentence-transformer model (e.g., bge-small-en-v1.5) to
 //! compute embeddings entirely on-device. No external API calls.
 
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE};
-use hf_hub::{api::sync::Api, Repo, RepoType};
+use hf_hub::{
+    api::sync::{Api, ApiBuilder},
+    Repo, RepoType,
+};
 use tokenizers::{Tokenizer, TruncationParams};
 
 use encmind_core::error::MemoryError;
@@ -31,7 +34,7 @@ struct LoadedModel {
 
 /// An embedder that runs a BERT sentence-transformer model locally via candle.
 pub struct LocalEmbedder {
-    inner: Mutex<LoadedModel>,
+    inner: Arc<Mutex<LoadedModel>>,
     dimensions: usize,
     model_name: String,
 }
@@ -42,7 +45,7 @@ impl LocalEmbedder {
     /// # Arguments
     /// * `model_id` — HuggingFace model ID (e.g., "BAAI/bge-small-en-v1.5")
     /// * `cache_dir` — optional local cache directory override
-    pub fn from_hub(model_id: &str, _cache_dir: Option<&PathBuf>) -> Result<Self, MemoryError> {
+    pub fn from_hub(model_id: &str, cache_dir: Option<&Path>) -> Result<Self, MemoryError> {
         let device = Device::Cpu;
 
         tracing::info!(
@@ -50,9 +53,21 @@ impl LocalEmbedder {
             "local embedding: downloading/loading model from HuggingFace Hub"
         );
 
-        let api = Api::new().map_err(|e| {
-            MemoryError::ModelNotLoaded(format!("failed to create HF Hub API: {e}"))
-        })?;
+        let api = if let Some(cache_dir) = cache_dir {
+            ApiBuilder::new()
+                .with_cache_dir(cache_dir.to_path_buf())
+                .build()
+                .map_err(|e| {
+                    MemoryError::ModelNotLoaded(format!(
+                        "failed to create HF Hub API with cache dir '{}': {e}",
+                        cache_dir.display()
+                    ))
+                })?
+        } else {
+            Api::new().map_err(|e| {
+                MemoryError::ModelNotLoaded(format!("failed to create HF Hub API: {e}"))
+            })?
+        };
 
         let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
 
@@ -102,25 +117,98 @@ impl LocalEmbedder {
         );
 
         Ok(Self {
-            inner: Mutex::new(LoadedModel {
+            inner: Arc::new(Mutex::new(LoadedModel {
                 model,
                 tokenizer,
                 device,
-            }),
+            })),
             dimensions,
             model_name: model_id.to_string(),
         })
     }
 
     /// Load the default model (bge-small-en-v1.5, 384 dimensions).
-    pub fn default_model(cache_dir: Option<&PathBuf>) -> Result<Self, MemoryError> {
+    pub fn default_model(cache_dir: Option<&Path>) -> Result<Self, MemoryError> {
         Self::from_hub(DEFAULT_MODEL_ID, cache_dir)
     }
 
-    /// Embed a single text synchronously.
-    fn embed_sync(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
-        let inner = self
-            .inner
+    /// Load model artifacts from a local directory containing:
+    /// - config.json
+    /// - tokenizer.json
+    /// - model.safetensors
+    pub fn from_local_dir(model_name: &str, model_dir: &Path) -> Result<Self, MemoryError> {
+        let device = Device::Cpu;
+        if !model_dir.is_dir() {
+            return Err(MemoryError::ModelNotLoaded(format!(
+                "local_model_path is not a directory: {}",
+                model_dir.display()
+            )));
+        }
+
+        let config_path = model_dir.join("config.json");
+        let tokenizer_path = model_dir.join("tokenizer.json");
+        let weights_path = model_dir.join("model.safetensors");
+        for p in [&config_path, &tokenizer_path, &weights_path] {
+            if !p.exists() {
+                return Err(MemoryError::ModelNotLoaded(format!(
+                    "local model file not found: {}",
+                    p.display()
+                )));
+            }
+        }
+
+        // Load config.
+        let config_data = std::fs::read_to_string(&config_path)
+            .map_err(|e| MemoryError::ModelNotLoaded(format!("failed to read config.json: {e}")))?;
+        let config: BertConfig = serde_json::from_str(&config_data).map_err(|e| {
+            MemoryError::ModelNotLoaded(format!("failed to parse config.json: {e}"))
+        })?;
+        let dimensions = config.hidden_size;
+
+        // Load tokenizer.
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
+            .map_err(|e| MemoryError::ModelNotLoaded(format!("failed to load tokenizer: {e}")))?;
+        tokenizer
+            .with_truncation(Some(TruncationParams {
+                max_length: MAX_TOKENS,
+                ..Default::default()
+            }))
+            .map_err(|e| MemoryError::ModelNotLoaded(format!("failed to set truncation: {e}")))?;
+        tokenizer.with_padding(None);
+
+        // Load weights.
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[weights_path], DTYPE, &device).map_err(|e| {
+                MemoryError::ModelNotLoaded(format!("failed to load model weights: {e}"))
+            })?
+        };
+
+        let model = BertModel::load(vb, &config)
+            .map_err(|e| MemoryError::ModelNotLoaded(format!("failed to build BERT model: {e}")))?;
+
+        tracing::info!(
+            model_dir = %model_dir.display(),
+            dimensions,
+            "local embedding: model loaded successfully from local path"
+        );
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(LoadedModel {
+                model,
+                tokenizer,
+                device,
+            })),
+            dimensions,
+            model_name: model_name.to_string(),
+        })
+    }
+
+    fn embed_sync_from_model(
+        inner: &Mutex<LoadedModel>,
+        expected_dimensions: usize,
+        text: &str,
+    ) -> Result<Vec<f32>, MemoryError> {
+        let inner = inner
             .lock()
             .map_err(|e| MemoryError::EmbeddingFailed(format!("model lock poisoned: {e}")))?;
 
@@ -182,7 +270,7 @@ impl LocalEmbedder {
             .broadcast_div(&count)
             .map_err(|e| MemoryError::EmbeddingFailed(format!("div failed: {e}")))?;
 
-        // Squeeze batch dimension → [hidden_dim].
+        // Squeeze batch dimension -> [hidden_dim].
         let embedding = mean_pooled
             .squeeze(0)
             .map_err(|e| MemoryError::EmbeddingFailed(format!("squeeze failed: {e}")))?;
@@ -206,10 +294,10 @@ impl LocalEmbedder {
             .to_vec1()
             .map_err(|e| MemoryError::EmbeddingFailed(format!("to_vec1 failed: {e}")))?;
 
-        if result.len() != self.dimensions {
+        if result.len() != expected_dimensions {
             return Err(MemoryError::EmbeddingFailed(format!(
                 "expected {} dimensions, got {}",
-                self.dimensions,
+                expected_dimensions,
                 result.len()
             )));
         }
@@ -221,13 +309,11 @@ impl LocalEmbedder {
 #[async_trait]
 impl Embedder for LocalEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+        let inner = Arc::clone(&self.inner);
+        let expected_dimensions = self.dimensions;
         let text = text.to_string();
-        let self_ptr = self as *const Self as usize;
         tokio::task::spawn_blocking(move || {
-            // SAFETY: the caller holds &self for the lifetime of this call,
-            // and spawn_blocking is awaited immediately — self outlives the task.
-            let this = unsafe { &*(self_ptr as *const Self) };
-            this.embed_sync(&text)
+            Self::embed_sync_from_model(inner.as_ref(), expected_dimensions, &text)
         })
         .await
         .map_err(|e| MemoryError::EmbeddingFailed(format!("embedding task failed: {e}")))?
@@ -247,9 +333,10 @@ mod tests {
     use super::*;
 
     // These tests download the model on first run (~130MB).
-    // They are not #[ignore] because the download is cached.
+    // Keep them ignored by default to avoid network-dependent CI behavior.
 
     #[test]
+    #[ignore = "requires HuggingFace model download/network"]
     fn local_embedder_loads_default_model() {
         let result = LocalEmbedder::default_model(None);
         match result {
@@ -264,6 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires HuggingFace model download/network"]
     async fn local_embedder_produces_384_dimensions() {
         let embedder = match LocalEmbedder::default_model(None) {
             Ok(e) => e,
@@ -277,6 +365,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires HuggingFace model download/network"]
     async fn local_embedder_output_is_normalized() {
         let embedder = match LocalEmbedder::default_model(None) {
             Ok(e) => e,
@@ -294,6 +383,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires HuggingFace model download/network"]
     async fn local_embedder_similar_texts_high_cosine() {
         let embedder = match LocalEmbedder::default_model(None) {
             Ok(e) => e,
@@ -312,6 +402,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires HuggingFace model download/network"]
     async fn local_embedder_different_texts_lower_cosine() {
         let embedder = match LocalEmbedder::default_model(None) {
             Ok(e) => e,

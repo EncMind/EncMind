@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -132,6 +132,52 @@ impl AppConfig {
 
         if self.agent_pool.max_concurrent_agents == 0 {
             errors.push("agent_pool.max_concurrent_agents must be > 0".to_string());
+        }
+
+        if self.memory.enabled {
+            if self.memory.embedding_dimensions == 0 {
+                errors.push("memory.embedding_dimensions must be > 0".to_string());
+            }
+            match &self.memory.embedding_mode {
+                EmbeddingMode::Private => {
+                    if let Some(path) = &self.memory.local_model_path {
+                        if !path.exists() {
+                            errors.push(format!(
+                                "memory.local_model_path does not exist: {}",
+                                path.display()
+                            ));
+                        } else if !path.is_dir() {
+                            errors.push(format!(
+                                "memory.local_model_path must be a directory: {}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                EmbeddingMode::External {
+                    provider,
+                    api_base_url,
+                } => {
+                    if provider.trim().is_empty() {
+                        errors.push(
+                            "memory.embedding_mode.provider must not be empty when embedding_mode.type=external"
+                                .to_string(),
+                        );
+                    }
+                    if api_base_url.trim().is_empty() {
+                        errors.push(
+                            "memory.embedding_mode.api_base_url must not be empty when embedding_mode.type=external"
+                                .to_string(),
+                        );
+                    }
+                    if self.memory.local_model_path.is_some() {
+                        errors.push(
+                            "memory.local_model_path is only valid when memory.embedding_mode.type=private"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
         }
 
         if matches!(
@@ -2054,29 +2100,28 @@ impl Default for GatewayConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MemoryConfig {
-    #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
     pub embedding_mode: EmbeddingMode,
     pub local_model_path: Option<PathBuf>,
-    #[serde(default = "default_embedding_model")]
     pub model_name: String,
-    #[serde(default = "default_embedding_dimensions")]
     pub embedding_dimensions: usize,
-    #[serde(default = "default_search_limit")]
     pub default_search_limit: usize,
-    #[serde(default = "default_max_context_memories")]
     pub max_context_memories: usize,
-    #[serde(default)]
     pub vector_backend: VectorBackendConfig,
 }
 
 fn default_embedding_model() -> String {
-    "text-embedding-3-small".into()
+    "BAAI/bge-small-en-v1.5".into()
 }
 fn default_embedding_dimensions() -> usize {
+    384
+}
+fn default_external_embedding_model() -> String {
+    "text-embedding-3-small".into()
+}
+fn default_external_embedding_dimensions() -> usize {
     1536
 }
 fn default_search_limit() -> usize {
@@ -2098,6 +2143,53 @@ impl Default for MemoryConfig {
             max_context_memories: default_max_context_memories(),
             vector_backend: VectorBackendConfig::default(),
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for MemoryConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawMemoryConfig {
+            #[serde(default)]
+            enabled: bool,
+            #[serde(default)]
+            embedding_mode: EmbeddingMode,
+            local_model_path: Option<PathBuf>,
+            model_name: Option<String>,
+            embedding_dimensions: Option<usize>,
+            default_search_limit: Option<usize>,
+            max_context_memories: Option<usize>,
+            #[serde(default)]
+            vector_backend: VectorBackendConfig,
+        }
+
+        let raw = RawMemoryConfig::deserialize(deserializer)?;
+
+        let (default_model, default_dims) = match raw.embedding_mode {
+            EmbeddingMode::Private => (default_embedding_model(), default_embedding_dimensions()),
+            EmbeddingMode::External { .. } => (
+                default_external_embedding_model(),
+                default_external_embedding_dimensions(),
+            ),
+        };
+
+        Ok(Self {
+            enabled: raw.enabled,
+            embedding_mode: raw.embedding_mode,
+            local_model_path: raw.local_model_path,
+            model_name: raw.model_name.unwrap_or(default_model),
+            embedding_dimensions: raw.embedding_dimensions.unwrap_or(default_dims),
+            default_search_limit: raw
+                .default_search_limit
+                .unwrap_or_else(default_search_limit),
+            max_context_memories: raw
+                .max_context_memories
+                .unwrap_or_else(default_max_context_memories),
+            vector_backend: raw.vector_backend,
+        })
     }
 }
 
@@ -2699,6 +2791,51 @@ skills:
     }
 
     #[test]
+    fn load_config_external_memory_applies_external_defaults_when_omitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+memory:
+  enabled: true
+  embedding_mode:
+    type: external
+    provider: openai
+    api_base_url: https://api.openai.com
+"#,
+        )
+        .unwrap();
+
+        let config = load_config(&path).unwrap();
+        assert!(matches!(
+            config.memory.embedding_mode,
+            EmbeddingMode::External { .. }
+        ));
+        assert_eq!(config.memory.model_name, "text-embedding-3-small");
+        assert_eq!(config.memory.embedding_dimensions, 1536);
+    }
+
+    #[test]
+    fn serde_app_config_external_memory_uses_mode_aware_defaults() {
+        let yaml = r#"
+memory:
+  enabled: true
+  embedding_mode:
+    type: external
+    provider: openai
+    api_base_url: https://api.openai.com
+"#;
+        let config: AppConfig = serde_yml::from_str(yaml).unwrap();
+        assert!(matches!(
+            config.memory.embedding_mode,
+            EmbeddingMode::External { .. }
+        ));
+        assert_eq!(config.memory.model_name, "text-embedding-3-small");
+        assert_eq!(config.memory.embedding_dimensions, 1536);
+    }
+
+    #[test]
     fn inference_mode_serde() {
         let yaml = "type: ApiProvider\nprovider: anthropic\n";
         let mode: InferenceMode = serde_yml::from_str(yaml).unwrap();
@@ -2758,7 +2895,7 @@ gateway:
         let config = MemoryConfig::default();
         assert!(!config.enabled);
         assert!(matches!(config.embedding_mode, EmbeddingMode::Private));
-        assert_eq!(config.embedding_dimensions, 1536);
+        assert_eq!(config.embedding_dimensions, 384);
         assert_eq!(config.default_search_limit, 10);
         assert_eq!(config.max_context_memories, 5);
         assert!(matches!(config.vector_backend, VectorBackendConfig::Sqlite));
@@ -2768,7 +2905,7 @@ gateway:
     fn app_config_includes_memory() {
         let config = AppConfig::default();
         assert!(!config.memory.enabled);
-        assert_eq!(config.memory.model_name, "text-embedding-3-small");
+        assert_eq!(config.memory.model_name, "BAAI/bge-small-en-v1.5");
     }
 
     #[test]
@@ -2780,6 +2917,42 @@ memory:
         let config: AppConfig = serde_yml::from_str(yaml).unwrap();
         assert!(!config.memory.enabled);
         assert_eq!(config.memory.model_name, "custom-embed");
+    }
+
+    #[test]
+    fn validate_rejects_missing_private_local_model_path() {
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+        config.memory.embedding_mode = EmbeddingMode::Private;
+        let temp = tempfile::tempdir().unwrap();
+        config.memory.local_model_path = Some(temp.path().join("missing-model"));
+
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("memory.local_model_path does not exist")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_local_model_path_in_external_mode() {
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+        config.memory.embedding_mode = EmbeddingMode::External {
+            provider: "openai".to_string(),
+            api_base_url: "https://api.openai.com".to_string(),
+        };
+        config.memory.local_model_path = Some(PathBuf::from("/tmp/local-model"));
+
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "memory.local_model_path is only valid when memory.embedding_mode.type=private"
+            )),
+            "errors={errors:?}"
+        );
     }
 
     #[test]
