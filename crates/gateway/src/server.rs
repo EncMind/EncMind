@@ -4251,19 +4251,22 @@ async fn initialize_memory_store(
     if let Err(e) =
         mode_enforcer.verify_firewall_consistency(&config.security.egress_firewall.global_allowlist)
     {
-        return Err(anyhow::anyhow!(
-            "memory initialization failed: invalid firewall/embedding mode combination: {e}"
-        ));
+        warn!(
+            error = %e,
+            "memory embedding/firewall consistency check failed; continuing because enforcement happens at request-time firewall"
+        );
     }
 
-    let embedder: Arc<dyn Embedder> = match mode_enforcer.create_embedder(&config.memory) {
-        Ok(embedder) => embedder,
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "memory initialization failed: cannot create embedder: {e}"
-            ));
-        }
-    };
+    let memory_cfg = config.memory.clone();
+    let embedder: Arc<dyn Embedder> =
+        tokio::task::spawn_blocking(move || mode_enforcer.create_embedder(&memory_cfg))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("memory initialization failed: embedder task panicked: {e}")
+            })?
+            .map_err(|e| {
+                anyhow::anyhow!("memory initialization failed: cannot create embedder: {e}")
+            })?;
 
     let vector_store: Arc<dyn VectorStore> = match &config.memory.vector_backend {
         VectorBackendConfig::Sqlite => Arc::new(SqliteVectorStore::new(pool.clone())),

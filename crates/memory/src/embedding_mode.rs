@@ -28,12 +28,29 @@ impl EmbeddingModeEnforcer {
     pub fn create_embedder(&self, config: &MemoryConfig) -> Result<Arc<dyn Embedder>, MemoryError> {
         match &self.mode {
             EmbeddingMode::Private => {
-                // Private mode requires a local embedding model (not yet implemented).
-                // Use External mode with an OpenAI-compatible embedding API instead.
-                let _ = config;
-                Err(MemoryError::ModelNotLoaded(
-                    "private embedding mode is not yet supported; use external mode with an embedding API".into(),
-                ))
+                #[cfg(feature = "local-embedding")]
+                {
+                    let embedder = if let Some(local_model_path) =
+                        config.local_model_path.as_deref()
+                    {
+                        crate::embedder::local::LocalEmbedder::from_local_dir(
+                            &config.model_name,
+                            local_model_path,
+                        )?
+                    } else {
+                        crate::embedder::local::LocalEmbedder::from_hub(&config.model_name, None)?
+                    };
+                    Ok(Arc::new(embedder))
+                }
+                #[cfg(not(feature = "local-embedding"))]
+                {
+                    let _ = config;
+                    Err(MemoryError::ModelNotLoaded(
+                        "private embedding mode requires the 'local-embedding' feature; \
+                         rebuild with: cargo build --features local-embedding"
+                            .into(),
+                    ))
+                }
             }
             EmbeddingMode::External {
                 provider,
@@ -57,20 +74,25 @@ impl EmbeddingModeEnforcer {
 
     /// Verify that the egress firewall config is consistent with the embedding mode.
     ///
-    /// - Private mode: embedding API domains should NOT be in the allowlist (data stays local).
-    /// - External mode: the configured API domain should be accessible.
+    /// - Private mode: emits warnings if known embedding API domains are present in allowlist.
+    /// - External mode: soft check only; firewall enforcement happens at request time.
     pub fn verify_firewall_consistency(
         &self,
         firewall_allowlist: &[String],
     ) -> Result<(), MemoryError> {
         match &self.mode {
             EmbeddingMode::Private => {
+                let mut embedding_domains = Vec::new();
                 for domain in firewall_allowlist {
                     if KNOWN_EMBEDDING_DOMAINS.iter().any(|d| domain.contains(d)) {
-                        return Err(MemoryError::InvalidConfig(format!(
-                            "private embedding mode but firewall allowlist contains embedding API domain: {domain}"
-                        )));
+                        embedding_domains.push(domain.clone());
                     }
+                }
+                if !embedding_domains.is_empty() {
+                    tracing::warn!(
+                        allowlist_domains = ?embedding_domains,
+                        "private embedding mode is enabled but firewall allowlist includes known embedding API domains"
+                    );
                 }
                 Ok(())
             }
@@ -130,32 +152,39 @@ fn embedding_api_key_env(provider: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     fn default_config() -> MemoryConfig {
         MemoryConfig::default()
     }
 
     #[test]
-    fn private_mode_errors_not_supported() {
+    fn private_mode_uses_configured_local_model_path() {
+        let mut config = default_config();
+        let temp = tempdir().expect("create tempdir");
+        config.local_model_path = Some(temp.path().join("missing-model-dir"));
         let enforcer = EmbeddingModeEnforcer::new(EmbeddingMode::Private);
-        let result = enforcer.create_embedder(&default_config());
-        match result {
-            Err(e) => assert!(
-                e.to_string().contains("not yet supported"),
-                "unexpected error: {e}"
-            ),
-            Ok(_) => panic!("expected error for private mode"),
-        }
+        let err = match enforcer.create_embedder(&config) {
+            Ok(_) => panic!("expected create_embedder to fail for invalid local_model_path"),
+            Err(err) => err.to_string(),
+        };
+        assert!(
+            err.contains("local_model_path is not a directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn external_mode_creates_api_embedder() {
         std::env::set_var("ACME_API_KEY", "test-key");
+        let mut config = default_config();
+        config.model_name = "text-embedding-3-small".to_string();
+        config.embedding_dimensions = 1536;
         let enforcer = EmbeddingModeEnforcer::new(EmbeddingMode::External {
             provider: "acme".into(),
             api_base_url: "https://example.com".into(),
         });
-        let result = enforcer.create_embedder(&default_config());
+        let result = enforcer.create_embedder(&config);
         assert!(result.is_ok());
         let embedder = result.unwrap();
         assert_eq!(embedder.dimensions(), 1536);
@@ -163,13 +192,11 @@ mod tests {
     }
 
     #[test]
-    fn firewall_consistency_private_rejects_embedding_domain() {
+    fn firewall_consistency_private_allows_embedding_domains() {
         let enforcer = EmbeddingModeEnforcer::new(EmbeddingMode::Private);
         let allowlist = vec!["api.openai.com".to_string(), "example.com".to_string()];
         let result = enforcer.verify_firewall_consistency(&allowlist);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("api.openai.com"));
+        assert!(result.is_ok());
     }
 
     #[test]

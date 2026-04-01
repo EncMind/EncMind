@@ -98,5 +98,12 @@ encoding_rs = "0.8"
 # PDF extraction
 pdf-extract = "0.10"
 
+# Local embedding (pure Rust, no ONNX Runtime needed)
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = "0.4"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
 # Testing
 tempfile = "3"
