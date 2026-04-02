@@ -40,7 +40,6 @@ const BASH_DENY_PATTERNS: &[(&str, &str)] = &[
     (":(){:|:&};:", "fork bomb"),
 ];
 
-
 /// Credential path patterns for file write deny-list.
 /// Matched against normalized path (lowercase, forward slashes).
 /// Both absolute (/.ssh/) and relative (.ssh/) forms are checked.
@@ -98,12 +97,8 @@ fn is_file_write_tool(name: &str) -> bool {
         || lower.ends_with("file.edit")
 }
 
-
 fn classify_bash_risk(input: &serde_json::Value) -> RiskClassification {
-    let command = input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let command = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
 
     // Normalize: lowercase, collapse whitespace for consistent matching.
     let lower: String = command
@@ -136,9 +131,7 @@ fn classify_bash_risk(input: &serde_json::Value) -> RiskClassification {
         };
     }
     // "dd" with if= (raw disk write). Must be a standalone word, not part of "add".
-    if lower.split_whitespace().any(|w| w == "dd")
-        && lower.contains("if=")
-    {
+    if lower.split_whitespace().any(|w| w == "dd") && lower.contains("if=") {
         return RiskClassification {
             level: ToolRiskLevel::Denied,
             reason: "raw disk write",
@@ -178,10 +171,7 @@ fn classify_bash_risk(input: &serde_json::Value) -> RiskClassification {
 }
 
 fn classify_file_write_risk(input: &serde_json::Value) -> RiskClassification {
-    let path = input
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
 
     // Normalize: lowercase + forward slashes for cross-platform matching.
     let normalized = path.to_lowercase().replace('\\', "/");
@@ -201,7 +191,6 @@ fn classify_file_write_risk(input: &serde_json::Value) -> RiskClassification {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +208,6 @@ mod tests {
         );
         assert_eq!(result.level, ToolRiskLevel::Denied);
     }
-
 
     #[test]
     fn denies_credential_file_write() {
@@ -280,7 +268,6 @@ mod tests {
         );
         assert_eq!(result.level, ToolRiskLevel::Low);
     }
-
 
     #[test]
     fn prefixed_node_bash_exec_is_classified() {
@@ -393,5 +380,4 @@ mod tests {
         );
         assert_eq!(result.level, ToolRiskLevel::Denied);
     }
-
 }

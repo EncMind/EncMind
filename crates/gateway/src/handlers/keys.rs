@@ -1424,9 +1424,14 @@ description = "Echo input"
     #[tokio::test]
     async fn dispatch_keys_list() {
         let state = state_with_key_store();
-        let result =
-            crate::dispatch::dispatch_method(&state, "keys.list", serde_json::json!({}), "req-d1")
-                .await;
+        let result = crate::dispatch::dispatch_method(
+            &state,
+            "keys.list",
+            serde_json::json!({}),
+            "req-d1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-d1"),
             _ => panic!("Expected Res"),
@@ -1443,6 +1448,7 @@ description = "Echo input"
             "keys.set",
             serde_json::json!({"provider": "testprov", "api_key": "sk-test"}),
             "req-d2",
+            None,
         )
         .await;
         match result {

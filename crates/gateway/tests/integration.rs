@@ -190,6 +190,7 @@ async fn ws_connect_and_chat_dispatch() {
         "chat.send",
         serde_json::json!({"message": "hello"}),
         "req-1",
+        None,
     )
     .await;
 
@@ -214,6 +215,7 @@ async fn lockdown_blocks_ws() {
         "chat.send",
         serde_json::json!({}),
         "locked-req",
+        None,
     )
     .await;
 
@@ -231,6 +233,7 @@ async fn lockdown_blocks_ws() {
         "security.lockdown",
         serde_json::json!({"active": false}),
         "unlock-req",
+        None,
     )
     .await;
 
@@ -316,6 +319,7 @@ async fn lockdown_full_flow() {
         "security.lockdown",
         serde_json::json!({"active": true, "reason": "maintenance"}),
         "lock-1",
+        None,
     )
     .await;
     match &result {
@@ -333,6 +337,7 @@ async fn lockdown_full_flow() {
         "chat.send",
         serde_json::json!({}),
         "chat-1",
+        None,
     )
     .await;
     match &result {
@@ -348,6 +353,7 @@ async fn lockdown_full_flow() {
         "security.audit",
         serde_json::json!({}),
         "audit-1",
+        None,
     )
     .await;
     match &result {
@@ -367,6 +373,7 @@ async fn lockdown_full_flow() {
         "config.get",
         serde_json::json!({}),
         "cfg-1",
+        None,
     )
     .await;
     match &result {
@@ -386,6 +393,7 @@ async fn lockdown_full_flow() {
         "models.list",
         serde_json::json!({}),
         "models-1",
+        None,
     )
     .await;
     match &result {
@@ -405,6 +413,7 @@ async fn lockdown_full_flow() {
         "security.lockdown",
         serde_json::json!({"active": false}),
         "unlock-1",
+        None,
     )
     .await;
     match &result {
@@ -422,6 +431,7 @@ async fn lockdown_full_flow() {
         "chat.send",
         serde_json::json!({"message": "hello"}),
         "chat-2",
+        None,
     )
     .await;
     match &result {
@@ -441,6 +451,7 @@ async fn lockdown_full_flow() {
         "security.audit",
         serde_json::json!({"category": "security.lockdown"}),
         "audit-2",
+        None,
     )
     .await;
     match &result {

@@ -39,7 +39,10 @@ const SYNTHETIC_TOOL_RESULT_PLACEHOLDER: &str = "[tool did not return a result]"
 /// Allowed content block types per role.
 fn is_block_allowed_for_role(role: &Role, block: &ContentBlock) -> bool {
     match role {
-        Role::User => matches!(block, ContentBlock::Text { .. } | ContentBlock::Image { .. }),
+        Role::User => matches!(
+            block,
+            ContentBlock::Text { .. } | ContentBlock::Image { .. }
+        ),
         Role::Assistant => matches!(
             block,
             ContentBlock::Text { .. }
@@ -206,17 +209,14 @@ pub fn normalize_for_api(messages: &mut Vec<Message>) -> NormalizationReport {
                 if !missing_ids.is_empty() {
                     let synthetic_blocks: Vec<ContentBlock> = missing_ids
                         .iter()
-                        .map(|id| {
-                            ContentBlock::ToolResult {
-                                tool_use_id: id.clone(),
-                                content: SYNTHETIC_TOOL_RESULT_PLACEHOLDER.to_owned(),
-                                is_error: true,
-                            }
+                        .map(|id| ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: SYNTHETIC_TOOL_RESULT_PLACEHOLDER.to_owned(),
+                            is_error: true,
                         })
                         .collect();
 
-                    report.synthetic_tool_results_injected +=
-                        synthetic_blocks.len() as u32;
+                    report.synthetic_tool_results_injected += synthetic_blocks.len() as u32;
 
                     // Insert right after this assistant message (position i+1).
                     // If i+1 is already a Tool message, merge into it.
@@ -226,9 +226,7 @@ pub fn normalize_for_api(messages: &mut Vec<Message>) -> NormalizationReport {
                         && matches!(messages[insert_pos].role, Role::Tool)
                     {
                         // Merge synthetics into existing Tool message.
-                        messages[insert_pos]
-                            .content
-                            .extend(synthetic_blocks);
+                        messages[insert_pos].content.extend(synthetic_blocks);
                     } else {
                         // Insert new Tool message.
                         messages.insert(
@@ -269,9 +267,7 @@ pub fn normalize_for_api(messages: &mut Vec<Message>) -> NormalizationReport {
     // The Anthropic API rejects consecutive user or assistant messages.
     let mut i = 1;
     while i < messages.len() {
-        if messages[i].role == messages[i - 1].role
-            && !matches!(messages[i].role, Role::System)
-        {
+        if messages[i].role == messages[i - 1].role && !matches!(messages[i].role, Role::System) {
             warn!(
                 role = ?messages[i].role,
                 "merging consecutive same-role messages"

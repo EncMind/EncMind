@@ -1475,6 +1475,7 @@ pub(crate) async fn channel_inbound_loop(
                         "session_id": session_id.as_str(),
                     }),
                     &req_id,
+                    None,
                 )
                 .await;
 
