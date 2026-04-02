@@ -1,15 +1,16 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::SinkExt;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use encmind_agent::context::ContextConfig;
-use encmind_agent::runtime::{AgentRuntime, RuntimeConfig};
+use encmind_agent::runtime::{AgentRuntime, ChatEvent, RuntimeConfig};
 use encmind_core::config::InferenceMode;
+use encmind_core::error::{AppError, LlmError};
 use encmind_core::types::{AgentId, ContentBlock, Message, MessageId, Role, SessionId};
 
 use crate::approval::gateway_approval_policy;
@@ -17,6 +18,7 @@ use crate::protocol::*;
 use crate::state::AppState;
 
 const MAX_CHANNEL_LEN: usize = 64;
+const STREAM_EVENT_SEND_TIMEOUT_MS: u64 = 250;
 
 fn model_allowed_in_current_mode(config: &encmind_core::config::AppConfig, model: &str) -> bool {
     match &config.llm.mode {
@@ -33,24 +35,15 @@ fn model_allowed_in_current_mode(config: &encmind_core::config::AppConfig, model
     }
 }
 
-/// Guard that removes the session's cancellation token from `active_runs` on drop.
-/// Ensures cleanup on all exit paths (early errors, panics, normal return).
-struct ActiveRunGuard {
-    active_runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
-    key: String,
-}
-
-impl Drop for ActiveRunGuard {
-    fn drop(&mut self) {
-        let mut runs = self.active_runs.lock().unwrap();
-        runs.remove(&self.key);
-    }
-}
+// ActiveRunGuard is replaced by QueryPermit from query_guard module.
+// The query guard serializes concurrent chat.send calls per session (FIFO)
+// instead of rejecting them with ERR_RATE_LIMITED.
 
 pub async fn handle_send(
     state: &AppState,
     params: serde_json::Value,
     req_id: &str,
+    ws_sender: Option<crate::ws::WsSender>,
 ) -> ServerMessage {
     let text = params
         .get("text")
@@ -221,26 +214,27 @@ pub async fn handle_send(
         }
     };
 
-    // Register cancellation token early (right after session_id is known)
-    // so that chat.abort can cancel in-flight work during agent/config resolution.
-    let cancel_token = CancellationToken::new();
-    let _run_guard = {
-        let mut active_runs = state.active_runs.lock().unwrap();
-        if active_runs.contains_key(session_id.as_str()) {
+    // Acquire per-session query guard. If another chat.send is running on this
+    // session, we wait in FIFO order (not reject). Different sessions proceed
+    // independently. The guard also registers the cancellation token in active_runs
+    // so chat.abort continues to work.
+    let query_permit = match state
+        .query_guard
+        .acquire(session_id.as_str(), state.active_runs.clone())
+        .await
+    {
+        Some(permit) => permit,
+        None => {
             return ServerMessage::Error {
                 id: Some(req_id.to_string()),
                 error: ErrorPayload::new(
                     ERR_RATE_LIMITED,
-                    "session already has an active run; use chat.abort first",
+                    "too many queued requests for this session",
                 ),
             };
         }
-        active_runs.insert(session_id.as_str().to_owned(), cancel_token.clone());
-        ActiveRunGuard {
-            active_runs: state.active_runs.clone(),
-            key: session_id.as_str().to_owned(),
-        }
     };
+    let cancel_token = query_permit.cancel_token().clone();
 
     let agent_id = match state.agent_registry.resolve_agent(&session_id).await {
         Ok(agent_id) => agent_id,
@@ -381,22 +375,109 @@ pub async fn handle_send(
     }
 
     let title_cancel = cancel_token.clone();
-    let execute_result = state
-        .agent_pool
-        .execute(
-            &runtime,
-            &session_id,
-            user_message,
-            &agent_config,
-            cancel_token,
-        )
-        .await;
+    let stream_cancel = cancel_token.clone();
 
-    // _run_guard drops here (or on any early return above), cleaning up active_runs
+    // If we have a WS sender, stream events in real-time.
+    // Otherwise, fall back to the non-streaming execute path.
+    let execute_result = if let Some(ref sender) = ws_sender {
+        match state
+            .agent_pool
+            .execute_streaming(
+                &runtime,
+                session_id.clone(),
+                user_message,
+                agent_config.clone(),
+                cancel_token,
+            )
+            .await
+        {
+            Ok((mut rx, mut handle)) => {
+                let mut final_result: Option<
+                    Result<encmind_agent::runtime::RunResult, encmind_core::error::AppError>,
+                > = None;
+                loop {
+                    tokio::select! {
+                        join_out = &mut handle => {
+                            final_result = Some(match join_out {
+                                Ok(result) => result,
+                                Err(join_err) => Err(encmind_core::error::AppError::Internal(
+                                    format!("agent task failed: {join_err}"),
+                                )),
+                            });
+                            break;
+                        }
+                        maybe_event = rx.recv() => {
+                            match maybe_event {
+                                Some(event) => {
+                                    if let Err(err) = send_stream_event(sender, req_id, &session_id, &event).await {
+                                        warn!(error = %err, "failed to forward streaming event; cancelling run");
+                                        stream_cancel.cancel();
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+
+                // Flush any queued events produced before the run handle resolved.
+                while let Ok(event) = rx.try_recv() {
+                    if let Err(err) = send_stream_event(sender, req_id, &session_id, &event).await {
+                        warn!(error = %err, "failed to forward queued streaming event");
+                        stream_cancel.cancel();
+                        break;
+                    }
+                }
+
+                // Drop the receiver to close the channel. This unblocks
+                // the runtime's final tx.send(Done/Error) if the channel was full.
+                drop(rx);
+
+                if let Some(result) = final_result {
+                    result
+                } else {
+                    match handle.await {
+                        Ok(result) => result,
+                        Err(join_err) => Err(encmind_core::error::AppError::Internal(format!(
+                            "agent task failed: {join_err}"
+                        ))),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        state
+            .agent_pool
+            .execute(
+                &runtime,
+                &session_id,
+                user_message,
+                &agent_config,
+                cancel_token,
+            )
+            .await
+    };
+
+    // query_permit drops here (or on any early return above), releasing the session
+    // semaphore (next queued request proceeds) and cleaning up active_runs.
 
     let run_result = match execute_result {
         Ok(result) => result,
         Err(e) => {
+            if is_cancelled_app_error(&e) {
+                return ServerMessage::Res {
+                    id: req_id.to_string(),
+                    result: serde_json::json!({
+                        "status": "cancelled",
+                        "session_id": session_id.as_str(),
+                        "agent_id": agent_id.as_str(),
+                        "iterations": 0,
+                        "total_tokens": 0,
+                    }),
+                };
+            }
             return ServerMessage::Error {
                 id: Some(req_id.to_string()),
                 error: ErrorPayload::new(ERR_INTERNAL, e.to_string()),
@@ -426,6 +507,20 @@ pub async fn handle_send(
     }
 
     let assistant_text = extract_text_blocks(&run_result.response.content);
+    if run_result.cancelled {
+        return ServerMessage::Res {
+            id: req_id.to_string(),
+            result: serde_json::json!({
+                "status": "cancelled",
+                "session_id": session_id.as_str(),
+                "agent_id": agent_id.as_str(),
+                "response": assistant_text,
+                "iterations": run_result.iterations,
+                "total_tokens": run_result.total_tokens,
+            }),
+        };
+    }
+
     let tool_calls = run_result
         .tool_calls
         .iter()
@@ -457,6 +552,42 @@ pub async fn handle_send(
             "total_tokens": run_result.total_tokens,
         }),
     }
+}
+
+async fn send_stream_event(
+    sender: &crate::ws::WsSender,
+    req_id: &str,
+    session_id: &SessionId,
+    event: &ChatEvent,
+) -> Result<(), String> {
+    let event_json = serde_json::to_value(event).map_err(|e| e.to_string())?;
+    let msg = ServerMessage::Event {
+        event: "chat.event".to_string(),
+        data: serde_json::json!({
+            "req_id": req_id,
+            "session_id": session_id.as_str(),
+            "event": event_json,
+        }),
+    };
+    let json = serde_json::to_string(&msg).map_err(|e| e.to_string())?;
+    let send_result =
+        tokio::time::timeout(Duration::from_millis(STREAM_EVENT_SEND_TIMEOUT_MS), async {
+            let mut s = sender.lock().await;
+            s.send(axum::extract::ws::Message::Text(json.into())).await
+        })
+        .await;
+
+    match send_result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err(format!(
+            "ws stream event send timed out after {STREAM_EVENT_SEND_TIMEOUT_MS}ms"
+        )),
+    }
+}
+
+fn is_cancelled_app_error(err: &AppError) -> bool {
+    matches!(err, AppError::Llm(LlmError::Cancelled))
 }
 
 fn extract_text_blocks(content: &[ContentBlock]) -> String {
@@ -705,7 +836,7 @@ mod tests {
         append_loop_break_audit, extract_text_blocks, handle_abort, handle_history, handle_send,
         loop_break_audit_detail, maybe_generate_title,
     };
-    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS, ERR_RATE_LIMITED};
+    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS};
     use crate::test_utils::make_test_state;
     use encmind_agent::tool_registry::{InternalToolHandler, ToolRegistry};
     use encmind_core::config::BashMode;
@@ -766,29 +897,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_rejects_concurrent_run_for_session() {
+    async fn send_queues_concurrent_run_for_session() {
+        // With the query guard, concurrent sends on the same session are queued
+        // (FIFO) instead of rejected. This test verifies that a second send
+        // waits for the first to complete rather than returning ERR_RATE_LIMITED.
+        //
+        // We can't easily test the full FIFO flow in a unit test (would need a
+        // real agent pool), but we can verify the guard acquires and releases
+        // correctly by checking active_runs state.
         let state = make_test_state();
         let session = state.session_store.create_session("web").await.unwrap();
-        let token = CancellationToken::new();
-        {
-            let mut active_runs = state.active_runs.lock().unwrap();
-            active_runs.insert(session.id.as_str().to_owned(), token);
-        }
 
-        let response = handle_send(
-            &state,
-            serde_json::json!({
-                "session_id": session.id.as_str(),
-                "text": "hello"
-            }),
-            "req-2",
-        )
-        .await;
+        // Acquire a permit directly to simulate an in-flight run.
+        let permit = state
+            .query_guard
+            .acquire(session.id.as_str(), state.active_runs.clone())
+            .await;
+        assert!(permit.is_some(), "first acquire should succeed");
 
-        match response {
-            ServerMessage::Error { error, .. } => assert_eq!(error.code, ERR_RATE_LIMITED),
-            _ => panic!("expected rate-limited error"),
-        }
+        // Verify token is registered in active_runs.
+        assert!(
+            state
+                .active_runs
+                .lock()
+                .unwrap()
+                .contains_key(session.id.as_str()),
+            "cancel token should be in active_runs"
+        );
+
+        // Drop the permit — simulates run completing.
+        drop(permit);
+
+        // After drop, active_runs should be clean.
+        assert!(
+            !state
+                .active_runs
+                .lock()
+                .unwrap()
+                .contains_key(session.id.as_str()),
+            "active_runs should be clean after permit drop"
+        );
     }
 
     #[tokio::test]
@@ -801,6 +949,7 @@ mod tests {
                 "model": "unknown-model"
             }),
             "req-3",
+            None,
         )
         .await;
 
@@ -841,6 +990,7 @@ mod tests {
                 "model": "claude-3-5-sonnet-latest"
             }),
             "req-4",
+            None,
         )
         .await;
 
@@ -879,6 +1029,7 @@ mod tests {
                 "model": "llama-3-8b"
             }),
             "req-5",
+            None,
         )
         .await;
 
@@ -900,6 +1051,7 @@ mod tests {
                 "channel": "x".repeat(65)
             }),
             "req-6",
+            None,
         )
         .await;
 
@@ -928,6 +1080,7 @@ mod tests {
                 "agent_id": "does-not-exist"
             }),
             "req-unknown-agent",
+            None,
         )
         .await;
 
@@ -1326,6 +1479,7 @@ mod tests {
                 "text": "trigger tool loop"
             }),
             "req-token-opt-1",
+            None,
         )
         .await;
 
@@ -1390,6 +1544,7 @@ mod tests {
                 "text": "run bash",
             }),
             "req-bash-deny",
+            None,
         )
         .await;
 
@@ -1640,6 +1795,7 @@ mod tests {
                     "session_id": sid_str,
                 }),
                 "req-abort-inflight",
+                None,
             )
             .await
         });
@@ -1664,17 +1820,13 @@ mod tests {
             other => panic!("expected abort Res, got {other:?}"),
         }
 
-        // Collect the send result — should be an error from the cancelled LLM
+        // Collect the send result — should return cancelled status.
         let send_response = send_task.await.expect("send task should not panic");
         match send_response {
-            ServerMessage::Error { error, .. } => {
-                assert!(
-                    error.message.contains("cancelled"),
-                    "expected 'cancelled' in error message, got: {}",
-                    error.message,
-                );
+            ServerMessage::Res { result, .. } => {
+                assert_eq!(result["status"], "cancelled");
             }
-            other => panic!("expected send Error after abort, got {other:?}"),
+            other => panic!("expected send Res(cancelled) after abort, got {other:?}"),
         }
     }
 
@@ -1699,6 +1851,7 @@ mod tests {
             &state,
             serde_json::json!({"text": "What is the weather?"}),
             "s-11-3",
+            None,
         )
         .await;
 

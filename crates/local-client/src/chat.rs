@@ -5,6 +5,7 @@ use std::time::Duration;
 use encmind_crypto::challenge::sign_nonce;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
+use tracing::debug;
 use url::Url;
 
 use crate::keystore::{identity_exists, KeystoreError, LocalKeystore};
@@ -199,13 +200,41 @@ pub async fn connect_and_auth(
     }
 }
 
+/// Default per-request timeout. Matches the server-side agent pool timeout.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Send a JSON-RPC request and await the matching response.
+///
+/// Enforces a per-request timeout (default 300s) to prevent indefinite hangs.
+/// On `chat.send` timeout, sends `chat.abort` to cancel server-side work
+/// (best-effort).
+/// Non-matching frames are logged at debug level and skipped.
+///
+/// Only one request should be in-flight per socket at a time. This is enforced
+/// by the `&mut WsStream` borrow contract.
 pub async fn send_req(
     ws: &mut WsStream,
     method: &str,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    send_req_with_timeout(ws, method, params, DEFAULT_REQUEST_TIMEOUT).await
+}
+
+/// Send a JSON-RPC request with a custom timeout.
+pub async fn send_req_with_timeout(
+    ws: &mut WsStream,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let id = next_req_id();
+
+    // Extract session_id from params if present (for abort on timeout).
+    let session_id = params
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     let msg = ClientMessage::Req {
         id: id.clone(),
         method: method.to_string(),
@@ -214,35 +243,83 @@ pub async fn send_req(
     let json = serde_json::to_string(&msg)?;
     ws.send(Message::Text(json)).await?;
 
-    // Await matching Res or Error.
-    loop {
-        let Some(frame) = ws.next().await else {
-            return Err("connection closed while awaiting response".into());
-        };
-        match frame? {
-            Message::Text(text) => {
-                let server_msg: ServerMessage = serde_json::from_str(text.as_ref())?;
-                match server_msg {
-                    ServerMessage::Res {
-                        id: res_id, result, ..
-                    } if res_id == id => {
-                        return Ok(result);
+    // Await matching Res or Error, with timeout.
+    let result = tokio::time::timeout(timeout, async {
+        loop {
+            let Some(frame) = ws.next().await else {
+                return Err::<serde_json::Value, Box<dyn std::error::Error>>(
+                    "connection closed while awaiting response".into(),
+                );
+            };
+            match frame? {
+                Message::Text(text) => {
+                    let server_msg: ServerMessage = serde_json::from_str(text.as_ref())?;
+                    match server_msg {
+                        ServerMessage::Res {
+                            id: res_id, result, ..
+                        } if res_id == id => {
+                            return Ok(result);
+                        }
+                        ServerMessage::Error {
+                            id: Some(ref err_id),
+                            ref error,
+                        } if *err_id == id => {
+                            return Err(format!(
+                                "server error ({}): {}",
+                                error.code, error.message
+                            )
+                            .into());
+                        }
+                        // Log and skip non-matching frames.
+                        other => {
+                            let frame_desc = match &other {
+                                ServerMessage::Res { id, .. } => format!("Res(id={id})"),
+                                ServerMessage::Error { id, .. } => format!("Error(id={id:?})"),
+                                ServerMessage::Event { event, .. } => format!("Event({event})"),
+                                _ => "other".to_string(),
+                            };
+                            debug!(
+                                req_id = %id,
+                                frame = %frame_desc,
+                                "skipping non-matching frame while awaiting response"
+                            );
+                            continue;
+                        }
                     }
-                    ServerMessage::Error {
-                        id: Some(ref err_id),
-                        ref error,
-                    } if *err_id == id => {
-                        return Err(
-                            format!("server error ({}): {}", error.code, error.message).into()
-                        );
+                }
+                Message::Close(_) => {
+                    return Err("connection closed while awaiting response".into());
+                }
+                _ => continue,
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => {
+            // Timeout: for chat.send only, send chat.abort to cancel server-side
+            // generation/tool execution (best-effort).
+            if method == "chat.send" {
+                if let Some(sid) = session_id {
+                    let abort_id = next_req_id();
+                    let abort_msg = ClientMessage::Req {
+                        id: abort_id,
+                        method: "chat.abort".to_string(),
+                        params: serde_json::json!({"session_id": sid}),
+                    };
+                    if let Ok(json) = serde_json::to_string(&abort_msg) {
+                        let _ = ws.send(Message::Text(json)).await;
                     }
-                    _ => continue,
                 }
             }
-            Message::Close(_) => {
-                return Err("connection closed while awaiting response".into());
-            }
-            _ => continue,
+            Err(format!(
+                "request '{}' timed out after {}s",
+                method,
+                timeout.as_secs()
+            )
+            .into())
         }
     }
 }

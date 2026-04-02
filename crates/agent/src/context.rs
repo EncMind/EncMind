@@ -42,6 +42,7 @@ impl Default for ContextConfig {
 }
 
 /// Manages context construction for LLM calls.
+#[derive(Clone)]
 pub struct ContextManager {
     config: ContextConfig,
     memory_search: Option<Arc<dyn MemorySearchProvider>>,

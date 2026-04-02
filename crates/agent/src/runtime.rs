@@ -1,15 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use futures::StreamExt;
+use serde::Serialize;
 use sha2::{Digest, Sha256};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use encmind_core::error::{AppError, PluginError};
+use encmind_core::error::{AppError, LlmError, PluginError};
 use encmind_core::hooks::{HookContext, HookPoint, HookRegistry, HookResult};
 use encmind_core::traits::{
     ApprovalHandler, CompletionParams, FinishReason, LlmBackend, MemorySearchProvider, SessionStore,
@@ -73,6 +76,58 @@ pub struct ToolCallRecord {
     pub is_error: bool,
 }
 
+/// Streaming events emitted during an agent run.
+///
+/// These are sent to the client as they happen, before the run completes.
+/// The final event is either `Done` or `Error`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatEvent {
+    /// Streaming text delta from the LLM.
+    Delta { text: String },
+    /// Thinking/reasoning delta (if thinking is enabled).
+    Thinking { text: String },
+    /// A tool call is about to start.
+    ToolStart {
+        tool_use_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
+    /// A tool call completed (success or error).
+    ToolComplete {
+        tool_use_id: String,
+        tool_name: String,
+        output: String,
+        is_error: bool,
+    },
+    /// The agent run completed.
+    Done {
+        stop_reason: StopReason,
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
+        iterations: u32,
+    },
+    /// An error occurred during the run.
+    Error { message: String },
+}
+
+/// Why the agent run stopped.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// LLM finished generating (no more tool calls).
+    EndTurn,
+    /// Max iterations reached.
+    MaxIterations,
+    /// Cancelled by user.
+    Cancelled,
+    /// Loop detector triggered.
+    LoopDetected { reason: String },
+    /// An error terminated the run.
+    Error,
+}
+
 /// The result of a complete agent run.
 #[derive(Debug)]
 pub struct RunResult {
@@ -86,6 +141,17 @@ pub struct RunResult {
     pub loop_break: Option<String>,
     /// Stable reason code for loop-break audit/reporting.
     pub loop_break_code: Option<String>,
+    /// True when the run stopped because max_tool_iterations was reached.
+    pub reached_max_iterations: bool,
+    /// True when the run was cancelled by user/token.
+    pub cancelled: bool,
+}
+
+struct ToolErrorDetails<'a> {
+    tool_use_id: &'a str,
+    tool_name: &'a str,
+    input: &'a serde_json::Value,
+    output: String,
 }
 
 /// The core agent runtime: drives the conversation loop.
@@ -151,6 +217,83 @@ impl AgentRuntime {
         self
     }
 
+    /// Cheap clone for streaming — all fields are Arc-wrapped.
+    fn clone_for_streaming(&self) -> Self {
+        Self {
+            llm: self.llm.clone(),
+            session_store: self.session_store.clone(),
+            tool_registry: self.tool_registry.clone(),
+            firewall: self.firewall.clone(),
+            context_manager: self.context_manager.clone(),
+            config: self.config.clone(),
+            approval_handler: self.approval_handler.clone(),
+            approval_checker: self.approval_checker.clone(),
+            hook_registry: self.hook_registry.clone(),
+        }
+    }
+
+    /// Run a single user turn, streaming events as they happen.
+    ///
+    /// Returns a receiver that yields `ChatEvent`s in real-time:
+    /// `Delta` / `Thinking` as the LLM generates, `ToolStart` / `ToolComplete`
+    /// as tools execute, and `Done` or `Error` when the run finishes.
+    ///
+    /// The `RunResult` is still returned as the function's return value after
+    /// all events have been sent (for backward-compatible callers that need it).
+    pub fn run_streaming(
+        &self,
+        session_id: SessionId,
+        user_message: Message,
+        agent_config: AgentConfig,
+        cancel: CancellationToken,
+    ) -> (
+        tokio::sync::mpsc::Receiver<ChatEvent>,
+        tokio::task::JoinHandle<Result<RunResult, AppError>>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let runtime = self.clone_for_streaming();
+        let sid = session_id.clone();
+        let handle = tokio::spawn(async move {
+            let result = runtime
+                .run_inner(&sid, user_message, &agent_config, cancel, Some(tx.clone()))
+                .await;
+            // Send final event.
+            match &result {
+                Ok(run_result) => {
+                    let stop_reason = if run_result.cancelled {
+                        StopReason::Cancelled
+                    } else if run_result.loop_break.is_some() {
+                        StopReason::LoopDetected {
+                            reason: run_result.loop_break.clone().unwrap_or_default(),
+                        }
+                    } else if run_result.reached_max_iterations {
+                        StopReason::MaxIterations
+                    } else {
+                        StopReason::EndTurn
+                    };
+                    let _ = tx
+                        .send(ChatEvent::Done {
+                            stop_reason,
+                            input_tokens: run_result.input_tokens,
+                            output_tokens: run_result.output_tokens,
+                            total_tokens: run_result.total_tokens,
+                            iterations: run_result.iterations,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(ChatEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                }
+            }
+            result
+        });
+        (rx, handle)
+    }
+
     /// Run a single user turn through the full conversation loop.
     pub async fn run(
         &self,
@@ -158,6 +301,19 @@ impl AgentRuntime {
         user_message: Message,
         agent_config: &AgentConfig,
         cancel: CancellationToken,
+    ) -> Result<RunResult, AppError> {
+        self.run_inner(session_id, user_message, agent_config, cancel, None)
+            .await
+    }
+
+    /// Internal run implementation that optionally emits streaming events.
+    async fn run_inner(
+        &self,
+        session_id: &SessionId,
+        user_message: Message,
+        agent_config: &AgentConfig,
+        cancel: CancellationToken,
+        event_tx: Option<tokio::sync::mpsc::Sender<ChatEvent>>,
     ) -> Result<RunResult, AppError> {
         let mut user_message = user_message;
 
@@ -242,14 +398,49 @@ impl AgentRuntime {
         // 2. Conversation loop
         for iteration in 0..self.config.max_tool_iterations {
             if cancel.is_cancelled() {
-                return Err(AppError::Internal("request cancelled".into()));
+                let result = Self::make_cancelled_result(
+                    last_response,
+                    tool_calls,
+                    input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    iteration,
+                );
+                self.maybe_compact(session_id).await;
+                return Ok(result);
             }
 
             // 2a. Build context
-            let (context, max_output) = self
+            let (mut context, max_output) = self
                 .context_manager
                 .build_context(session_id, agent_config, &self.session_store, &self.llm)
                 .await?;
+
+            // 2b. Normalize messages before token counting and LLM call.
+            // Must run before count_tokens so telemetry reflects actual payload.
+            let norm_report = crate::message_validation::normalize_for_api(&mut context);
+            if norm_report.tool_use_inputs_coerced > 0
+                || norm_report.orphaned_tool_results_removed > 0
+                || norm_report.consecutive_roles_merged > 0
+                || norm_report.empty_messages_removed > 0
+                || norm_report.role_incompatible_blocks_dropped > 0
+                || norm_report.synthetic_tool_results_injected > 0
+                || norm_report.duplicate_tool_uses_removed > 0
+                || norm_report.duplicate_tool_results_removed > 0
+            {
+                tracing::info!(
+                    coerced = norm_report.tool_use_inputs_coerced,
+                    orphans = norm_report.orphaned_tool_results_removed,
+                    merged = norm_report.consecutive_roles_merged,
+                    empty = norm_report.empty_messages_removed,
+                    role_drops = norm_report.role_incompatible_blocks_dropped,
+                    synthetics = norm_report.synthetic_tool_results_injected,
+                    dup_uses = norm_report.duplicate_tool_uses_removed,
+                    dup_results = norm_report.duplicate_tool_results_removed,
+                    "message normalization applied before LLM call"
+                );
+            }
+
             let prompt_tokens = match self.llm.count_tokens(&context).await {
                 Ok(tokens) => tokens,
                 Err(e) => {
@@ -260,7 +451,7 @@ impl AgentRuntime {
             input_tokens = input_tokens.saturating_add(prompt_tokens);
             total_tokens = total_tokens.saturating_add(prompt_tokens);
 
-            // 2b. Call LLM
+            // 2c. Call LLM
             let params = CompletionParams {
                 model: agent_config.model.clone(),
                 max_tokens: max_output,
@@ -268,7 +459,24 @@ impl AgentRuntime {
                 ..Default::default()
             };
 
-            let stream = self.llm.complete(&context, params, cancel.clone()).await?;
+            let stream = match self.llm.complete(&context, params, cancel.clone()).await {
+                Ok(stream) => stream,
+                Err(e) => {
+                    if cancel.is_cancelled() || matches!(e, LlmError::Cancelled) {
+                        let result = Self::make_cancelled_result(
+                            last_response,
+                            tool_calls,
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                            iteration + 1,
+                        );
+                        self.maybe_compact(session_id).await;
+                        return Ok(result);
+                    }
+                    return Err(e.into());
+                }
+            };
 
             // 2c. Collect streaming response
             let mut text_buf = String::new();
@@ -278,12 +486,54 @@ impl AgentRuntime {
 
             tokio::pin!(stream);
             while let Some(delta_result) = stream.next().await {
-                let delta = delta_result?;
+                let delta = match delta_result {
+                    Ok(delta) => delta,
+                    Err(e) => {
+                        if cancel.is_cancelled() || matches!(e, LlmError::Cancelled) {
+                            let partial_chars = text_buf
+                                .len()
+                                .saturating_add(thinking_buf.len())
+                                .saturating_add(
+                                    tool_uses
+                                        .iter()
+                                        .map(|(id, name, input_json)| {
+                                            id.len() + name.len() + input_json.len()
+                                        })
+                                        .sum::<usize>(),
+                                );
+                            let partial_tokens = (partial_chars / 4) as u32;
+                            output_tokens = output_tokens.saturating_add(partial_tokens);
+                            total_tokens = total_tokens.saturating_add(partial_tokens);
+                            let result = Self::make_cancelled_result(
+                                last_response,
+                                tool_calls,
+                                input_tokens,
+                                output_tokens,
+                                total_tokens,
+                                iteration + 1,
+                            );
+                            self.maybe_compact(session_id).await;
+                            return Ok(result);
+                        }
+                        return Err(e.into());
+                    }
+                };
                 if let Some(ref text) = delta.text {
                     text_buf.push_str(text);
+                    if let Some(ref tx) = event_tx {
+                        Self::emit_delta_event(tx, ChatEvent::Delta { text: text.clone() });
+                    }
                 }
                 if let Some(ref thinking) = delta.thinking {
                     thinking_buf.push_str(thinking);
+                    if let Some(ref tx) = event_tx {
+                        Self::emit_delta_event(
+                            tx,
+                            ChatEvent::Thinking {
+                                text: thinking.clone(),
+                            },
+                        );
+                    }
                 }
                 if let Some(ref tu) = delta.tool_use {
                     tool_uses.push((tu.id.clone(), tu.name.clone(), tu.input_json.clone()));
@@ -355,7 +605,76 @@ impl AgentRuntime {
                 'tool_loop: for (id, name, parsed_input) in &parsed_tool_uses {
                     let mut input = parsed_input.clone();
 
-                    if let Some(override_payload) = self
+                    // Emit ToolStart event.
+                    if let Some(ref tx) = event_tx {
+                        // Truncate input for streaming to avoid huge WS frames
+                        // and leaking sensitive args into transport logs.
+                        let stream_input = Self::truncate_stream_event_input(&input);
+                        Self::emit_event(
+                            tx,
+                            ChatEvent::ToolStart {
+                                tool_use_id: id.clone(),
+                                tool_name: name.clone(),
+                                input: stream_input,
+                            },
+                        )
+                        .await;
+                    }
+
+                    // --- Governance step 1: Risk classification (immutable deny-list) ---
+                    let risk = crate::risk_classifier::classify_tool_risk(name, &input, session_id);
+                    if risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+                        warn!(
+                            tool = %name,
+                            reason = %risk.reason,
+                            "tool call blocked by immutable deny-list"
+                        );
+                        self.record_tool_error(
+                            session_id,
+                            &mut tool_calls,
+                            ToolErrorDetails {
+                                tool_use_id: id,
+                                tool_name: name,
+                                input: &input,
+                                output: format!(
+                                    "Error: operation denied by security policy — {}",
+                                    risk.reason
+                                ),
+                            },
+                            &event_tx,
+                        )
+                        .await?;
+                        let _ = self
+                            .execute_hook(
+                                HookPoint::AfterToolCall,
+                                session_id,
+                                &agent_config.id,
+                                Some(name.clone()),
+                                serde_json::json!({
+                                    "tool_name": name,
+                                    "input": input.clone(),
+                                    "output": format!("Error: denied — {}", risk.reason),
+                                    "is_error": true,
+                                    "risk_level": format!("{:?}", risk.level),
+                                    "deny_reason": "immutable_deny_list",
+                                }),
+                            )
+                            .await;
+                        continue 'tool_loop;
+                    }
+
+                    // --- Governance step 2: Input validation (schema check) ---
+                    if !input.is_object() {
+                        warn!(
+                            tool = %name,
+                            input_type = %crate::message_validation::json_type_name(&input),
+                            "tool_use input is not an object — coercing to empty object"
+                        );
+                        input = serde_json::json!({});
+                    }
+
+                    // --- Governance step 3: Pre-tool hook (BeforeToolCall) ---
+                    let hook_result = self
                         .execute_hook(
                             HookPoint::BeforeToolCall,
                             session_id,
@@ -366,8 +685,26 @@ impl AgentRuntime {
                                 "input": input.clone(),
                             }),
                         )
-                        .await?
-                    {
+                        .await;
+
+                    // If hook aborted, emit ToolComplete before propagating error
+                    // (ToolStart was already emitted above).
+                    if let Err(ref e) = hook_result {
+                        if let Some(ref tx) = event_tx {
+                            Self::emit_event(
+                                tx,
+                                ChatEvent::ToolComplete {
+                                    tool_use_id: id.clone(),
+                                    tool_name: name.clone(),
+                                    output: format!("Error: hook aborted — {e}"),
+                                    is_error: true,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+
+                    if let Some(override_payload) = hook_result? {
                         // Abort from BeforeToolCall is fail-closed and bubbles
                         // out as a run error via execute_hook(). At this point
                         // the assistant tool_use message has already been
@@ -378,6 +715,59 @@ impl AgentRuntime {
                             .cloned()
                             .unwrap_or(override_payload);
                         input = new_input;
+
+                        // Re-validate object shape after hook override.
+                        if !input.is_object() {
+                            warn!(
+                                tool = %name,
+                                "hook set non-object input — coercing to empty object"
+                            );
+                            input = serde_json::json!({});
+                        }
+
+                        // Re-classify after hook modified input — hooks must not
+                        // bypass the immutable deny-list by transforming input.
+                        let post_hook_risk =
+                            crate::risk_classifier::classify_tool_risk(name, &input, session_id);
+                        if post_hook_risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+                            warn!(
+                                tool = %name,
+                                reason = %post_hook_risk.reason,
+                                "tool call blocked after hook modified input — deny-list match"
+                            );
+                            self.record_tool_error(
+                                session_id,
+                                &mut tool_calls,
+                                ToolErrorDetails {
+                                    tool_use_id: id,
+                                    tool_name: name,
+                                    input: &input,
+                                    output: format!(
+                                        "Error: operation denied by security policy — {}",
+                                        post_hook_risk.reason
+                                    ),
+                                },
+                                &event_tx,
+                            )
+                            .await?;
+                            let _ = self
+                                .execute_hook(
+                                    HookPoint::AfterToolCall,
+                                    session_id,
+                                    &agent_config.id,
+                                    Some(name.clone()),
+                                    serde_json::json!({
+                                        "tool_name": name,
+                                        "input": input.clone(),
+                                        "output": format!("Error: denied — {}", post_hook_risk.reason),
+                                        "is_error": true,
+                                        "risk_level": format!("{:?}", post_hook_risk.level),
+                                        "deny_reason": "immutable_deny_list",
+                                    }),
+                                )
+                                .await;
+                            continue 'tool_loop;
+                        }
                     }
 
                     if let Some(ref firewall) = self.firewall {
@@ -396,10 +786,13 @@ impl AgentRuntime {
                                 self.record_tool_error(
                                     session_id,
                                     &mut tool_calls,
-                                    id,
-                                    name,
-                                    &input,
-                                    format!("Error: {e}"),
+                                    ToolErrorDetails {
+                                        tool_use_id: id,
+                                        tool_name: name,
+                                        input: &input,
+                                        output: format!("Error: {e}"),
+                                    },
+                                    &event_tx,
                                 )
                                 .await?;
                                 // Intentionally ignore HookResult on error
@@ -417,6 +810,7 @@ impl AgentRuntime {
                                             "input": input.clone(),
                                             "output": format!("Error: {e}"),
                                             "is_error": true,
+                                            "deny_reason": "egress_firewall",
                                         }),
                                     )
                                     .await;
@@ -431,10 +825,16 @@ impl AgentRuntime {
                             self.record_tool_error(
                                 session_id,
                                 &mut tool_calls,
-                                id,
-                                name,
-                                &input,
-                                format!("Error: tool '{}' is denied by security policy", name),
+                                ToolErrorDetails {
+                                    tool_use_id: id,
+                                    tool_name: name,
+                                    input: &input,
+                                    output: format!(
+                                        "Error: tool '{}' is denied by security policy",
+                                        name
+                                    ),
+                                },
+                                &event_tx,
                             )
                             .await?;
                             // Intentionally ignore HookResult on error paths
@@ -450,6 +850,7 @@ impl AgentRuntime {
                                         "input": input.clone(),
                                         "output": format!("Error: tool '{}' is denied by security policy", name),
                                         "is_error": true,
+                                        "deny_reason": "policy_denied",
                                     }),
                                 )
                                 .await;
@@ -468,10 +869,16 @@ impl AgentRuntime {
                                 self.record_tool_error(
                                     session_id,
                                     &mut tool_calls,
-                                    id,
-                                    name,
-                                    &input,
-                                    format!("Error: tool '{}' denied: {}", name, reason),
+                                    ToolErrorDetails {
+                                        tool_use_id: id,
+                                        tool_name: name,
+                                        input: &input,
+                                        output: format!(
+                                            "Error: tool '{}' denied: {}",
+                                            name, reason
+                                        ),
+                                    },
+                                    &event_tx,
                                 )
                                 .await?;
                                 // Intentionally ignore HookResult on error
@@ -487,6 +894,7 @@ impl AgentRuntime {
                                             "input": input.clone(),
                                             "output": format!("Error: tool '{}' denied: {}", name, reason),
                                             "is_error": true,
+                                            "deny_reason": "approval_denied",
                                         }),
                                     )
                                     .await;
@@ -542,6 +950,20 @@ impl AgentRuntime {
                         output: output.clone(),
                         is_error,
                     });
+
+                    // Emit ToolComplete event.
+                    if let Some(ref tx) = event_tx {
+                        Self::emit_event(
+                            tx,
+                            ChatEvent::ToolComplete {
+                                tool_use_id: id.clone(),
+                                tool_name: name.clone(),
+                                output: Self::truncate_stream_event_output(&output),
+                                is_error,
+                            },
+                        )
+                        .await;
+                    }
 
                     let limit = self
                         .config
@@ -615,6 +1037,8 @@ impl AgentRuntime {
                             total_tokens,
                             loop_break: Some(reason),
                             loop_break_code: Some(reason_code),
+                            reached_max_iterations: false,
+                            cancelled: false,
                         });
                     }
                 }
@@ -671,6 +1095,8 @@ impl AgentRuntime {
                 iterations: iteration + 1,
                 loop_break: None,
                 loop_break_code: None,
+                reached_max_iterations: false,
+                cancelled: false,
             };
             self.maybe_compact(session_id).await;
             return Ok(result);
@@ -702,6 +1128,8 @@ impl AgentRuntime {
             iterations: self.config.max_tool_iterations,
             loop_break: None,
             loop_break_code: None,
+            reached_max_iterations: true,
+            cancelled: false,
         };
         self.maybe_compact(session_id).await;
         Ok(result)
@@ -740,6 +1168,61 @@ impl AgentRuntime {
         }
     }
 
+    fn emit_delta_event(tx: &tokio::sync::mpsc::Sender<ChatEvent>, event: ChatEvent) {
+        match tx.try_send(event) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                debug!("dropping streaming delta event due full channel buffer");
+            }
+            Err(TrySendError::Closed(_)) => {
+                debug!("dropping streaming delta event because receiver is closed");
+            }
+        }
+    }
+
+    async fn emit_event(tx: &tokio::sync::mpsc::Sender<ChatEvent>, event: ChatEvent) {
+        match tokio::time::timeout(Duration::from_millis(50), tx.send(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                debug!("dropping streaming event because receiver is closed");
+            }
+            Err(_) => {
+                debug!("dropping streaming event because send timed out");
+            }
+        }
+    }
+
+    fn make_cancelled_result(
+        last_response: Option<Message>,
+        tool_calls: Vec<ToolCallRecord>,
+        input_tokens: u32,
+        output_tokens: u32,
+        total_tokens: u32,
+        iterations: u32,
+    ) -> RunResult {
+        let response = last_response.unwrap_or_else(|| Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "Request cancelled.".into(),
+            }],
+            created_at: Utc::now(),
+            token_count: None,
+        });
+        RunResult {
+            response,
+            tool_calls,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            iterations,
+            loop_break: None,
+            loop_break_code: None,
+            reached_max_iterations: false,
+            cancelled: true,
+        }
+    }
+
     fn message_text_for_audit(message: &Message) -> String {
         message
             .content
@@ -766,17 +1249,36 @@ impl AgentRuntime {
         &self,
         session_id: &SessionId,
         tool_calls: &mut Vec<ToolCallRecord>,
-        tool_use_id: &str,
-        tool_name: &str,
-        input: &serde_json::Value,
-        output: String,
+        details: ToolErrorDetails<'_>,
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
     ) -> Result<(), AppError> {
+        let ToolErrorDetails {
+            tool_use_id,
+            tool_name,
+            input,
+            output,
+        } = details;
+
         tool_calls.push(ToolCallRecord {
             name: tool_name.to_owned(),
             input: input.clone(),
             output: output.clone(),
             is_error: true,
         });
+
+        // Emit ToolComplete event for error path.
+        if let Some(ref tx) = event_tx {
+            Self::emit_event(
+                tx,
+                ChatEvent::ToolComplete {
+                    tool_use_id: tool_use_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    output: Self::truncate_stream_event_output(&output),
+                    is_error: true,
+                },
+            )
+            .await;
+        }
 
         let tool_result_msg = Message {
             id: MessageId::new(),
@@ -933,6 +1435,131 @@ impl AgentRuntime {
         }
         let truncated: String = output.chars().take(max_chars).collect();
         format!("{truncated}\n\n[truncated from {char_count} chars to {max_chars}]")
+    }
+
+    const MAX_STREAM_EVENT_OUTPUT_CHARS: usize = 4_000;
+    const MAX_STREAM_EVENT_INPUT_STRING_CHARS: usize = 512;
+    const MAX_STREAM_EVENT_INPUT_ARRAY_ITEMS: usize = 16;
+    const MAX_STREAM_EVENT_INPUT_OBJECT_KEYS: usize = 32;
+    const MAX_STREAM_EVENT_INPUT_DEPTH: usize = 3;
+
+    fn truncate_stream_event_output(output: &str) -> String {
+        Self::truncate_tool_output(output, Self::MAX_STREAM_EVENT_OUTPUT_CHARS)
+    }
+
+    fn truncate_stream_event_input(input: &serde_json::Value) -> serde_json::Value {
+        if Self::serialized_char_count(input) <= Self::MAX_STREAM_EVENT_OUTPUT_CHARS {
+            return input.clone();
+        }
+
+        // Prefer preserving structure (top-level keys, scalar fields) while
+        // reducing deep/large values to bounded previews.
+        let mut summarized = Self::summarize_stream_event_input(input, 0);
+        match &mut summarized {
+            serde_json::Value::Object(map) => {
+                map.insert("_truncated".to_string(), serde_json::Value::Bool(true));
+            }
+            _ => {
+                summarized = serde_json::json!({
+                    "_truncated": true,
+                    "_value": summarized,
+                });
+            }
+        }
+        if Self::serialized_char_count(&summarized) <= Self::MAX_STREAM_EVENT_OUTPUT_CHARS {
+            return summarized;
+        }
+
+        // Fallback when even structured summary is too large.
+        let serialized = match serde_json::to_string(input) {
+            Ok(s) => s,
+            Err(_) => return summarized,
+        };
+        let preview: String = serialized
+            .chars()
+            .take(Self::MAX_STREAM_EVENT_OUTPUT_CHARS)
+            .collect();
+        serde_json::json!({
+            "_truncated": true,
+            "_preview": preview,
+            "_original_type": Self::json_type_name_for_stream(input),
+        })
+    }
+
+    fn serialized_char_count(value: &serde_json::Value) -> usize {
+        serde_json::to_string(value)
+            .map(|s| s.chars().count())
+            .unwrap_or(usize::MAX)
+    }
+
+    fn summarize_stream_event_input(value: &serde_json::Value, depth: usize) -> serde_json::Value {
+        if depth >= Self::MAX_STREAM_EVENT_INPUT_DEPTH {
+            return serde_json::Value::String("[truncated depth]".to_string());
+        }
+
+        match value {
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+                value.clone()
+            }
+            serde_json::Value::String(s) => {
+                let char_count = s.chars().count();
+                if char_count <= Self::MAX_STREAM_EVENT_INPUT_STRING_CHARS {
+                    serde_json::Value::String(s.clone())
+                } else {
+                    let preview: String = s
+                        .chars()
+                        .take(Self::MAX_STREAM_EVENT_INPUT_STRING_CHARS)
+                        .collect();
+                    serde_json::Value::String(format!(
+                        "{preview}...[truncated from {char_count} chars]"
+                    ))
+                }
+            }
+            serde_json::Value::Array(items) => {
+                let mut summarized: Vec<serde_json::Value> = items
+                    .iter()
+                    .take(Self::MAX_STREAM_EVENT_INPUT_ARRAY_ITEMS)
+                    .map(|item| Self::summarize_stream_event_input(item, depth + 1))
+                    .collect();
+                if items.len() > Self::MAX_STREAM_EVENT_INPUT_ARRAY_ITEMS {
+                    let remaining = items.len() - Self::MAX_STREAM_EVENT_INPUT_ARRAY_ITEMS;
+                    summarized.push(serde_json::Value::String(format!(
+                        "[{remaining} items truncated]"
+                    )));
+                }
+                serde_json::Value::Array(summarized)
+            }
+            serde_json::Value::Object(map) => {
+                let mut summarized = serde_json::Map::new();
+                for (idx, (key, item)) in map.iter().enumerate() {
+                    if idx >= Self::MAX_STREAM_EVENT_INPUT_OBJECT_KEYS {
+                        break;
+                    }
+                    summarized.insert(
+                        key.clone(),
+                        Self::summarize_stream_event_input(item, depth + 1),
+                    );
+                }
+                if map.len() > Self::MAX_STREAM_EVENT_INPUT_OBJECT_KEYS {
+                    summarized.insert(
+                        "_truncated_keys".to_string(),
+                        serde_json::json!(map.len() - Self::MAX_STREAM_EVENT_INPUT_OBJECT_KEYS),
+                    );
+                }
+                serde_json::Value::Object(summarized)
+            }
+        }
+    }
+
+    fn json_type_name_for_stream(value: &serde_json::Value) -> &'static str {
+        match value {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
     }
 }
 
@@ -1548,12 +2175,16 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        // Cancellation now returns Ok with a cancelled result (not Err)
+        // so streaming path can emit Done { stop_reason: Cancelled }.
         assert!(
-            err.contains("cancelled"),
-            "expected cancellation error: {err}"
+            result.is_ok(),
+            "cancelled run should return Ok, got: {:?}",
+            result.err()
         );
+        let run_result = result.unwrap();
+        // The response should be a fallback message since no LLM turn completed.
+        assert_eq!(run_result.iterations, 0);
     }
 
     #[tokio::test]
@@ -1796,8 +2427,11 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
 
+        // Use a non-denied bash command (ls is Sensitive, not Denied).
+        // The deny-list blocks rm -rf / before approval; this tests the
+        // approval flow for commands that pass the deny-list.
         let responses = vec![
-            tool_use_response("t1", "bash.exec", r#"{"command":"rm -rf /"}"#),
+            tool_use_response("t1", "bash.exec", r#"{"command":"ls -la /tmp"}"#),
             text_response("ok"),
         ];
 
@@ -1901,6 +2535,36 @@ mod tests {
             Ok(HookResult::Override(
                 serde_json::json!({"input": {"text": "rewritten"}}),
             ))
+        }
+    }
+
+    /// Hook that returns a non-object input override (should be coerced to {}).
+    struct NonObjectInputHook;
+    #[async_trait::async_trait]
+    impl HookHandler for NonObjectInputHook {
+        async fn execute(
+            &self,
+            _ctx: &mut encmind_core::hooks::HookContext,
+        ) -> Result<HookResult, PluginError> {
+            // Return a string instead of an object — runtime should coerce to {}.
+            Ok(HookResult::Override(
+                serde_json::json!({"input": "not an object"}),
+            ))
+        }
+    }
+
+    /// Hook that captures AfterToolCall payloads for test assertions.
+    struct CaptureAfterToolHook {
+        payloads: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    }
+    #[async_trait::async_trait]
+    impl HookHandler for CaptureAfterToolHook {
+        async fn execute(
+            &self,
+            ctx: &mut encmind_core::hooks::HookContext,
+        ) -> Result<HookResult, PluginError> {
+            self.payloads.lock().unwrap().push(ctx.payload.clone());
+            Ok(HookResult::Continue)
         }
     }
 
@@ -2164,6 +2828,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_hook_abort_emits_tool_complete_before_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+        let responses = vec![
+            tool_use_response("t1", "echo", r#"{"text":"hello"}"#),
+            text_response("ok"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::BeforeToolCall,
+                100,
+                "test",
+                Arc::new(AbortBeforeToolHook),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("trigger"),
+            default_agent(),
+            CancellationToken::new(),
+        );
+
+        let mut started_tool_use_id: Option<String> = None;
+        let mut completed_tool_use_id: Option<String> = None;
+        let mut saw_error_event = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart {
+                    tool_use_id,
+                    tool_name,
+                    ..
+                } if tool_name == "echo" => started_tool_use_id = Some(tool_use_id),
+                ChatEvent::ToolComplete {
+                    tool_use_id,
+                    tool_name,
+                    is_error,
+                    ..
+                } if tool_name == "echo" && is_error => completed_tool_use_id = Some(tool_use_id),
+                ChatEvent::Error { .. } => {
+                    saw_error_event = true;
+                    break;
+                }
+                ChatEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("BeforeToolCall"));
+        assert!(saw_error_event, "expected final Error event");
+        assert_eq!(
+            completed_tool_use_id, started_tool_use_id,
+            "ToolComplete must correspond to the started tool call"
+        );
+    }
+
+    #[tokio::test]
     async fn before_tool_call_hook_can_override_input() {
         let mut registry = ToolRegistry::new();
         registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
@@ -2197,6 +2925,51 @@ mod tests {
             .unwrap();
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].input["text"], "rewritten");
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_hook_non_object_input_coerced() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+        let responses = vec![
+            tool_use_response("t1", "echo", r#"{"text":"hello"}"#),
+            text_response("ok"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::BeforeToolCall,
+                100,
+                "test",
+                Arc::new(NonObjectInputHook),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("trigger"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // The hook returned a string input which should be coerced to {}.
+        // TestEchoSkill echoes input.text — with {} input, text is absent
+        // so output should be empty or "null".
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(!result.tool_calls[0].is_error);
+        // Input should have been coerced to empty object.
+        assert!(
+            result.tool_calls[0].input.is_object(),
+            "non-object input should be coerced to object"
+        );
     }
 
     #[tokio::test]
@@ -2537,6 +3310,54 @@ mod tests {
         assert!(result.starts_with(&"x".repeat(50)));
     }
 
+    #[test]
+    fn truncate_stream_event_input_is_utf8_safe_and_truncates() {
+        let input = serde_json::json!({
+            "text": "你好🚀".repeat(5_000),
+        });
+
+        let stream_input = AgentRuntime::truncate_stream_event_input(&input);
+        let obj = stream_input
+            .as_object()
+            .expect("truncated payload must be object");
+        assert_eq!(obj.get("_truncated").and_then(|v| v.as_bool()), Some(true));
+        let preview = obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("_preview").and_then(|v| v.as_str()))
+            .expect("structured text preview or fallback _preview must be string");
+        assert!(
+            preview.chars().count() <= AgentRuntime::MAX_STREAM_EVENT_OUTPUT_CHARS,
+            "preview must be char-truncated to stream limit"
+        );
+    }
+
+    #[test]
+    fn truncate_stream_event_input_preserves_top_level_object_shape() {
+        let input = serde_json::json!({
+            "query": "x".repeat(10_000),
+            "limit": 5,
+            "nested": {
+                "topic": "alerts"
+            }
+        });
+
+        let stream_input = AgentRuntime::truncate_stream_event_input(&input);
+        let obj = stream_input
+            .as_object()
+            .expect("truncated payload must remain an object");
+        assert_eq!(obj.get("_truncated").and_then(|v| v.as_bool()), Some(true));
+        assert!(
+            obj.contains_key("query"),
+            "top-level field should be preserved"
+        );
+        assert_eq!(obj.get("limit"), Some(&serde_json::json!(5)));
+        assert!(
+            obj.contains_key("nested"),
+            "nested field should be preserved"
+        );
+    }
+
     #[tokio::test]
     async fn tool_output_truncated_in_message_but_full_in_record() {
         use crate::tool_registry::test_helpers::TestEchoSkill;
@@ -2744,5 +3565,150 @@ mod tests {
             assistant_tool_use.is_object(),
             "persisted tool_use.input should be object for Anthropic compatibility"
         );
+    }
+
+    #[tokio::test]
+    async fn deny_list_block_emits_deny_reason_in_hook_payload() {
+        let mut registry = ToolRegistry::new();
+        registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
+
+        // bash.exec with rm -rf / triggers the immutable deny-list.
+        let responses = vec![
+            tool_use_response("t1", "bash.exec", r#"{"command":"rm -rf /"}"#),
+            text_response("ok"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::AfterToolCall,
+                100,
+                "capture",
+                Arc::new(CaptureAfterToolHook {
+                    payloads: payloads.clone(),
+                }),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("delete everything"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // Tool should have been denied.
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].is_error);
+
+        // AfterToolCall hook should have received a payload with deny_reason.
+        let captured = payloads.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected exactly 1 AfterToolCall hook call"
+        );
+        let payload = &captured[0];
+        assert_eq!(payload["is_error"], true);
+        assert!(
+            payload.get("deny_reason").is_some(),
+            "AfterToolCall payload on deny path must include deny_reason, got: {payload}"
+        );
+        assert_eq!(payload["deny_reason"], "immutable_deny_list");
+    }
+
+    #[tokio::test]
+    async fn streaming_done_reports_max_iterations() {
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(vec![], 128_000));
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(ToolRegistry::new()),
+            RuntimeConfig {
+                max_tool_iterations: 0,
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("hello"),
+            default_agent(),
+            CancellationToken::new(),
+        );
+
+        let mut stop_reason = None;
+        while let Some(event) = rx.recv().await {
+            if let ChatEvent::Done {
+                stop_reason: sr, ..
+            } = event
+            {
+                stop_reason = Some(sr);
+                break;
+            }
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.reached_max_iterations);
+        match stop_reason {
+            Some(StopReason::MaxIterations) => {}
+            other => panic!("expected max_iterations stop reason, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_cancel_emits_done_cancelled() {
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(vec![], 128_000));
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(ToolRegistry::new()),
+            RuntimeConfig {
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("hello"),
+            default_agent(),
+            cancel,
+        );
+
+        let mut saw_cancelled = false;
+        while let Some(event) = rx.recv().await {
+            if let ChatEvent::Done {
+                stop_reason: StopReason::Cancelled,
+                ..
+            } = event
+            {
+                saw_cancelled = true;
+                break;
+            }
+        }
+
+        assert!(saw_cancelled, "expected streaming Done(cancelled) event");
+        let result = handle.await.unwrap().unwrap();
+        assert!(
+            result.cancelled,
+            "cancelled run should return cancelled result"
+        );
+        assert_eq!(result.iterations, 0);
     }
 }

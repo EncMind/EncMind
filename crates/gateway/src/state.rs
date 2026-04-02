@@ -138,6 +138,8 @@ pub struct AppState {
     pub pairing_sessions: Arc<Mutex<HashMap<String, PairingSession>>>,
     pub admin_bootstrap_lock: Arc<AsyncMutex<()>>,
     pub active_runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    /// Per-session query guard that serializes concurrent chat.send calls.
+    pub query_guard: Arc<crate::query_guard::QueryGuardRegistry>,
     pub db_pool: Pool<SqliteConnectionManager>,
     pub memory_store: Option<Arc<MemoryStoreImpl>>,
     pub cron_store: Option<Arc<dyn CronStore>>,
@@ -298,6 +300,9 @@ mod tests {
         let pairing_sessions = Arc::new(Mutex::new(HashMap::new()));
         let admin_bootstrap_lock = Arc::new(AsyncMutex::new(()));
         let active_runs = Arc::new(Mutex::new(HashMap::new()));
+        let query_guard = Arc::new(crate::query_guard::QueryGuardRegistry::new(
+            config.gateway.max_queued_per_session,
+        ));
 
         let _state = AppState {
             session_store,
@@ -321,6 +326,7 @@ mod tests {
             pairing_sessions,
             admin_bootstrap_lock,
             active_runs,
+            query_guard,
             db_pool: pool,
             memory_store: None,
             cron_store: None,

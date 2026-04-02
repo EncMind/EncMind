@@ -16,6 +16,7 @@ pub mod plugin_api;
 pub mod plugin_manager;
 pub mod plugins;
 pub mod protocol;
+pub mod query_guard;
 pub mod rate_limiter;
 pub mod routes;
 pub mod server;

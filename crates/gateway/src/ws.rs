@@ -6,11 +6,15 @@ use encmind_core::types::DevicePermissions;
 use futures::stream::SplitSink;
 use futures::{FutureExt, SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OwnedSemaphorePermit};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock};
+use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
 use crate::dispatch::dispatch_method;
 use crate::idempotency::IdempotencyCache;
+
+/// Shared WebSocket sender for streaming events.
+pub type WsSender = Arc<Mutex<SplitSink<WebSocket, Message>>>;
 use crate::node::check_permission;
 use crate::plugin_manager::PluginManager;
 use crate::protocol::*;
@@ -34,10 +38,17 @@ pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> 
 async fn handle_connection(socket: WebSocket, state: AppState, _permit: OwnedSemaphorePermit) {
     let (sender, mut receiver) = socket.split();
     let sender = Arc::new(Mutex::new(sender));
-    let mut auth = ConnectionAuth::default();
+    let auth = Arc::new(RwLock::new(ConnectionAuth::default()));
+    let mut in_flight = JoinSet::new();
 
     // Connection is open — process messages until close
     loop {
+        while let Some(join_result) = in_flight.try_join_next() {
+            if let Err(err) = join_result {
+                warn!(error = %err, "ws message task failed");
+            }
+        }
+
         let next = receiver.next().await;
         let msg = match next {
             Some(Ok(msg)) => msg,
@@ -53,30 +64,64 @@ async fn handle_connection(socket: WebSocket, state: AppState, _permit: OwnedSem
 
         match msg {
             Message::Text(text) => {
-                let response = process_text_message_with_recovery(&state, &mut auth, &text).await;
-                if let Some(resp) = response {
-                    match serde_json::to_string(&resp) {
-                        Ok(json) => {
-                            let mut s = sender.lock().await;
-                            if let Err(err) = s.send(Message::Text(json.into())).await {
-                                warn!(
-                                    error = %err,
-                                    "ws failed to send response frame; closing connection"
-                                );
-                                break;
-                            }
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "ws response serialization failed; dropping response");
+                let text = text.to_string();
+                let is_connect = matches!(
+                    serde_json::from_str::<ClientMessage>(&text),
+                    Ok(ClientMessage::Connect { .. })
+                );
+
+                // Process connect inline to preserve request ordering and avoid
+                // races where immediate follow-up requests run before auth is set.
+                if is_connect {
+                    let response = process_text_message_with_recovery_shared(
+                        &state,
+                        auth.clone(),
+                        &text,
+                        Some(sender.clone()),
+                    )
+                    .await;
+                    if let Some(resp) = response {
+                        if let Err(err) = send_ws_response_frame(&sender, &resp).await {
+                            warn!(error = %err, "ws failed to send response frame; closing connection");
+                            break;
                         }
                     }
+                    continue;
                 }
+
+                let state_clone = state.clone();
+                let auth_clone = auth.clone();
+                let sender_clone = sender.clone();
+
+                in_flight.spawn(async move {
+                    let response = process_text_message_with_recovery_shared(
+                        &state_clone,
+                        auth_clone,
+                        &text,
+                        Some(sender_clone.clone()),
+                    )
+                    .await;
+                    if let Some(resp) = response {
+                        if let Err(err) = send_ws_response_frame(&sender_clone, &resp).await {
+                            warn!(error = %err, "ws failed to send response frame");
+                        }
+                    }
+                });
             }
             Message::Close(frame) => {
                 debug!(?frame, "ws close frame received; closing connection");
                 break;
             }
             Message::Ping(_) | Message::Pong(_) | Message::Binary(_) => {}
+        }
+    }
+
+    in_flight.abort_all();
+    while let Some(join_result) = in_flight.join_next().await {
+        if let Err(err) = join_result {
+            if !err.is_cancelled() {
+                warn!(error = %err, "ws message task failed during shutdown");
+            }
         }
     }
 }
@@ -86,9 +131,167 @@ struct ConnectionAuth {
     session: Option<AuthSession>,
 }
 
+#[derive(Clone)]
 struct AuthSession {
     device_id: String,
     permissions: DevicePermissions,
+}
+
+async fn send_ws_response_frame(sender: &WsSender, response: &ServerMessage) -> Result<(), String> {
+    let json = serde_json::to_string(response).map_err(|e| e.to_string())?;
+    let mut s = sender.lock().await;
+    s.send(Message::Text(json.into()))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn process_text_message_with_recovery_shared(
+    state: &AppState,
+    auth: Arc<RwLock<ConnectionAuth>>,
+    text: &str,
+    ws_sender: Option<WsSender>,
+) -> Option<ServerMessage> {
+    let panic_response_id = extract_req_id_from_raw_text(text);
+    match std::panic::AssertUnwindSafe(process_text_message_shared(
+        state,
+        auth.clone(),
+        text,
+        ws_sender,
+    ))
+    .catch_unwind()
+    .await
+    {
+        Ok(response) => response,
+        Err(panic_payload) => {
+            let panic_msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "<non-string panic payload>".to_string()
+            };
+            let mut guard = auth.write().await;
+            *guard = ConnectionAuth::default();
+            warn!(
+                panic = %panic_msg,
+                "ws process_text_message panicked; auth reset and connection kept alive"
+            );
+            Some(ServerMessage::Error {
+                id: panic_response_id,
+                error: ErrorPayload::new(
+                    ERR_INTERNAL,
+                    "internal server error while processing message",
+                ),
+            })
+        }
+    }
+}
+
+async fn process_text_message_shared(
+    state: &AppState,
+    auth: Arc<RwLock<ConnectionAuth>>,
+    text: &str,
+    ws_sender: Option<WsSender>,
+) -> Option<ServerMessage> {
+    let client_msg: ClientMessage = match serde_json::from_str(text) {
+        Ok(msg) => msg,
+        Err(e) => {
+            return Some(ServerMessage::Error {
+                id: None,
+                error: ErrorPayload::new(ERR_INTERNAL, format!("invalid message: {e}")),
+            });
+        }
+    };
+
+    match client_msg {
+        ClientMessage::Connect { auth: payload } => {
+            match authenticate_connection(state, &payload).await {
+                Ok((device_id, permissions)) => {
+                    let mut guard = auth.write().await;
+                    guard.session = Some(AuthSession {
+                        device_id: device_id.clone(),
+                        permissions,
+                    });
+                    Some(ServerMessage::Connected {
+                        session_id: format!("ws-{device_id}"),
+                    })
+                }
+                Err(message) => Some(ServerMessage::Error {
+                    id: None,
+                    error: ErrorPayload::new(ERR_AUTH_FAILED, message),
+                }),
+            }
+        }
+        ClientMessage::Req { id, method, params } => {
+            let session = {
+                let guard = auth.read().await;
+                match guard.session.as_ref() {
+                    Some(session) => session.clone(),
+                    None => {
+                        return Some(ServerMessage::Error {
+                            id: Some(id),
+                            error: ErrorPayload::new(
+                                ERR_AUTH_FAILED,
+                                "authentication required: send connect first",
+                            ),
+                        });
+                    }
+                }
+            };
+
+            #[cfg(test)]
+            if method == "__panic_test__" {
+                panic!("ws test panic");
+            }
+
+            let plugin_manager = { state.plugin_manager.read().await.clone() };
+            if !is_method_allowed_with_plugin(
+                &method,
+                &params,
+                &session.permissions,
+                plugin_manager.as_deref(),
+            ) {
+                return Some(ServerMessage::Error {
+                    id: Some(id),
+                    error: ErrorPayload::new(
+                        ERR_AUTH_FAILED,
+                        format!("permission denied for method: {method}"),
+                    ),
+                });
+            }
+
+            let scoped_id = format!("{}:{id}", session.device_id);
+
+            // Check idempotency cache
+            {
+                let cache = match state.idempotency.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => recover_poisoned_idempotency_cache(poisoned, "read"),
+                };
+                if let Some(cached) = cache.get(&scoped_id) {
+                    return Some(ServerMessage::Res {
+                        id: id.clone(),
+                        result: cached.clone(),
+                    });
+                }
+            }
+
+            let response = dispatch_method(state, &method, params, &id, ws_sender.clone()).await;
+
+            // Cache successful results
+            if let ServerMessage::Res { ref result, .. } = response {
+                let mut cache = match state.idempotency.lock() {
+                    Ok(cache) => cache,
+                    Err(poisoned) => recover_poisoned_idempotency_cache(poisoned, "write"),
+                };
+                cache.set(scoped_id, result.clone());
+                cache.cleanup();
+            }
+
+            Some(response)
+        }
+        ClientMessage::Ping { seq } => Some(ServerMessage::Pong { seq }),
+    }
 }
 
 fn extract_req_id_from_raw_text(text: &str) -> Option<String> {
@@ -113,13 +316,15 @@ fn recover_poisoned_idempotency_cache<'a>(
     cache
 }
 
+#[cfg(test)]
 async fn process_text_message_with_recovery(
     state: &AppState,
     auth: &mut ConnectionAuth,
     text: &str,
+    ws_sender: Option<WsSender>,
 ) -> Option<ServerMessage> {
     let panic_response_id = extract_req_id_from_raw_text(text);
-    match std::panic::AssertUnwindSafe(process_text_message(state, auth, text))
+    match std::panic::AssertUnwindSafe(process_text_message(state, auth, text, ws_sender))
         .catch_unwind()
         .await
     {
@@ -149,10 +354,12 @@ async fn process_text_message_with_recovery(
     }
 }
 
+#[cfg(test)]
 async fn process_text_message(
     state: &AppState,
     auth: &mut ConnectionAuth,
     text: &str,
+    ws_sender: Option<WsSender>,
 ) -> Option<ServerMessage> {
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(msg) => msg,
@@ -233,7 +440,7 @@ async fn process_text_message(
                 }
             }
 
-            let response = dispatch_method(state, &method, params, &id).await;
+            let response = dispatch_method(state, &method, params, &id, ws_sender.clone()).await;
 
             // Cache successful results
             if let ServerMessage::Res { ref result, .. } = response {
@@ -444,7 +651,9 @@ mod tests {
         .await;
         let mut auth = ConnectionAuth::default();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Connected { session_id } => {
                 assert!(session_id.starts_with("ws-"));
@@ -459,7 +668,9 @@ mod tests {
         let mut auth = ConnectionAuth::default();
         let msg = serde_json::to_string(&ClientMessage::Ping { seq: 7 }).unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Pong { seq } => assert_eq!(seq, 7),
             _ => panic!("Expected Pong"),
@@ -479,7 +690,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -491,7 +702,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "r1"),
             _ => panic!("Expected Res"),
@@ -502,7 +715,7 @@ mod tests {
     async fn process_invalid_json() {
         let state = make_test_state();
         let mut auth = ConnectionAuth::default();
-        let result = process_text_message(&state, &mut auth, "not json")
+        let result = process_text_message(&state, &mut auth, "not json", None)
             .await
             .unwrap();
         match result {
@@ -526,7 +739,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -539,9 +752,13 @@ mod tests {
         .unwrap();
 
         // First call
-        let r1 = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let r1 = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         // Second call with same ID should return cached
-        let r2 = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let r2 = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
 
         match (&r1, &r2) {
             (ServerMessage::Res { result: res1, .. }, ServerMessage::Res { result: res2, .. }) => {
@@ -564,7 +781,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -578,7 +795,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ERR_LOCKDOWN);
@@ -598,7 +817,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ERR_AUTH_FAILED);
@@ -621,7 +842,7 @@ mod tests {
         .await;
         let mut auth = ConnectionAuth::default();
 
-        let connected = process_text_message_with_recovery(&state, &mut auth, &connect)
+        let connected = process_text_message_with_recovery(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -634,7 +855,7 @@ mod tests {
         })
         .unwrap();
 
-        let panic_result = process_text_message_with_recovery(&state, &mut auth, &panic_req)
+        let panic_result = process_text_message_with_recovery(&state, &mut auth, &panic_req, None)
             .await
             .unwrap();
         match panic_result {
@@ -655,7 +876,7 @@ mod tests {
             params: serde_json::json!({}),
         })
         .unwrap();
-        let follow_up = process_text_message_with_recovery(&state, &mut auth, &follow_up_req)
+        let follow_up = process_text_message_with_recovery(&state, &mut auth, &follow_up_req, None)
             .await
             .unwrap();
         match follow_up {
@@ -742,7 +963,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -755,7 +976,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("tl-10-5a".into()));
@@ -782,7 +1005,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -795,7 +1018,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "tl-10-5b");
@@ -821,7 +1046,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -833,7 +1058,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "s-perm-1"),
             other => panic!("expected Res for chat device, got {other:?}"),
@@ -854,7 +1081,7 @@ mod tests {
         )
         .await;
         let mut auth = ConnectionAuth::default();
-        let connected = process_text_message(&state, &mut auth, &connect)
+        let connected = process_text_message(&state, &mut auth, &connect, None)
             .await
             .unwrap();
         assert!(matches!(connected, ServerMessage::Connected { .. }));
@@ -866,7 +1093,9 @@ mod tests {
         })
         .unwrap();
 
-        let result = process_text_message(&state, &mut auth, &msg).await.unwrap();
+        let result = process_text_message(&state, &mut auth, &msg, None)
+            .await
+            .unwrap();
         match result {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ERR_AUTH_FAILED);

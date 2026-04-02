@@ -97,7 +97,8 @@ async fn rpc_handler(
     }
 
     let req_id = ulid::Ulid::new().to_string();
-    let resp = crate::dispatch::dispatch_method(&state, &body.method, body.params, &req_id).await;
+    let resp =
+        crate::dispatch::dispatch_method(&state, &body.method, body.params, &req_id, None).await;
 
     // Convert ServerMessage to JSON.
     let json = serde_json::to_value(&resp)

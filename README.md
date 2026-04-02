@@ -254,7 +254,15 @@ channels:
       - sender_id: user@example.com
         auto_reply: true
   access_policy:
-    default_action: allow
+    default_action: reject   # reject all unless explicitly allowed
+    allowlist:
+      # Slack: sender_id format is "channel_id:user_id".
+      # Find yours in the server log: look for "sender=CXXXXXXXX:UXXXXXXXX"
+      - sender_id: "CXXXXXXXX:UXXXXXXXX"
+        channel: slack
+      # Gmail: sender_id is the email address
+      # - sender_id: user@example.com
+      #   channel: gmail
 
 skills:
   enabled: []

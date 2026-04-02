@@ -67,6 +67,9 @@ fn make_state() -> AppState {
     let pairing_sessions = Arc::new(Mutex::new(HashMap::<String, PairingSession>::new()));
     let admin_bootstrap_lock = Arc::new(AsyncMutex::new(()));
     let active_runs = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
+    let query_guard = Arc::new(encmind_gateway::query_guard::QueryGuardRegistry::new(
+        config.gateway.max_queued_per_session,
+    ));
 
     AppState {
         session_store,
@@ -90,6 +93,7 @@ fn make_state() -> AppState {
         pairing_sessions,
         admin_bootstrap_lock,
         active_runs,
+        query_guard,
         timeline_store: Some(Arc::new(
             encmind_storage::timeline_store::SqliteTimelineStore::new(pool.clone()),
         )),
@@ -186,6 +190,7 @@ async fn ws_connect_and_chat_dispatch() {
         "chat.send",
         serde_json::json!({"message": "hello"}),
         "req-1",
+        None,
     )
     .await;
 
@@ -210,6 +215,7 @@ async fn lockdown_blocks_ws() {
         "chat.send",
         serde_json::json!({}),
         "locked-req",
+        None,
     )
     .await;
 
@@ -227,6 +233,7 @@ async fn lockdown_blocks_ws() {
         "security.lockdown",
         serde_json::json!({"active": false}),
         "unlock-req",
+        None,
     )
     .await;
 
@@ -312,6 +319,7 @@ async fn lockdown_full_flow() {
         "security.lockdown",
         serde_json::json!({"active": true, "reason": "maintenance"}),
         "lock-1",
+        None,
     )
     .await;
     match &result {
@@ -329,6 +337,7 @@ async fn lockdown_full_flow() {
         "chat.send",
         serde_json::json!({}),
         "chat-1",
+        None,
     )
     .await;
     match &result {
@@ -344,6 +353,7 @@ async fn lockdown_full_flow() {
         "security.audit",
         serde_json::json!({}),
         "audit-1",
+        None,
     )
     .await;
     match &result {
@@ -363,6 +373,7 @@ async fn lockdown_full_flow() {
         "config.get",
         serde_json::json!({}),
         "cfg-1",
+        None,
     )
     .await;
     match &result {
@@ -382,6 +393,7 @@ async fn lockdown_full_flow() {
         "models.list",
         serde_json::json!({}),
         "models-1",
+        None,
     )
     .await;
     match &result {
@@ -401,6 +413,7 @@ async fn lockdown_full_flow() {
         "security.lockdown",
         serde_json::json!({"active": false}),
         "unlock-1",
+        None,
     )
     .await;
     match &result {
@@ -418,6 +431,7 @@ async fn lockdown_full_flow() {
         "chat.send",
         serde_json::json!({"message": "hello"}),
         "chat-2",
+        None,
     )
     .await;
     match &result {
@@ -437,6 +451,7 @@ async fn lockdown_full_flow() {
         "security.audit",
         serde_json::json!({"category": "security.lockdown"}),
         "audit-2",
+        None,
     )
     .await;
     match &result {

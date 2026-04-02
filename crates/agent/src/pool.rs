@@ -9,7 +9,7 @@ use encmind_core::config::AgentPoolConfig;
 use encmind_core::error::AppError;
 use encmind_core::types::*;
 
-use crate::runtime::{AgentRuntime, RunResult};
+use crate::runtime::{AgentRuntime, ChatEvent, RunResult};
 
 /// Concurrency-limited pool for agent executions.
 ///
@@ -66,6 +66,65 @@ impl AgentPool {
                 )))
             }
         }
+    }
+
+    /// Execute an agent run with streaming events, concurrency limiting, and timeout.
+    ///
+    /// Returns a receiver for streaming events and a join handle for the final result.
+    /// The semaphore permit is held until the run completes.
+    pub async fn execute_streaming(
+        &self,
+        runtime: &AgentRuntime,
+        session_id: SessionId,
+        user_message: Message,
+        agent_config: AgentConfig,
+        cancel: CancellationToken,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Receiver<ChatEvent>,
+            tokio::task::JoinHandle<Result<RunResult, AppError>>,
+        ),
+        AppError,
+    > {
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::Internal("agent pool semaphore closed".into()))?;
+
+        let timeout = self.timeout;
+        let timeout_cancel = cancel.clone();
+        let (rx, inner_handle) =
+            runtime.run_streaming(session_id, user_message, agent_config, cancel);
+
+        // Wrap the inner handle with timeout and permit release.
+        let handle = tokio::spawn(async move {
+            let mut inner_handle = inner_handle;
+            let result = tokio::select! {
+                join = &mut inner_handle => {
+                    match join {
+                        Ok(inner) => inner,
+                        Err(join_err) => Err(AppError::Internal(format!(
+                            "agent task panicked: {join_err}"
+                        ))),
+                    }
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    timeout_cancel.cancel();
+                    inner_handle.abort();
+                    let _ = inner_handle.await;
+                    Err(AppError::Internal(format!(
+                        "agent execution timed out after {} seconds",
+                        timeout.as_secs()
+                    )))
+                }
+            };
+            drop(permit);
+            result
+        });
+
+        Ok((rx, handle))
     }
 
     /// Number of currently available permits.
@@ -257,6 +316,82 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("timed out"), "expected timeout error: {err}");
+    }
+
+    #[tokio::test]
+    async fn streaming_timeout_returns_error_and_releases_permit() {
+        use async_trait::async_trait;
+        use encmind_core::error::LlmError;
+        use encmind_core::traits::{CompletionDelta, CompletionParams, ModelInfo};
+        use std::pin::Pin;
+        use tokio_stream::Stream;
+
+        struct HangingLlmBackend;
+
+        #[async_trait]
+        impl LlmBackend for HangingLlmBackend {
+            async fn complete(
+                &self,
+                _messages: &[Message],
+                _params: CompletionParams,
+                _cancel: CancellationToken,
+            ) -> Result<
+                Pin<Box<dyn Stream<Item = Result<CompletionDelta, LlmError>> + Send>>,
+                LlmError,
+            > {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                unreachable!()
+            }
+
+            async fn count_tokens(&self, _messages: &[Message]) -> Result<u32, LlmError> {
+                Ok(10)
+            }
+
+            fn model_info(&self) -> ModelInfo {
+                ModelInfo {
+                    id: "hang".into(),
+                    name: "Hanging".into(),
+                    context_window: 128_000,
+                    provider: "test".into(),
+                    supports_tools: true,
+                    supports_streaming: true,
+                    supports_thinking: false,
+                }
+            }
+        }
+
+        let pool = AgentPool::new(&AgentPoolConfig {
+            max_concurrent_agents: 1,
+            per_session_timeout_secs: 1,
+        });
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(HangingLlmBackend);
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn encmind_core::traits::SessionStore>,
+            Arc::new(ToolRegistry::new()),
+            RuntimeConfig::default(),
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        let (_rx, handle) = pool
+            .execute_streaming(
+                &runtime,
+                session.id.clone(),
+                make_user_msg("timeout"),
+                default_agent(),
+                cancel,
+            )
+            .await
+            .unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("timed out"), "expected timeout error: {err}");
+        assert_eq!(pool.available_permits(), 1);
     }
 
     #[tokio::test]

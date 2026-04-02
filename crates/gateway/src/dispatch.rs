@@ -1,6 +1,7 @@
 use crate::handlers;
 use crate::protocol::*;
 use crate::state::AppState;
+use crate::ws::WsSender;
 
 /// Dispatch a method call to the appropriate handler.
 pub async fn dispatch_method(
@@ -8,6 +9,7 @@ pub async fn dispatch_method(
     method: &str,
     params: serde_json::Value,
     req_id: &str,
+    ws_sender: Option<WsSender>,
 ) -> ServerMessage {
     // Check lockdown first
     if state.lockdown.is_active() && !is_lockdown_exempt(method) {
@@ -18,7 +20,7 @@ pub async fn dispatch_method(
     }
 
     match method {
-        "chat.send" => handlers::chat::handle_send(state, params, req_id).await,
+        "chat.send" => handlers::chat::handle_send(state, params, req_id, ws_sender).await,
         "chat.history" => handlers::chat::handle_history(state, params, req_id).await,
         "chat.abort" => handlers::chat::handle_abort(state, params, req_id).await,
         "sessions.list" => handlers::sessions::handle_list(state, params, req_id).await,
@@ -152,7 +154,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_chat_send() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "chat.send", serde_json::json!({}), "req-1").await;
+        let result =
+            dispatch_method(&state, "chat.send", serde_json::json!({}), "req-1", None).await;
         // Should return a response (possibly stub)
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-1"),
@@ -164,7 +167,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_sessions_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "sessions.list", serde_json::json!({}), "req-2").await;
+        let result = dispatch_method(
+            &state,
+            "sessions.list",
+            serde_json::json!({}),
+            "req-2",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-2"),
             _ => panic!("Expected Res"),
@@ -174,8 +184,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_sessions_create() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "sessions.create", serde_json::json!({}), "req-3").await;
+        let result = dispatch_method(
+            &state,
+            "sessions.create",
+            serde_json::json!({}),
+            "req-3",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-3"),
             _ => panic!("Expected Res"),
@@ -185,7 +201,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_config_get() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "config.get", serde_json::json!({}), "req-4").await;
+        let result =
+            dispatch_method(&state, "config.get", serde_json::json!({}), "req-4", None).await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-4"),
             _ => panic!("Expected Res"),
@@ -200,6 +217,7 @@ mod tests {
             "security.lockdown",
             serde_json::json!({"active": true}),
             "req-5",
+            None,
         )
         .await;
         match result {
@@ -211,7 +229,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_models_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "models.list", serde_json::json!({}), "req-6").await;
+        let result =
+            dispatch_method(&state, "models.list", serde_json::json!({}), "req-6", None).await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-6"),
             _ => panic!("Expected Res"),
@@ -221,7 +240,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_agents_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "agents.list", serde_json::json!({}), "req-7").await;
+        let result =
+            dispatch_method(&state, "agents.list", serde_json::json!({}), "req-7", None).await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-7"),
             _ => panic!("Expected Res"),
@@ -236,6 +256,7 @@ mod tests {
             "agents.get",
             serde_json::json!({"agent_id": "main"}),
             "req-8",
+            None,
         )
         .await;
         match result {
@@ -249,8 +270,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_unknown_method() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "nonexistent.method", serde_json::json!({}), "req-u").await;
+        let result = dispatch_method(
+            &state,
+            "nonexistent.method",
+            serde_json::json!({}),
+            "req-u",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ERR_UNKNOWN_METHOD);
@@ -262,8 +289,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_memory_search_returns_error_no_query() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "memory.search", serde_json::json!({}), "req-m1").await;
+        let result = dispatch_method(
+            &state,
+            "memory.search",
+            serde_json::json!({}),
+            "req-m1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-m1".to_string()));
@@ -281,7 +314,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_memory_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "memory.list", serde_json::json!({}), "req-m2").await;
+        let result =
+            dispatch_method(&state, "memory.list", serde_json::json!({}), "req-m2", None).await;
         match result {
             ServerMessage::Res { id, .. } | ServerMessage::Error { id: Some(id), .. } => {
                 assert_eq!(id, "req-m2");
@@ -298,6 +332,7 @@ mod tests {
             "memory.delete",
             serde_json::json!({"id": "mem-1"}),
             "req-m3",
+            None,
         )
         .await;
         match result {
@@ -311,8 +346,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_memory_status() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "memory.status", serde_json::json!({}), "req-m4").await;
+        let result = dispatch_method(
+            &state,
+            "memory.status",
+            serde_json::json!({}),
+            "req-m4",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, .. } | ServerMessage::Error { id: Some(id), .. } => {
                 assert_eq!(id, "req-m4");
@@ -329,6 +370,7 @@ mod tests {
             "memory.search",
             serde_json::json!({"query": "dark mode"}),
             "req-m5",
+            None,
         )
         .await;
         match result {
@@ -342,7 +384,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_cron_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c1").await;
+        let result =
+            dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c1", None).await;
         match result {
             ServerMessage::Res { id, .. } => assert_eq!(id, "req-c1"),
             _ => panic!("Expected Res"),
@@ -361,6 +404,7 @@ mod tests {
                 "prompt": "do something"
             }),
             "req-c2",
+            None,
         )
         .await;
         match result {
@@ -382,6 +426,7 @@ mod tests {
                 "next_run_at": "not-a-timestamp"
             }),
             "req-c2b",
+            None,
         )
         .await;
         match result {
@@ -406,12 +451,13 @@ mod tests {
                 "prompt": "run"
             }),
             "req-c3a",
+            None,
         )
         .await;
 
         // Get the job id from list
         let list_result =
-            dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c3b").await;
+            dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c3b", None).await;
         let job_id = match &list_result {
             ServerMessage::Res { result, .. } => result.as_array().unwrap()[0]["id"]
                 .as_str()
@@ -425,6 +471,7 @@ mod tests {
             "cron.delete",
             serde_json::json!({"id": job_id}),
             "req-c3c",
+            None,
         )
         .await;
         match result {
@@ -449,11 +496,12 @@ mod tests {
                 "prompt": "run"
             }),
             "req-c4a",
+            None,
         )
         .await;
 
         let list_result =
-            dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c4b").await;
+            dispatch_method(&state, "cron.list", serde_json::json!({}), "req-c4b", None).await;
         let job_id = match &list_result {
             ServerMessage::Res { result, .. } => result.as_array().unwrap()[0]["id"]
                 .as_str()
@@ -467,6 +515,7 @@ mod tests {
             "cron.trigger",
             serde_json::json!({"id": job_id}),
             "req-c4c",
+            None,
         )
         .await;
         match result {
@@ -484,8 +533,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_timeline_query() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "timeline.query", serde_json::json!({}), "req-tl1").await;
+        let result = dispatch_method(
+            &state,
+            "timeline.query",
+            serde_json::json!({}),
+            "req-tl1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-tl1");
@@ -498,8 +553,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_backup_trigger() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "backup.trigger", serde_json::json!({}), "req-b1").await;
+        let result = dispatch_method(
+            &state,
+            "backup.trigger",
+            serde_json::json!({}),
+            "req-b1",
+            None,
+        )
+        .await;
         match result {
             // backup_manager is None in test state → error
             ServerMessage::Error { id, error } => {
@@ -513,7 +574,8 @@ mod tests {
     #[tokio::test]
     async fn dispatch_backup_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "backup.list", serde_json::json!({}), "req-b2").await;
+        let result =
+            dispatch_method(&state, "backup.list", serde_json::json!({}), "req-b2", None).await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-b2".to_string()));
@@ -527,7 +589,8 @@ mod tests {
     async fn lockdown_rejects_non_exempt() {
         let state = make_test_state();
         state.lockdown.activate("test");
-        let result = dispatch_method(&state, "chat.send", serde_json::json!({}), "req-lock").await;
+        let result =
+            dispatch_method(&state, "chat.send", serde_json::json!({}), "req-lock", None).await;
         match result {
             ServerMessage::Error { error, .. } => {
                 assert_eq!(error.code, ERR_LOCKDOWN);
@@ -539,7 +602,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_skills_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "skills.list", serde_json::json!({}), "req-sk1").await;
+        let result = dispatch_method(
+            &state,
+            "skills.list",
+            serde_json::json!({}),
+            "req-sk1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-sk1");
@@ -552,8 +622,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_approval_respond_missing_request_id() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "approval.respond", serde_json::json!({}), "req-ap1").await;
+        let result = dispatch_method(
+            &state,
+            "approval.respond",
+            serde_json::json!({}),
+            "req-ap1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-ap1".to_string()));
@@ -566,7 +642,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_timers_list() {
         let state = make_test_state();
-        let result = dispatch_method(&state, "timers.list", serde_json::json!({}), "req-tl1").await;
+        let result = dispatch_method(
+            &state,
+            "timers.list",
+            serde_json::json!({}),
+            "req-tl1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-tl1");
@@ -579,8 +662,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_timers_toggle_missing_params() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "timers.toggle", serde_json::json!({}), "req-tt1").await;
+        let result = dispatch_method(
+            &state,
+            "timers.toggle",
+            serde_json::json!({}),
+            "req-tt1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-tt1".to_string()));
@@ -593,8 +682,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_skills_toggle_missing_params() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "skills.toggle", serde_json::json!({}), "req-st1").await;
+        let result = dispatch_method(
+            &state,
+            "skills.toggle",
+            serde_json::json!({}),
+            "req-st1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-st1".to_string()));
@@ -633,6 +728,7 @@ mod tests {
             "skills.toggle",
             serde_json::json!({"skill_id": "skill-a", "enabled": true}),
             "req-st2",
+            None,
         )
         .await;
         match result {
@@ -659,6 +755,7 @@ mod tests {
             "chat.abort",
             serde_json::json!({ "session_id": session.id.as_str() }),
             "req-abort",
+            None,
         )
         .await;
 
@@ -671,8 +768,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_plugins_status() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "plugins.status", serde_json::json!({}), "req-ps").await;
+        let result = dispatch_method(
+            &state,
+            "plugins.status",
+            serde_json::json!({}),
+            "req-ps",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-ps");
@@ -688,8 +791,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_skills_metrics() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "skills.metrics", serde_json::json!({}), "req-sm").await;
+        let result = dispatch_method(
+            &state,
+            "skills.metrics",
+            serde_json::json!({}),
+            "req-sm",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-sm");
@@ -719,6 +828,7 @@ mod tests {
             "skills.config.get",
             serde_json::json!({"skill_id": "test"}),
             "req-cg",
+            None,
         )
         .await;
         match result {
@@ -753,6 +863,7 @@ mod tests {
             "skills.config.set",
             serde_json::json!({"skill_id": "test", "key": "k", "value": "v"}),
             "req-cs",
+            None,
         )
         .await;
         match result {
@@ -784,6 +895,7 @@ mod tests {
             "skills.resources.get",
             serde_json::json!({"skill_id": "test"}),
             "req-rg",
+            None,
         )
         .await;
         match result {
@@ -795,8 +907,14 @@ mod tests {
     #[tokio::test]
     async fn readiness_dispatch_works() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "status.readiness", serde_json::json!({}), "req-rd").await;
+        let result = dispatch_method(
+            &state,
+            "status.readiness",
+            serde_json::json!({}),
+            "req-rd",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-rd");
@@ -835,6 +953,7 @@ mod tests {
             "skills.resources.set",
             serde_json::json!({"skill_id": "test", "overrides": {"max_concurrent": 2}}),
             "req-rs",
+            None,
         )
         .await;
         match result {
@@ -851,8 +970,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_channels_list() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "channels.list", serde_json::json!({}), "req-ch1").await;
+        let result = dispatch_method(
+            &state,
+            "channels.list",
+            serde_json::json!({}),
+            "req-ch1",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-ch1");
@@ -870,6 +995,7 @@ mod tests {
             "channels.list",
             serde_json::json!({"foo": "bar"}),
             "req-ch1b",
+            None,
         )
         .await;
         match result {
@@ -890,6 +1016,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "My Bot"}),
             "req-ch2",
+            None,
         )
         .await;
         match result {
@@ -906,8 +1033,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_channels_add_missing_type() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "channels.add", serde_json::json!({}), "req-ch2b").await;
+        let result = dispatch_method(
+            &state,
+            "channels.add",
+            serde_json::json!({}),
+            "req-ch2b",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Error { id, error } => {
                 assert_eq!(id, Some("req-ch2b".to_string()));
@@ -925,6 +1058,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "My Bot", "foo": "bar"}),
             "req-ch2c",
+            None,
         )
         .await;
         match result {
@@ -946,6 +1080,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch3a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -959,6 +1094,7 @@ mod tests {
             "channels.remove",
             serde_json::json!({"id": account_id}),
             "req-ch3b",
+            None,
         )
         .await;
         match result {
@@ -978,6 +1114,7 @@ mod tests {
             "channels.remove",
             serde_json::json!({"id": "nonexistent"}),
             "req-ch3c",
+            None,
         )
         .await;
         match result {
@@ -997,6 +1134,7 @@ mod tests {
             "channels.remove",
             serde_json::json!({"id": "nonexistent", "foo": "bar"}),
             "req-ch3d",
+            None,
         )
         .await;
         match result {
@@ -1018,6 +1156,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1030,6 +1169,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id, "bot_token": "test-token-123"}),
             "req-ch4b",
+            None,
         )
         .await;
         match result {
@@ -1051,6 +1191,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4c",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1063,6 +1204,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id}),
             "req-ch4d",
+            None,
         )
         .await;
         match result {
@@ -1082,6 +1224,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4d-existing-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1107,6 +1250,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id}),
             "req-ch4d-existing-b",
+            None,
         )
         .await;
         match result {
@@ -1127,6 +1271,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4d2-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1139,6 +1284,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id, "bot_token": "token", "foo": "bar"}),
             "req-ch4d2-b",
+            None,
         )
         .await;
         match result {
@@ -1159,6 +1305,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "discord"}),
             "req-ch4e-a",
+            None,
         )
         .await;
         match add_result {
@@ -1178,6 +1325,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "A"}),
             "req-ch4d-a",
+            None,
         )
         .await;
         match first {
@@ -1190,6 +1338,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "B"}),
             "req-ch4d-b",
+            None,
         )
         .await;
         match second {
@@ -1227,6 +1376,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": legacy_account.id.as_str(), "bot_token": "token"}),
             "req-ch4e-b",
+            None,
         )
         .await;
         match result {
@@ -1286,6 +1436,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": "telegram", "bot_token": "token"}),
             "req-ch4e-c",
+            None,
         )
         .await;
         match result {
@@ -1308,6 +1459,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4g-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1333,6 +1485,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id, "bot_token": "new-token"}),
             "req-ch4g-b",
+            None,
         )
         .await;
         match login_result {
@@ -1353,6 +1506,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4h-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1378,6 +1532,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id, "bot_token": "token"}),
             "req-ch4h-b",
+            None,
         )
         .await;
         match result {
@@ -1407,6 +1562,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "slack"}),
             "req-ch4f-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1423,6 +1579,7 @@ mod tests {
                 "app_token": "xapp-original"
             }),
             "req-ch4f-b",
+            None,
         )
         .await;
         match first_login {
@@ -1438,6 +1595,7 @@ mod tests {
                 "bot_token": "xoxb-rotated"
             }),
             "req-ch4f-c",
+            None,
         )
         .await;
         match second_login {
@@ -1470,6 +1628,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "gmail"}),
             "req-ch4gml-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1485,6 +1644,7 @@ mod tests {
                 "client_id": "cid-only"
             }),
             "req-ch4gml-b",
+            None,
         )
         .await;
         match result {
@@ -1511,6 +1671,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch4x-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1548,6 +1709,7 @@ mod tests {
             "channels.login",
             serde_json::json!({"id": account_id, "bot_token": "new-invalid-token"}),
             "req-ch4x-b",
+            None,
         )
         .await;
         match login_result {
@@ -1567,6 +1729,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram"}),
             "req-ch5a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1579,6 +1742,7 @@ mod tests {
             "channels.logout",
             serde_json::json!({"id": account_id}),
             "req-ch5b",
+            None,
         )
         .await;
         match result {
@@ -1598,6 +1762,7 @@ mod tests {
             "channels.logout",
             serde_json::json!({"id": "nonexistent", "foo": "bar"}),
             "req-ch5c",
+            None,
         )
         .await;
         match result {
@@ -1618,6 +1783,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "Test"}),
             "req-ch6a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1630,6 +1796,7 @@ mod tests {
             "channels.status",
             serde_json::json!({"id": account_id}),
             "req-ch6b",
+            None,
         )
         .await;
         match result {
@@ -1650,6 +1817,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "Test"}),
             "req-ch6p-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1662,6 +1830,7 @@ mod tests {
             "channels.status",
             serde_json::json!({"id": account_id, "probe": true}),
             "req-ch6p-b",
+            None,
         )
         .await;
         match result {
@@ -1684,6 +1853,7 @@ mod tests {
             "channels.add",
             serde_json::json!({"channel_type": "telegram", "label": "Test"}),
             "req-ch6p2-a",
+            None,
         )
         .await;
         let account_id = match add_result {
@@ -1709,6 +1879,7 @@ mod tests {
             "channels.status",
             serde_json::json!({"id": account_id, "probe": true}),
             "req-ch6p2-b",
+            None,
         )
         .await;
         match result {
@@ -1725,8 +1896,14 @@ mod tests {
     #[tokio::test]
     async fn dispatch_channels_status_no_id_falls_back_to_list() {
         let state = make_test_state();
-        let result =
-            dispatch_method(&state, "channels.status", serde_json::json!({}), "req-ch6c").await;
+        let result = dispatch_method(
+            &state,
+            "channels.status",
+            serde_json::json!({}),
+            "req-ch6c",
+            None,
+        )
+        .await;
         match result {
             ServerMessage::Res { id, result } => {
                 assert_eq!(id, "req-ch6c");
@@ -1745,6 +1922,7 @@ mod tests {
             "channels.status",
             serde_json::json!({"probe": true}),
             "req-ch6c2",
+            None,
         )
         .await;
         match result {
@@ -1764,6 +1942,7 @@ mod tests {
             "channels.status",
             serde_json::json!({"foo": "bar"}),
             "req-ch6d",
+            None,
         )
         .await;
         match result {
