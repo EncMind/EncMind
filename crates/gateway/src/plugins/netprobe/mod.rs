@@ -194,6 +194,10 @@ struct NetProbeSearchHandler {
 
 #[async_trait]
 impl InternalToolHandler for NetProbeSearchHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true // read-only search
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
@@ -286,6 +290,10 @@ struct NetProbeFetchHandler {
 
 #[async_trait]
 impl InternalToolHandler for NetProbeFetchHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true // read-only fetch
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,

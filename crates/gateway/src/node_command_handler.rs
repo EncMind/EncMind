@@ -77,6 +77,10 @@ fn select_device<'a>(
 
 #[async_trait]
 impl InternalToolHandler for NodeCommandHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        matches!(self.command.as_str(), "file.read" | "file.list")
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,

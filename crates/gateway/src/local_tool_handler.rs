@@ -88,6 +88,11 @@ impl LocalToolHandler {
 
 #[async_trait]
 impl InternalToolHandler for LocalToolHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        // Read-only local commands are safe for parallel execution.
+        matches!(self.command_type.as_str(), "file.read" | "file.list")
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
