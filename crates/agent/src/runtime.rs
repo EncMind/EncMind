@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::error::TrySendError;
@@ -15,7 +15,8 @@ use tracing::{debug, info, warn};
 use encmind_core::error::{AppError, LlmError, PluginError};
 use encmind_core::hooks::{HookContext, HookPoint, HookRegistry, HookResult};
 use encmind_core::traits::{
-    ApprovalHandler, CompletionParams, FinishReason, LlmBackend, MemorySearchProvider, SessionStore,
+    ApprovalHandler, CompletionParams, FinishReason, LlmBackend, MemorySearchProvider,
+    SessionStore, ToolInterruptBehavior,
 };
 use encmind_core::types::*;
 
@@ -49,6 +50,17 @@ pub struct RuntimeConfig {
     /// stops the run early with a diagnostic message. Defaults to `None`
     /// (which falls back to `max_tool_iterations * 5`).
     pub tool_calls_per_run: Option<u32>,
+    /// Max parallel dispatch fanout for concurrent-safe tools.
+    /// Values <= 1 disable safe-tool parallelism.
+    pub max_parallel_safe_tools: usize,
+    /// Optional per-tool interrupt behavior overrides.
+    ///
+    /// This can override behavior for any registered tool name (internal,
+    /// MCP, or skill), not just internal handlers.
+    pub per_tool_interrupt_behavior: HashMap<String, ToolInterruptBehavior>,
+    /// How long to wait for a `Block` tool to finish after cancellation
+    /// before fail-closing with an error result.
+    pub blocking_tool_cancel_grace: Duration,
 }
 
 impl Default for RuntimeConfig {
@@ -63,6 +75,9 @@ impl Default for RuntimeConfig {
             max_tool_output_chars: 32_768,
             per_tool_output_chars: HashMap::new(),
             tool_calls_per_run: None,
+            max_parallel_safe_tools: DEFAULT_MAX_PARALLEL_SAFE_TOOLS,
+            per_tool_interrupt_behavior: HashMap::new(),
+            blocking_tool_cancel_grace: Duration::from_secs(10),
         }
     }
 }
@@ -147,11 +162,47 @@ pub struct RunResult {
     pub cancelled: bool,
 }
 
-struct ToolErrorDetails<'a> {
-    tool_use_id: &'a str,
-    tool_name: &'a str,
-    input: &'a serde_json::Value,
+const DEFAULT_MAX_PARALLEL_SAFE_TOOLS: usize = 4;
+const MAX_PARALLEL_SAFE_TOOLS_CAP: usize = 16;
+
+enum PreparedToolCall {
+    Ready {
+        input: serde_json::Value,
+    },
+    Finalized {
+        input: serde_json::Value,
+        output: String,
+        is_error: bool,
+    },
+}
+
+struct CompletedToolCall {
+    tool_use_id: String,
+    tool_name: String,
+    input: serde_json::Value,
     output: String,
+    is_error: bool,
+}
+
+struct DenyHookDetails<'a> {
+    output: &'a str,
+    deny_reason: &'a str,
+    risk_level: Option<&'a str>,
+}
+
+#[derive(Clone, Copy)]
+struct RunAccounting {
+    input_tokens: u32,
+    output_tokens: u32,
+    total_tokens: u32,
+    iteration: u32,
+}
+
+struct SafeBatchState<'a> {
+    tool_calls: &'a mut Vec<ToolCallRecord>,
+    loop_detector: &'a mut crate::loop_detector::LoopDetector,
+    event_tx: &'a Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+    cancel: &'a CancellationToken,
 }
 
 /// The core agent runtime: drives the conversation loop.
@@ -602,444 +653,266 @@ impl AgentRuntime {
                 self.session_store
                     .append_message(session_id, &assistant_msg)
                     .await?;
-                'tool_loop: for (id, name, parsed_input) in &parsed_tool_uses {
-                    let mut input = parsed_input.clone();
 
-                    // Emit ToolStart event.
-                    if let Some(ref tx) = event_tx {
-                        // Truncate input for streaming to avoid huge WS frames
-                        // and leaking sensitive args into transport logs.
-                        let stream_input = Self::truncate_stream_event_input(&input);
-                        Self::emit_event(
-                            tx,
-                            ChatEvent::ToolStart {
-                                tool_use_id: id.clone(),
-                                tool_name: name.clone(),
-                                input: stream_input,
-                            },
-                        )
-                        .await;
+                // Run tools in original model order.
+                // Contiguous concurrent-safe tools are executed as bounded
+                // parallel batches, then their results are persisted in order.
+                let mut safe_batch: Vec<(String, String, serde_json::Value)> = Vec::new();
+                for (id, name, parsed_input) in &parsed_tool_uses {
+                    if self.tool_registry.is_tool_concurrent_safe(name) {
+                        safe_batch.push((id.clone(), name.clone(), parsed_input.clone()));
+                        continue;
                     }
 
-                    // --- Governance step 1: Risk classification (immutable deny-list) ---
-                    let risk = crate::risk_classifier::classify_tool_risk(name, &input, session_id);
-                    if risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
-                        warn!(
-                            tool = %name,
-                            reason = %risk.reason,
-                            "tool call blocked by immutable deny-list"
-                        );
-                        self.record_tool_error(
-                            session_id,
-                            &mut tool_calls,
-                            ToolErrorDetails {
-                                tool_use_id: id,
-                                tool_name: name,
-                                input: &input,
-                                output: format!(
-                                    "Error: operation denied by security policy — {}",
-                                    risk.reason
-                                ),
-                            },
-                            &event_tx,
-                        )
-                        .await?;
-                        let _ = self
-                            .execute_hook(
-                                HookPoint::AfterToolCall,
+                    if !safe_batch.is_empty() {
+                        let mut safe_batch_state = SafeBatchState {
+                            tool_calls: &mut tool_calls,
+                            loop_detector: &mut loop_detector,
+                            event_tx: &event_tx,
+                            cancel: &cancel,
+                        };
+                        let safe_batch_result = self
+                            .execute_safe_batch(
                                 session_id,
                                 &agent_config.id,
-                                Some(name.clone()),
-                                serde_json::json!({
-                                    "tool_name": name,
-                                    "input": input.clone(),
-                                    "output": format!("Error: denied — {}", risk.reason),
-                                    "is_error": true,
-                                    "risk_level": format!("{:?}", risk.level),
-                                    "deny_reason": "immutable_deny_list",
-                                }),
+                                &safe_batch,
+                                &mut safe_batch_state,
                             )
                             .await;
-                        continue 'tool_loop;
+                        let maybe_violation = match safe_batch_result {
+                            Ok(v) => v,
+                            Err(e) if Self::is_cancelled_app_error(&e) || cancel.is_cancelled() => {
+                                let result = Self::make_cancelled_result(
+                                    last_response,
+                                    tool_calls,
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    iteration + 1,
+                                );
+                                self.maybe_compact(session_id).await;
+                                return Ok(result);
+                            }
+                            Err(e) => return Err(e),
+                        };
+
+                        if let Some(violation) = maybe_violation {
+                            return self
+                                .build_loop_break_result(
+                                    session_id,
+                                    tool_calls,
+                                    RunAccounting {
+                                        input_tokens,
+                                        output_tokens,
+                                        total_tokens,
+                                        iteration,
+                                    },
+                                    violation,
+                                )
+                                .await;
+                        }
+                        safe_batch.clear();
                     }
 
-                    // --- Governance step 2: Input validation (schema check) ---
-                    if !input.is_object() {
-                        warn!(
-                            tool = %name,
-                            input_type = %crate::message_validation::json_type_name(&input),
-                            "tool_use input is not an object — coercing to empty object"
-                        );
-                        input = serde_json::json!({});
-                    }
+                    match self
+                        .prepare_tool_call(session_id, &agent_config.id, name, parsed_input)
+                        .await
+                    {
+                        Ok(PreparedToolCall::Finalized {
+                            input,
+                            output,
+                            is_error,
+                        }) => {
+                            Self::emit_tool_start_event(&event_tx, id, name, &input).await;
+                            self.persist_completed_tool_call(
+                                session_id,
+                                &mut tool_calls,
+                                CompletedToolCall {
+                                    tool_use_id: (*id).clone(),
+                                    tool_name: (*name).clone(),
+                                    input,
+                                    output,
+                                    is_error,
+                                },
+                                &event_tx,
+                            )
+                            .await?;
+                            if let Some(violation) = loop_detector.record_and_check(name, is_error)
+                            {
+                                return self
+                                    .build_loop_break_result(
+                                        session_id,
+                                        tool_calls,
+                                        RunAccounting {
+                                            input_tokens,
+                                            output_tokens,
+                                            total_tokens,
+                                            iteration,
+                                        },
+                                        violation,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Ok(PreparedToolCall::Ready { input }) => {
+                            Self::emit_tool_start_event(&event_tx, id, name, &input).await;
+                            let interrupt_behavior = self.resolve_tool_interrupt_behavior(name);
+                            let (output, is_error) = if cancel.is_cancelled()
+                                && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel)
+                            {
+                                ("Error: request cancelled".to_string(), true)
+                            } else {
+                                let mut dispatch_future = Box::pin(self.tool_registry.dispatch(
+                                    name,
+                                    input.clone(),
+                                    session_id,
+                                    &agent_config.id,
+                                ));
+                                match interrupt_behavior {
+                                    ToolInterruptBehavior::Cancel => {
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true),
+                                            result = dispatch_future.as_mut() => self.normalize_dispatch_outcome(name, result),
+                                        }
+                                    }
+                                    ToolInterruptBehavior::Block => {
+                                        tokio::select! {
+                                            result = dispatch_future.as_mut() => self.normalize_dispatch_outcome(name, result),
+                                            _ = cancel.cancelled() => {
+                                                self.await_blocking_dispatch_with_grace(name, &mut dispatch_future).await
+                                            },
+                                        }
+                                    }
+                                }
+                            };
 
-                    // --- Governance step 3: Pre-tool hook (BeforeToolCall) ---
-                    let hook_result = self
-                        .execute_hook(
-                            HookPoint::BeforeToolCall,
-                            session_id,
-                            &agent_config.id,
-                            Some(name.clone()),
-                            serde_json::json!({
-                                "tool_name": name,
-                                "input": input.clone(),
-                            }),
-                        )
-                        .await;
+                            let (output, is_error) = match self
+                                .apply_after_tool_call_hook(
+                                    session_id,
+                                    &agent_config.id,
+                                    name,
+                                    &input,
+                                    output,
+                                    is_error,
+                                )
+                                .await
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    self.persist_completed_tool_call(
+                                        session_id,
+                                        &mut tool_calls,
+                                        CompletedToolCall {
+                                            tool_use_id: (*id).clone(),
+                                            tool_name: (*name).clone(),
+                                            input: input.clone(),
+                                            output: format!("Error: hook aborted — {e}"),
+                                            is_error: true,
+                                        },
+                                        &event_tx,
+                                    )
+                                    .await?;
+                                    return Err(e);
+                                }
+                            };
 
-                    // If hook aborted, emit ToolComplete before propagating error
-                    // (ToolStart was already emitted above).
-                    if let Err(ref e) = hook_result {
-                        if let Some(ref tx) = event_tx {
-                            Self::emit_event(
-                                tx,
-                                ChatEvent::ToolComplete {
-                                    tool_use_id: id.clone(),
-                                    tool_name: name.clone(),
+                            self.persist_completed_tool_call(
+                                session_id,
+                                &mut tool_calls,
+                                CompletedToolCall {
+                                    tool_use_id: (*id).clone(),
+                                    tool_name: (*name).clone(),
+                                    input,
+                                    output,
+                                    is_error,
+                                },
+                                &event_tx,
+                            )
+                            .await?;
+
+                            if let Some(violation) = loop_detector.record_and_check(name, is_error)
+                            {
+                                return self
+                                    .build_loop_break_result(
+                                        session_id,
+                                        tool_calls,
+                                        RunAccounting {
+                                            input_tokens,
+                                            output_tokens,
+                                            total_tokens,
+                                            iteration,
+                                        },
+                                        violation,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            Self::emit_tool_start_event(&event_tx, id, name, parsed_input).await;
+                            self.persist_completed_tool_call(
+                                session_id,
+                                &mut tool_calls,
+                                CompletedToolCall {
+                                    tool_use_id: (*id).clone(),
+                                    tool_name: (*name).clone(),
+                                    input: parsed_input.clone(),
                                     output: format!("Error: hook aborted — {e}"),
                                     is_error: true,
                                 },
-                            )
-                            .await;
-                        }
-                    }
-
-                    if let Some(override_payload) = hook_result? {
-                        // Abort from BeforeToolCall is fail-closed and bubbles
-                        // out as a run error via execute_hook(). At this point
-                        // the assistant tool_use message has already been
-                        // persisted, so the session may show a tool_use without
-                        // a corresponding tool_result.
-                        let new_input = override_payload
-                            .get("input")
-                            .cloned()
-                            .unwrap_or(override_payload);
-                        input = new_input;
-
-                        // Re-validate object shape after hook override.
-                        if !input.is_object() {
-                            warn!(
-                                tool = %name,
-                                "hook set non-object input — coercing to empty object"
-                            );
-                            input = serde_json::json!({});
-                        }
-
-                        // Re-classify after hook modified input — hooks must not
-                        // bypass the immutable deny-list by transforming input.
-                        let post_hook_risk =
-                            crate::risk_classifier::classify_tool_risk(name, &input, session_id);
-                        if post_hook_risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
-                            warn!(
-                                tool = %name,
-                                reason = %post_hook_risk.reason,
-                                "tool call blocked after hook modified input — deny-list match"
-                            );
-                            self.record_tool_error(
-                                session_id,
-                                &mut tool_calls,
-                                ToolErrorDetails {
-                                    tool_use_id: id,
-                                    tool_name: name,
-                                    input: &input,
-                                    output: format!(
-                                        "Error: operation denied by security policy — {}",
-                                        post_hook_risk.reason
-                                    ),
-                                },
                                 &event_tx,
                             )
                             .await?;
-                            let _ = self
-                                .execute_hook(
-                                    HookPoint::AfterToolCall,
-                                    session_id,
-                                    &agent_config.id,
-                                    Some(name.clone()),
-                                    serde_json::json!({
-                                        "tool_name": name,
-                                        "input": input.clone(),
-                                        "output": format!("Error: denied — {}", post_hook_risk.reason),
-                                        "is_error": true,
-                                        "risk_level": format!("{:?}", post_hook_risk.level),
-                                        "deny_reason": "immutable_deny_list",
-                                    }),
-                                )
-                                .await;
-                            continue 'tool_loop;
+                            return Err(e);
                         }
                     }
+                }
 
-                    if let Some(ref firewall) = self.firewall {
-                        let urls = Self::extract_http_urls(&input);
-                        for url in urls {
-                            if let Err(e) = firewall
-                                .check_url_for_agent(&url, agent_config.id.as_str())
-                                .await
-                            {
-                                warn!(
-                                    tool = %name,
-                                    url = %url,
-                                    error = %e,
-                                    "tool call blocked by egress firewall"
-                                );
-                                self.record_tool_error(
-                                    session_id,
-                                    &mut tool_calls,
-                                    ToolErrorDetails {
-                                        tool_use_id: id,
-                                        tool_name: name,
-                                        input: &input,
-                                        output: format!("Error: {e}"),
-                                    },
-                                    &event_tx,
-                                )
-                                .await?;
-                                // Intentionally ignore HookResult on error
-                                // paths. This keeps denied/blocked/error
-                                // outcomes fail-closed and prevents hooks from
-                                // "un-denying" by overriding is_error/output.
-                                let _ = self
-                                    .execute_hook(
-                                        HookPoint::AfterToolCall,
-                                        session_id,
-                                        &agent_config.id,
-                                        Some(name.clone()),
-                                        serde_json::json!({
-                                            "tool_name": name,
-                                            "input": input.clone(),
-                                            "output": format!("Error: {e}"),
-                                            "is_error": true,
-                                            "deny_reason": "egress_firewall",
-                                        }),
-                                    )
-                                    .await;
-                                continue 'tool_loop;
-                            }
-                        }
-                    }
-
-                    // Approval check before dispatch
-                    if let Some(ref checker) = self.approval_checker {
-                        if checker.is_denied(name) {
-                            self.record_tool_error(
-                                session_id,
-                                &mut tool_calls,
-                                ToolErrorDetails {
-                                    tool_use_id: id,
-                                    tool_name: name,
-                                    input: &input,
-                                    output: format!(
-                                        "Error: tool '{}' is denied by security policy",
-                                        name
-                                    ),
-                                },
-                                &event_tx,
-                            )
-                            .await?;
-                            // Intentionally ignore HookResult on error paths
-                            // (see fail-closed rationale above).
-                            let _ = self
-                                .execute_hook(
-                                    HookPoint::AfterToolCall,
-                                    session_id,
-                                    &agent_config.id,
-                                    Some(name.clone()),
-                                    serde_json::json!({
-                                        "tool_name": name,
-                                        "input": input.clone(),
-                                        "output": format!("Error: tool '{}' is denied by security policy", name),
-                                        "is_error": true,
-                                        "deny_reason": "policy_denied",
-                                    }),
-                                )
-                                .await;
-                            continue 'tool_loop;
-                        }
-
-                        if checker.requires_approval(name, &input) {
-                            let req = ApprovalRequest {
-                                tool_name: name.clone(),
-                                tool_input: input.clone(),
-                                session_id: session_id.clone(),
-                                agent_id: agent_config.id.clone(),
-                            };
-                            let decision = self.approval_handler.request_approval(req).await;
-                            if let ApprovalDecision::Denied { reason } = decision {
-                                self.record_tool_error(
-                                    session_id,
-                                    &mut tool_calls,
-                                    ToolErrorDetails {
-                                        tool_use_id: id,
-                                        tool_name: name,
-                                        input: &input,
-                                        output: format!(
-                                            "Error: tool '{}' denied: {}",
-                                            name, reason
-                                        ),
-                                    },
-                                    &event_tx,
-                                )
-                                .await?;
-                                // Intentionally ignore HookResult on error
-                                // paths (see fail-closed rationale above).
-                                let _ = self
-                                    .execute_hook(
-                                        HookPoint::AfterToolCall,
-                                        session_id,
-                                        &agent_config.id,
-                                        Some(name.clone()),
-                                        serde_json::json!({
-                                            "tool_name": name,
-                                            "input": input.clone(),
-                                            "output": format!("Error: tool '{}' denied: {}", name, reason),
-                                            "is_error": true,
-                                            "deny_reason": "approval_denied",
-                                        }),
-                                    )
-                                    .await;
-                                continue 'tool_loop;
-                            }
-                        }
-                    }
-
-                    let (output, is_error) = match self
-                        .tool_registry
-                        .dispatch(name, input.clone(), session_id, &agent_config.id)
-                        .await
-                    {
-                        Ok(result) => (result, false),
-                        Err(e) => {
-                            warn!(tool = %name, error = %e, "tool dispatch failed");
-                            (format!("Error: {e}"), true)
-                        }
+                if !safe_batch.is_empty() {
+                    let mut safe_batch_state = SafeBatchState {
+                        tool_calls: &mut tool_calls,
+                        loop_detector: &mut loop_detector,
+                        event_tx: &event_tx,
+                        cancel: &cancel,
                     };
-
-                    let mut output = output;
-                    let mut is_error = is_error;
-                    if let Some(override_payload) = self
-                        .execute_hook(
-                            HookPoint::AfterToolCall,
+                    let safe_batch_result = self
+                        .execute_safe_batch(
                             session_id,
                             &agent_config.id,
-                            Some(name.clone()),
-                            serde_json::json!({
-                                "tool_name": name,
-                                "input": input.clone(),
-                                "output": output.clone(),
-                                "is_error": is_error,
-                            }),
-                        )
-                        .await?
-                    {
-                        if let Some(obj) = override_payload.as_object() {
-                            if let Some(new_output) = obj.get("output").and_then(|v| v.as_str()) {
-                                output = new_output.to_owned();
-                            }
-                            if let Some(new_error) = obj.get("is_error").and_then(|v| v.as_bool()) {
-                                is_error = new_error;
-                            }
-                        } else if let Some(new_output) = override_payload.as_str() {
-                            output = new_output.to_owned();
-                        }
-                    }
-
-                    tool_calls.push(ToolCallRecord {
-                        name: name.clone(),
-                        input: input.clone(),
-                        output: output.clone(),
-                        is_error,
-                    });
-
-                    // Emit ToolComplete event.
-                    if let Some(ref tx) = event_tx {
-                        Self::emit_event(
-                            tx,
-                            ChatEvent::ToolComplete {
-                                tool_use_id: id.clone(),
-                                tool_name: name.clone(),
-                                output: Self::truncate_stream_event_output(&output),
-                                is_error,
-                            },
+                            &safe_batch,
+                            &mut safe_batch_state,
                         )
                         .await;
-                    }
-
-                    let limit = self
-                        .config
-                        .per_tool_output_chars
-                        .get(name.as_str())
-                        .copied()
-                        .unwrap_or(self.config.max_tool_output_chars);
-                    let persisted_output = Self::truncate_tool_output(&output, limit);
-                    if persisted_output.len() < output.len() {
-                        info!(
-                            tool = %name,
-                            original_chars = output.chars().count(),
-                            truncated_to = limit,
-                            "tool output truncated for LLM context"
-                        );
-                    }
-
-                    let tool_result_msg = Message {
-                        id: MessageId::new(),
-                        role: Role::Tool,
-                        content: vec![ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content: persisted_output,
-                            is_error,
-                        }],
-                        created_at: Utc::now(),
-                        token_count: None,
+                    let maybe_violation = match safe_batch_result {
+                        Ok(v) => v,
+                        Err(e) if Self::is_cancelled_app_error(&e) || cancel.is_cancelled() => {
+                            let result = Self::make_cancelled_result(
+                                last_response,
+                                tool_calls,
+                                input_tokens,
+                                output_tokens,
+                                total_tokens,
+                                iteration + 1,
+                            );
+                            self.maybe_compact(session_id).await;
+                            return Ok(result);
+                        }
+                        Err(e) => return Err(e),
                     };
 
-                    self.session_store
-                        .append_message(session_id, &tool_result_msg)
-                        .await?;
-
-                    // Loop detection: check for runaway patterns after each tool call
-                    if let Some(violation) = loop_detector.record_and_check(name, is_error) {
-                        let reason = violation.to_string();
-                        let reason_code = match &violation {
-                            crate::loop_detector::LoopViolation::ToolCallCapExceeded { .. } => {
-                                "tool_call_cap_exceeded"
-                            }
-                            crate::loop_detector::LoopViolation::ConsecutiveFailures { .. } => {
-                                "consecutive_failures"
-                            }
-                            crate::loop_detector::LoopViolation::RepeatingPattern { .. } => {
-                                "repeating_pattern"
-                            }
-                        }
-                        .to_string();
-                        warn!(reason = %reason, "loop detector triggered, stopping run");
-
-                        let stop_msg = Message {
-                            id: MessageId::new(),
-                            role: Role::Assistant,
-                            content: vec![ContentBlock::Text {
-                                text: format!("[Loop breaker: {reason}]"),
-                            }],
-                            created_at: Utc::now(),
-                            token_count: None,
-                        };
-                        let _ = self
-                            .session_store
-                            .append_message(session_id, &stop_msg)
+                    if let Some(violation) = maybe_violation {
+                        return self
+                            .build_loop_break_result(
+                                session_id,
+                                tool_calls,
+                                RunAccounting {
+                                    input_tokens,
+                                    output_tokens,
+                                    total_tokens,
+                                    iteration,
+                                },
+                                violation,
+                            )
                             .await;
-
-                        return Ok(RunResult {
-                            response: stop_msg,
-                            tool_calls,
-                            input_tokens,
-                            output_tokens,
-                            iterations: iteration + 1,
-                            total_tokens,
-                            loop_break: Some(reason),
-                            loop_break_code: Some(reason_code),
-                            reached_max_iterations: false,
-                            cancelled: false,
-                        });
                     }
                 }
 
@@ -1168,6 +1041,933 @@ impl AgentRuntime {
         }
     }
 
+    async fn emit_tool_start_event(
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+        tool_use_id: &str,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) {
+        if let Some(tx) = event_tx {
+            let stream_input = Self::truncate_stream_event_input(input);
+            Self::emit_event(
+                tx,
+                ChatEvent::ToolStart {
+                    tool_use_id: tool_use_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    input: stream_input,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn emit_tool_complete_event(
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+        tool_use_id: &str,
+        tool_name: &str,
+        output: &str,
+        is_error: bool,
+    ) {
+        if let Some(tx) = event_tx {
+            Self::emit_event(
+                tx,
+                ChatEvent::ToolComplete {
+                    tool_use_id: tool_use_id.to_owned(),
+                    tool_name: tool_name.to_owned(),
+                    output: Self::truncate_stream_event_output(output),
+                    is_error,
+                },
+            )
+            .await;
+        }
+    }
+
+    async fn invoke_after_tool_call_deny_hook(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentId,
+        tool_name: &str,
+        input: &serde_json::Value,
+        details: DenyHookDetails<'_>,
+    ) {
+        let mut payload = serde_json::json!({
+            "tool_name": tool_name,
+            "input": input.clone(),
+            "output": details.output,
+            "is_error": true,
+            "deny_reason": details.deny_reason,
+        });
+        if let Some(level) = details.risk_level {
+            payload["risk_level"] = serde_json::Value::String(level.to_owned());
+        }
+        let _ = self
+            .execute_hook(
+                HookPoint::AfterToolCall,
+                session_id,
+                agent_id,
+                Some(tool_name.to_owned()),
+                payload,
+            )
+            .await;
+    }
+
+    async fn prepare_tool_call(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentId,
+        tool_name: &str,
+        parsed_input: &serde_json::Value,
+    ) -> Result<PreparedToolCall, AppError> {
+        let mut input = parsed_input.clone();
+
+        // Governance step 1: immutable deny-list.
+        let risk = crate::risk_classifier::classify_tool_risk(tool_name, &input, session_id);
+        if risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+            warn!(
+                tool = %tool_name,
+                reason = %risk.reason,
+                "tool call blocked by immutable deny-list"
+            );
+            let output = format!(
+                "Error: operation denied by security policy — {}",
+                risk.reason
+            );
+            self.invoke_after_tool_call_deny_hook(
+                session_id,
+                agent_id,
+                tool_name,
+                &input,
+                DenyHookDetails {
+                    output: &output,
+                    deny_reason: "immutable_deny_list",
+                    risk_level: Some(&format!("{:?}", risk.level)),
+                },
+            )
+            .await;
+            return Ok(PreparedToolCall::Finalized {
+                input,
+                output,
+                is_error: true,
+            });
+        }
+
+        // Governance step 2: tool input must be an object.
+        if !input.is_object() {
+            warn!(
+                tool = %tool_name,
+                input_type = %crate::message_validation::json_type_name(&input),
+                "tool_use input is not an object — coercing to empty object"
+            );
+            input = serde_json::json!({});
+        }
+
+        // Governance step 3: BeforeToolCall hook.
+        if let Some(override_payload) = self
+            .execute_hook(
+                HookPoint::BeforeToolCall,
+                session_id,
+                agent_id,
+                Some(tool_name.to_owned()),
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "input": input.clone(),
+                }),
+            )
+            .await?
+        {
+            let new_input = override_payload
+                .get("input")
+                .cloned()
+                .unwrap_or(override_payload);
+            input = new_input;
+
+            if !input.is_object() {
+                warn!(
+                    tool = %tool_name,
+                    "hook set non-object input — coercing to empty object"
+                );
+                input = serde_json::json!({});
+            }
+
+            // Hooks must not bypass immutable deny-list.
+            let post_hook_risk =
+                crate::risk_classifier::classify_tool_risk(tool_name, &input, session_id);
+            if post_hook_risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
+                warn!(
+                    tool = %tool_name,
+                    reason = %post_hook_risk.reason,
+                    "tool call blocked after hook modified input — deny-list match"
+                );
+                let output = format!(
+                    "Error: operation denied by security policy — {}",
+                    post_hook_risk.reason
+                );
+                self.invoke_after_tool_call_deny_hook(
+                    session_id,
+                    agent_id,
+                    tool_name,
+                    &input,
+                    DenyHookDetails {
+                        output: &output,
+                        deny_reason: "immutable_deny_list",
+                        risk_level: Some(&format!("{:?}", post_hook_risk.level)),
+                    },
+                )
+                .await;
+                return Ok(PreparedToolCall::Finalized {
+                    input,
+                    output,
+                    is_error: true,
+                });
+            }
+        }
+
+        // Governance step 4: egress firewall.
+        if let Some(firewall) = &self.firewall {
+            let urls = Self::extract_http_urls(&input);
+            for url in urls {
+                if let Err(e) = firewall.check_url_for_agent(&url, agent_id.as_str()).await {
+                    warn!(
+                        tool = %tool_name,
+                        url = %url,
+                        error = %e,
+                        "tool call blocked by egress firewall"
+                    );
+                    let output = format!("Error: {e}");
+                    self.invoke_after_tool_call_deny_hook(
+                        session_id,
+                        agent_id,
+                        tool_name,
+                        &input,
+                        DenyHookDetails {
+                            output: &output,
+                            deny_reason: "egress_firewall",
+                            risk_level: None,
+                        },
+                    )
+                    .await;
+                    return Ok(PreparedToolCall::Finalized {
+                        input,
+                        output,
+                        is_error: true,
+                    });
+                }
+            }
+        }
+
+        // Governance step 5: approval policy.
+        if let Some(checker) = &self.approval_checker {
+            if checker.is_denied(tool_name) {
+                let output = format!("Error: tool '{}' is denied by security policy", tool_name);
+                self.invoke_after_tool_call_deny_hook(
+                    session_id,
+                    agent_id,
+                    tool_name,
+                    &input,
+                    DenyHookDetails {
+                        output: &output,
+                        deny_reason: "policy_denied",
+                        risk_level: None,
+                    },
+                )
+                .await;
+                return Ok(PreparedToolCall::Finalized {
+                    input,
+                    output,
+                    is_error: true,
+                });
+            }
+
+            if checker.requires_approval(tool_name, &input) {
+                let req = ApprovalRequest {
+                    tool_name: tool_name.to_owned(),
+                    tool_input: input.clone(),
+                    session_id: session_id.clone(),
+                    agent_id: agent_id.clone(),
+                };
+                let decision = self.approval_handler.request_approval(req).await;
+                if let ApprovalDecision::Denied { reason } = decision {
+                    let output = format!("Error: tool '{}' denied: {}", tool_name, reason);
+                    self.invoke_after_tool_call_deny_hook(
+                        session_id,
+                        agent_id,
+                        tool_name,
+                        &input,
+                        DenyHookDetails {
+                            output: &output,
+                            deny_reason: "approval_denied",
+                            risk_level: None,
+                        },
+                    )
+                    .await;
+                    return Ok(PreparedToolCall::Finalized {
+                        input,
+                        output,
+                        is_error: true,
+                    });
+                }
+            }
+        }
+
+        Ok(PreparedToolCall::Ready { input })
+    }
+
+    async fn apply_after_tool_call_hook(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentId,
+        tool_name: &str,
+        input: &serde_json::Value,
+        output: String,
+        is_error: bool,
+    ) -> Result<(String, bool), AppError> {
+        let mut output = output;
+        let mut is_error = is_error;
+        if let Some(override_payload) = self
+            .execute_hook(
+                HookPoint::AfterToolCall,
+                session_id,
+                agent_id,
+                Some(tool_name.to_owned()),
+                serde_json::json!({
+                    "tool_name": tool_name,
+                    "input": input.clone(),
+                    "output": output.clone(),
+                    "is_error": is_error,
+                }),
+            )
+            .await?
+        {
+            if let Some(obj) = override_payload.as_object() {
+                if let Some(new_output) = obj.get("output").and_then(|v| v.as_str()) {
+                    output = new_output.to_owned();
+                }
+                if let Some(new_error) = obj.get("is_error").and_then(|v| v.as_bool()) {
+                    is_error = new_error;
+                }
+            } else if let Some(new_output) = override_payload.as_str() {
+                output = new_output.to_owned();
+            }
+        }
+        Ok((output, is_error))
+    }
+
+    fn resolve_tool_interrupt_behavior(&self, tool_name: &str) -> ToolInterruptBehavior {
+        self.config
+            .per_tool_interrupt_behavior
+            .get(tool_name)
+            .copied()
+            .unwrap_or_else(|| self.tool_registry.tool_interrupt_behavior(tool_name))
+    }
+
+    fn normalize_dispatch_outcome(
+        &self,
+        tool_name: &str,
+        dispatch_result: Result<String, AppError>,
+    ) -> (String, bool) {
+        match dispatch_result {
+            Ok(result) => (result, false),
+            Err(e) => {
+                warn!(tool = %tool_name, error = %e, "tool dispatch failed");
+                (format!("Error: {e}"), true)
+            }
+        }
+    }
+
+    async fn await_blocking_dispatch_with_grace<F>(
+        &self,
+        tool_name: &str,
+        dispatch_future: &mut std::pin::Pin<Box<F>>,
+    ) -> (String, bool)
+    where
+        F: std::future::Future<Output = Result<String, AppError>> + Send,
+    {
+        let grace = self.config.blocking_tool_cancel_grace;
+        match tokio::time::timeout(grace, dispatch_future.as_mut()).await {
+            Ok(result) => self.normalize_dispatch_outcome(tool_name, result),
+            Err(_) => {
+                warn!(
+                    tool = %tool_name,
+                    grace_ms = grace.as_millis(),
+                    "blocking tool did not finish within cancel grace"
+                );
+                (
+                    format!(
+                        "Error: blocking tool did not finish within cancel grace ({}ms)",
+                        grace.as_millis()
+                    ),
+                    true,
+                )
+            }
+        }
+    }
+
+    async fn execute_safe_batch(
+        &self,
+        session_id: &SessionId,
+        agent_id: &AgentId,
+        safe_batch: &[(String, String, serde_json::Value)],
+        state: &mut SafeBatchState<'_>,
+    ) -> Result<Option<crate::loop_detector::LoopViolation>, AppError> {
+        if safe_batch.is_empty() {
+            return Ok(None);
+        }
+
+        let mut cancel_requested = state.cancel.is_cancelled();
+
+        // Pre-governance is still sequential/fail-closed.
+        let mut prepared: Vec<(String, String, PreparedToolCall)> =
+            Vec::with_capacity(safe_batch.len());
+        let mut interrupt_behaviors: Vec<ToolInterruptBehavior> =
+            Vec::with_capacity(safe_batch.len());
+        for (id, name, parsed_input) in safe_batch {
+            let interrupt_behavior = self.resolve_tool_interrupt_behavior(name);
+            interrupt_behaviors.push(interrupt_behavior);
+
+            match self
+                .prepare_tool_call(session_id, agent_id, name, parsed_input)
+                .await
+            {
+                Ok(prepared_call) => prepared.push((id.clone(), name.clone(), prepared_call)),
+                Err(e) => {
+                    Self::emit_tool_start_event(state.event_tx, id, name, parsed_input).await;
+                    self.persist_completed_tool_call(
+                        session_id,
+                        state.tool_calls,
+                        CompletedToolCall {
+                            tool_use_id: id.clone(),
+                            tool_name: name.clone(),
+                            input: parsed_input.clone(),
+                            output: format!("Error: hook aborted — {e}"),
+                            is_error: true,
+                        },
+                        state.event_tx,
+                    )
+                    .await?;
+                    return Err(e);
+                }
+            }
+
+            if state.cancel.is_cancelled() {
+                cancel_requested = true;
+            }
+        }
+
+        // Emit starts in original order with post-governance input.
+        for (id, name, prepared_call) in &prepared {
+            let input = match prepared_call {
+                PreparedToolCall::Ready { input } => input,
+                PreparedToolCall::Finalized { input, .. } => input,
+            };
+            Self::emit_tool_start_event(state.event_tx, id, name, input).await;
+        }
+
+        let mut loop_violation: Option<crate::loop_detector::LoopViolation> = None;
+
+        if state.cancel.is_cancelled() {
+            cancel_requested = true;
+        }
+
+        // Dispatch only "Ready" calls in bounded parallelism.
+        let ready_dispatches: Vec<(usize, String, serde_json::Value, ToolInterruptBehavior)> =
+            prepared
+                .iter()
+                .enumerate()
+                .filter_map(|(order, (_, name, prepared_call))| match prepared_call {
+                    PreparedToolCall::Ready { input } => {
+                        let interrupt_behavior = interrupt_behaviors
+                            .get(order)
+                            .copied()
+                            .unwrap_or(ToolInterruptBehavior::Cancel);
+                        if cancel_requested && interrupt_behavior == ToolInterruptBehavior::Cancel {
+                            None
+                        } else {
+                            Some((order, name.clone(), input.clone(), interrupt_behavior))
+                        }
+                    }
+                    PreparedToolCall::Finalized { .. } => None,
+                })
+                .collect();
+
+        // Dispatch ready tools in bounded parallelism and keep only out-of-order
+        // results in memory. As soon as a contiguous prefix is ready, persist it.
+        let mut dispatch_results_by_order: HashMap<usize, (String, bool)> = HashMap::new();
+        let mut next_order_to_persist = 0usize;
+        let requested = self.config.max_parallel_safe_tools;
+        let parallelism = requested.clamp(1, MAX_PARALLEL_SAFE_TOOLS_CAP);
+        if parallelism != requested {
+            debug!(
+                requested,
+                clamped = parallelism,
+                cap = MAX_PARALLEL_SAFE_TOOLS_CAP,
+                "parallel tool concurrency clamped"
+            );
+        }
+        if !ready_dispatches.is_empty() {
+            let mut dispatch_stream =
+                futures::stream::iter(ready_dispatches.into_iter().map(
+                    |(order, name, input, interrupt_behavior)| {
+                    let tool_registry = self.tool_registry.clone();
+                    let dispatch_session_id = session_id.clone();
+                    let dispatch_agent_id = agent_id.clone();
+                    let dispatch_cancel = state.cancel.clone();
+                    let cancel_grace = self.config.blocking_tool_cancel_grace;
+                    let dispatch_name = name.clone();
+                    async move {
+                        let dispatch_future = std::panic::AssertUnwindSafe(tool_registry.dispatch(
+                            &dispatch_name,
+                            input,
+                            &dispatch_session_id,
+                            &dispatch_agent_id,
+                        ))
+                        .catch_unwind();
+                        tokio::pin!(dispatch_future);
+
+                        let normalize = |dispatch_result: Result<
+                            Result<String, AppError>,
+                            Box<dyn std::any::Any + Send>,
+                        >| {
+                            let dispatch_result = match dispatch_result {
+                                Ok(inner) => inner,
+                                Err(_) => Err(AppError::Internal(
+                                    "parallel tool task panicked".to_string(),
+                                )),
+                            };
+                            match dispatch_result {
+                                Ok(result) => (result, false),
+                                Err(e) => (format!("Error: {e}"), true),
+                            }
+                        };
+
+                        let (output, is_error) = match interrupt_behavior {
+                            ToolInterruptBehavior::Cancel => {
+                                tokio::select! {
+                                    _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true),
+                                    result = dispatch_future.as_mut() => normalize(result),
+                                }
+                            }
+                            ToolInterruptBehavior::Block => {
+                                if dispatch_cancel.is_cancelled() {
+                                    match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
+                                        Ok(result) => normalize(result),
+                                        Err(_) => {
+                                            warn!(
+                                                tool = %name,
+                                                grace_ms = cancel_grace.as_millis(),
+                                                "blocking tool did not finish within cancel grace"
+                                            );
+                                            (
+                                                format!("Error: blocking tool did not finish within cancel grace ({}ms)", cancel_grace.as_millis()),
+                                                true,
+                                            )
+                                        },
+                                    }
+                                } else {
+                                    tokio::select! {
+                                        result = dispatch_future.as_mut() => normalize(result),
+                                        _ = dispatch_cancel.cancelled() => {
+                                            match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
+                                                Ok(result) => normalize(result),
+                                                Err(_) => {
+                                                    warn!(
+                                                        tool = %name,
+                                                        grace_ms = cancel_grace.as_millis(),
+                                                        "blocking tool did not finish within cancel grace"
+                                                    );
+                                                    (
+                                                        format!("Error: blocking tool did not finish within cancel grace ({}ms)", cancel_grace.as_millis()),
+                                                        true,
+                                                    )
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        };
+                        (order, name, output, is_error)
+                    }
+                }))
+                .buffer_unordered(parallelism);
+
+            loop {
+                while next_order_to_persist < prepared.len() {
+                    if state.cancel.is_cancelled() {
+                        cancel_requested = true;
+                    }
+
+                    let (id, name, prepared_call) = &prepared[next_order_to_persist];
+                    let interrupt_behavior = interrupt_behaviors
+                        .get(next_order_to_persist)
+                        .copied()
+                        .unwrap_or(ToolInterruptBehavior::Cancel);
+                    let short_circuit_cancel = cancel_requested
+                        && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
+                    let (input, output, is_error) = match prepared_call {
+                        PreparedToolCall::Finalized {
+                            input,
+                            output,
+                            is_error,
+                        } => (input.clone(), output.clone(), *is_error),
+                        PreparedToolCall::Ready { input } => {
+                            let maybe_dispatch =
+                                dispatch_results_by_order.remove(&next_order_to_persist);
+                            let (dispatch_output, dispatch_error) = if short_circuit_cancel {
+                                maybe_dispatch
+                                    .unwrap_or(("Error: request cancelled".to_string(), true))
+                            } else {
+                                let Some(result) = maybe_dispatch else {
+                                    break;
+                                };
+                                result
+                            };
+
+                            match self
+                                .apply_after_tool_call_hook(
+                                    session_id,
+                                    agent_id,
+                                    name,
+                                    input,
+                                    dispatch_output,
+                                    dispatch_error,
+                                )
+                                .await
+                            {
+                                Ok((hook_output, hook_error)) => {
+                                    (input.clone(), hook_output, hook_error)
+                                }
+                                Err(e) => {
+                                    self.persist_completed_tool_call(
+                                        session_id,
+                                        state.tool_calls,
+                                        CompletedToolCall {
+                                            tool_use_id: id.clone(),
+                                            tool_name: name.clone(),
+                                            input: input.clone(),
+                                            output: format!("Error: hook aborted — {e}"),
+                                            is_error: true,
+                                        },
+                                        state.event_tx,
+                                    )
+                                    .await?;
+                                    let _ = state.loop_detector.record_and_check(name, true);
+
+                                    for (remaining_id, remaining_name, remaining_prepared_call) in
+                                        prepared.iter().skip(next_order_to_persist + 1)
+                                    {
+                                        let remaining_input = match remaining_prepared_call {
+                                            PreparedToolCall::Ready { input } => input.clone(),
+                                            PreparedToolCall::Finalized { input, .. } => {
+                                                input.clone()
+                                            }
+                                        };
+                                        self.persist_completed_tool_call(
+                                            session_id,
+                                            state.tool_calls,
+                                            CompletedToolCall {
+                                                tool_use_id: remaining_id.clone(),
+                                                tool_name: remaining_name.clone(),
+                                                input: remaining_input,
+                                                output:
+                                                    "Error: aborted by hook (sibling tool abort)"
+                                                        .to_string(),
+                                                is_error: true,
+                                            },
+                                            state.event_tx,
+                                        )
+                                        .await?;
+                                        let _ = state
+                                            .loop_detector
+                                            .record_and_check(remaining_name, true);
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    };
+
+                    self.persist_completed_tool_call(
+                        session_id,
+                        state.tool_calls,
+                        CompletedToolCall {
+                            tool_use_id: id.clone(),
+                            tool_name: name.clone(),
+                            input,
+                            output,
+                            is_error,
+                        },
+                        state.event_tx,
+                    )
+                    .await?;
+
+                    let violation = state.loop_detector.record_and_check(name, is_error);
+                    if loop_violation.is_none() {
+                        loop_violation = violation;
+                    }
+                    next_order_to_persist += 1;
+                }
+
+                if next_order_to_persist >= prepared.len() {
+                    break;
+                }
+
+                let next_result = if cancel_requested {
+                    dispatch_stream.next().await
+                } else {
+                    tokio::select! {
+                        _ = state.cancel.cancelled() => {
+                            cancel_requested = true;
+                            continue;
+                        }
+                        result = dispatch_stream.next() => result,
+                    }
+                };
+
+                match next_result {
+                    Some((order, tool_name, output, is_error)) => {
+                        if is_error {
+                            warn!(order, tool = %tool_name, "parallel tool dispatch failed");
+                        }
+                        dispatch_results_by_order.insert(order, (output, is_error));
+                    }
+                    None => {
+                        // Stream ended unexpectedly. Missing results are handled
+                        // as synthetic errors below in the final flush.
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Final flush (covers all-finalized batches and any missing dispatch results).
+        while next_order_to_persist < prepared.len() {
+            if state.cancel.is_cancelled() {
+                cancel_requested = true;
+            }
+
+            let (id, name, prepared_call) = &prepared[next_order_to_persist];
+            let interrupt_behavior = interrupt_behaviors
+                .get(next_order_to_persist)
+                .copied()
+                .unwrap_or(ToolInterruptBehavior::Cancel);
+            let short_circuit_cancel =
+                cancel_requested && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
+            let (input, output, is_error) = match prepared_call {
+                PreparedToolCall::Finalized {
+                    input,
+                    output,
+                    is_error,
+                } => (input.clone(), output.clone(), *is_error),
+                PreparedToolCall::Ready { input } => {
+                    let maybe_dispatch = dispatch_results_by_order.remove(&next_order_to_persist);
+                    let (dispatch_output, dispatch_error) = if short_circuit_cancel {
+                        maybe_dispatch.unwrap_or(("Error: request cancelled".to_string(), true))
+                    } else {
+                        match maybe_dispatch {
+                            Some(result) => result,
+                            None => {
+                                warn!(
+                                    order = next_order_to_persist,
+                                    "missing parallel dispatch result; marking as error"
+                                );
+                                (
+                                    "Error: parallel tool dispatch result missing".to_string(),
+                                    true,
+                                )
+                            }
+                        }
+                    };
+                    match self
+                        .apply_after_tool_call_hook(
+                            session_id,
+                            agent_id,
+                            name,
+                            input,
+                            dispatch_output,
+                            dispatch_error,
+                        )
+                        .await
+                    {
+                        Ok((hook_output, hook_error)) => (input.clone(), hook_output, hook_error),
+                        Err(e) => {
+                            self.persist_completed_tool_call(
+                                session_id,
+                                state.tool_calls,
+                                CompletedToolCall {
+                                    tool_use_id: id.clone(),
+                                    tool_name: name.clone(),
+                                    input: input.clone(),
+                                    output: format!("Error: hook aborted — {e}"),
+                                    is_error: true,
+                                },
+                                state.event_tx,
+                            )
+                            .await?;
+                            let _ = state.loop_detector.record_and_check(name, true);
+
+                            for (remaining_id, remaining_name, remaining_prepared_call) in
+                                prepared.iter().skip(next_order_to_persist + 1)
+                            {
+                                let remaining_input = match remaining_prepared_call {
+                                    PreparedToolCall::Ready { input } => input.clone(),
+                                    PreparedToolCall::Finalized { input, .. } => input.clone(),
+                                };
+                                self.persist_completed_tool_call(
+                                    session_id,
+                                    state.tool_calls,
+                                    CompletedToolCall {
+                                        tool_use_id: remaining_id.clone(),
+                                        tool_name: remaining_name.clone(),
+                                        input: remaining_input,
+                                        output: "Error: aborted by hook (sibling tool abort)"
+                                            .to_string(),
+                                        is_error: true,
+                                    },
+                                    state.event_tx,
+                                )
+                                .await?;
+                                let _ = state.loop_detector.record_and_check(remaining_name, true);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+            };
+
+            self.persist_completed_tool_call(
+                session_id,
+                state.tool_calls,
+                CompletedToolCall {
+                    tool_use_id: id.clone(),
+                    tool_name: name.clone(),
+                    input,
+                    output,
+                    is_error,
+                },
+                state.event_tx,
+            )
+            .await?;
+
+            let violation = state.loop_detector.record_and_check(name, is_error);
+            if loop_violation.is_none() {
+                loop_violation = violation;
+            }
+            next_order_to_persist += 1;
+        }
+
+        if cancel_requested {
+            return Err(LlmError::Cancelled.into());
+        }
+
+        Ok(loop_violation)
+    }
+
+    async fn persist_completed_tool_call(
+        &self,
+        session_id: &SessionId,
+        tool_calls: &mut Vec<ToolCallRecord>,
+        completed: CompletedToolCall,
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+    ) -> Result<(), AppError> {
+        tool_calls.push(ToolCallRecord {
+            name: completed.tool_name.clone(),
+            input: completed.input.clone(),
+            output: completed.output.clone(),
+            is_error: completed.is_error,
+        });
+
+        Self::emit_tool_complete_event(
+            event_tx,
+            &completed.tool_use_id,
+            &completed.tool_name,
+            &completed.output,
+            completed.is_error,
+        )
+        .await;
+
+        let limit = self
+            .config
+            .per_tool_output_chars
+            .get(completed.tool_name.as_str())
+            .copied()
+            .unwrap_or(self.config.max_tool_output_chars);
+        let persisted_output = Self::truncate_tool_output(&completed.output, limit);
+        if persisted_output.len() < completed.output.len() {
+            info!(
+                tool = %completed.tool_name,
+                original_chars = completed.output.chars().count(),
+                truncated_to = limit,
+                "tool output truncated for LLM context"
+            );
+        }
+
+        let tool_result_msg = Message {
+            id: MessageId::new(),
+            role: Role::Tool,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: completed.tool_use_id,
+                content: persisted_output,
+                is_error: completed.is_error,
+            }],
+            created_at: Utc::now(),
+            token_count: None,
+        };
+
+        self.session_store
+            .append_message(session_id, &tool_result_msg)
+            .await?;
+        Ok(())
+    }
+
+    async fn build_loop_break_result(
+        &self,
+        session_id: &SessionId,
+        tool_calls: Vec<ToolCallRecord>,
+        accounting: RunAccounting,
+        violation: crate::loop_detector::LoopViolation,
+    ) -> Result<RunResult, AppError> {
+        let reason = violation.to_string();
+        let reason_code = match &violation {
+            crate::loop_detector::LoopViolation::ToolCallCapExceeded { .. } => {
+                "tool_call_cap_exceeded"
+            }
+            crate::loop_detector::LoopViolation::ConsecutiveFailures { .. } => {
+                "consecutive_failures"
+            }
+            crate::loop_detector::LoopViolation::RepeatingPattern { .. } => "repeating_pattern",
+        }
+        .to_string();
+
+        warn!(reason = %reason, "loop detector triggered, stopping run");
+
+        let stop_msg = Message {
+            id: MessageId::new(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: format!("[Loop breaker: {reason}]"),
+            }],
+            created_at: Utc::now(),
+            token_count: None,
+        };
+        let _ = self
+            .session_store
+            .append_message(session_id, &stop_msg)
+            .await;
+
+        Ok(RunResult {
+            response: stop_msg,
+            tool_calls,
+            input_tokens: accounting.input_tokens,
+            output_tokens: accounting.output_tokens,
+            iterations: accounting.iteration + 1,
+            total_tokens: accounting.total_tokens,
+            loop_break: Some(reason),
+            loop_break_code: Some(reason_code),
+            reached_max_iterations: false,
+            cancelled: false,
+        })
+    }
+
     fn emit_delta_event(tx: &tokio::sync::mpsc::Sender<ChatEvent>, event: ChatEvent) {
         match tx.try_send(event) {
             Ok(()) => {}
@@ -1190,6 +1990,10 @@ impl AgentRuntime {
                 debug!("dropping streaming event because send timed out");
             }
         }
+    }
+
+    fn is_cancelled_app_error(err: &AppError) -> bool {
+        matches!(err, AppError::Llm(LlmError::Cancelled))
     }
 
     fn make_cancelled_result(
@@ -1243,58 +2047,6 @@ impl AgentRuntime {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&hash[..8]);
         format!("{:016x}", u64::from_be_bytes(prefix))
-    }
-
-    async fn record_tool_error(
-        &self,
-        session_id: &SessionId,
-        tool_calls: &mut Vec<ToolCallRecord>,
-        details: ToolErrorDetails<'_>,
-        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
-    ) -> Result<(), AppError> {
-        let ToolErrorDetails {
-            tool_use_id,
-            tool_name,
-            input,
-            output,
-        } = details;
-
-        tool_calls.push(ToolCallRecord {
-            name: tool_name.to_owned(),
-            input: input.clone(),
-            output: output.clone(),
-            is_error: true,
-        });
-
-        // Emit ToolComplete event for error path.
-        if let Some(ref tx) = event_tx {
-            Self::emit_event(
-                tx,
-                ChatEvent::ToolComplete {
-                    tool_use_id: tool_use_id.to_owned(),
-                    tool_name: tool_name.to_owned(),
-                    output: Self::truncate_stream_event_output(&output),
-                    is_error: true,
-                },
-            )
-            .await;
-        }
-
-        let tool_result_msg = Message {
-            id: MessageId::new(),
-            role: Role::Tool,
-            content: vec![ContentBlock::ToolResult {
-                tool_use_id: tool_use_id.to_owned(),
-                content: output,
-                is_error: true,
-            }],
-            created_at: Utc::now(),
-            token_count: None,
-        };
-        self.session_store
-            .append_message(session_id, &tool_result_msg)
-            .await?;
-        Ok(())
     }
 
     fn extract_http_urls(input: &serde_json::Value) -> Vec<String> {
@@ -1876,7 +2628,7 @@ mod tests {
     use encmind_core::error::LlmError;
     use encmind_core::error::PluginError;
     use encmind_core::hooks::{HookHandler, HookPoint, HookRegistry, HookResult};
-    use encmind_core::traits::{CompletionDelta, ModelInfo};
+    use encmind_core::traits::{CompletionDelta, InternalToolHandler, ModelInfo};
 
     use super::test_helpers::*;
     use super::*;
@@ -2121,6 +2873,134 @@ mod tests {
 
         assert_eq!(result.iterations, 3);
         assert_eq!(result.tool_calls.len(), 2);
+    }
+
+    struct DelayedInternalTool {
+        name: &'static str,
+        delay_ms: u64,
+        concurrent_safe: bool,
+        interrupt_behavior: ToolInterruptBehavior,
+    }
+
+    #[async_trait::async_trait]
+    impl InternalToolHandler for DelayedInternalTool {
+        async fn handle(
+            &self,
+            _input: serde_json::Value,
+            _session_id: &SessionId,
+            _agent_id: &AgentId,
+        ) -> Result<String, AppError> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(self.name.to_string())
+        }
+
+        fn is_concurrent_safe(&self) -> bool {
+            self.concurrent_safe
+        }
+
+        fn interrupt_behavior(&self) -> ToolInterruptBehavior {
+            self.interrupt_behavior
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_safe_and_sequential_tools_preserve_model_order() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+
+        registry
+            .register_internal(
+                "safe_slow",
+                "safe slow",
+                empty_schema.clone(),
+                Arc::new(DelayedInternalTool {
+                    name: "safe_slow",
+                    delay_ms: 30,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+        registry
+            .register_internal(
+                "safe_fast",
+                "safe fast",
+                empty_schema.clone(),
+                Arc::new(DelayedInternalTool {
+                    name: "safe_fast",
+                    delay_ms: 1,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+        registry
+            .register_internal(
+                "seq_tool",
+                "sequential",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "seq_tool",
+                    delay_ms: 1,
+                    concurrent_safe: false,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![
+            vec![
+                CompletionDelta {
+                    text: None,
+                    thinking: None,
+                    tool_use: Some(encmind_core::traits::ToolUseDelta {
+                        id: "t1".into(),
+                        name: "safe_slow".into(),
+                        input_json: "{}".into(),
+                    }),
+                    finish_reason: None,
+                },
+                CompletionDelta {
+                    text: None,
+                    thinking: None,
+                    tool_use: Some(encmind_core::traits::ToolUseDelta {
+                        id: "t2".into(),
+                        name: "safe_fast".into(),
+                        input_json: "{}".into(),
+                    }),
+                    finish_reason: None,
+                },
+                CompletionDelta {
+                    text: None,
+                    thinking: None,
+                    tool_use: Some(encmind_core::traits::ToolUseDelta {
+                        id: "t3".into(),
+                        name: "seq_tool".into(),
+                        input_json: "{}".into(),
+                    }),
+                    finish_reason: Some(FinishReason::ToolUse),
+                },
+            ],
+            text_response("done"),
+        ];
+
+        let (runtime, store) = setup_runtime(responses, registry).await;
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("run mixed tools"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let names: Vec<_> = result.tool_calls.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["safe_slow", "safe_fast", "seq_tool"]);
     }
 
     #[tokio::test]
@@ -2581,6 +3461,19 @@ mod tests {
         }
     }
 
+    struct AbortAfterToolHook;
+    #[async_trait::async_trait]
+    impl HookHandler for AbortAfterToolHook {
+        async fn execute(
+            &self,
+            _ctx: &mut encmind_core::hooks::HookContext,
+        ) -> Result<HookResult, PluginError> {
+            Ok(HookResult::Abort {
+                reason: "after tool blocked".into(),
+            })
+        }
+    }
+
     struct AbortBeforeAgentStartHook;
     #[async_trait::async_trait]
     impl HookHandler for AbortBeforeAgentStartHook {
@@ -2825,6 +3718,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("BeforeToolCall"));
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let tool_results: Vec<&Message> =
+            messages.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "abort path must persist a tool_result"
+        );
     }
 
     #[tokio::test]
@@ -2888,6 +3793,129 @@ mod tests {
         assert_eq!(
             completed_tool_use_id, started_tool_use_id,
             "ToolComplete must correspond to the started tool call"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_safe_batch_after_hook_abort_pairs_all_started_tools() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                "safe_a",
+                "safe a",
+                empty_schema.clone(),
+                Arc::new(DelayedInternalTool {
+                    name: "safe_a",
+                    delay_ms: 1,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+        registry
+            .register_internal(
+                "safe_b",
+                "safe b",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "safe_b",
+                    delay_ms: 1,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![vec![
+            CompletionDelta {
+                text: None,
+                thinking: None,
+                tool_use: Some(encmind_core::traits::ToolUseDelta {
+                    id: "ta".into(),
+                    name: "safe_a".into(),
+                    input_json: "{}".into(),
+                }),
+                finish_reason: None,
+            },
+            CompletionDelta {
+                text: None,
+                thinking: None,
+                tool_use: Some(encmind_core::traits::ToolUseDelta {
+                    id: "tb".into(),
+                    name: "safe_b".into(),
+                    input_json: "{}".into(),
+                }),
+                finish_reason: Some(FinishReason::ToolUse),
+            },
+        ]];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::AfterToolCall,
+                100,
+                "test",
+                Arc::new(AbortAfterToolHook),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("trigger"),
+            default_agent(),
+            CancellationToken::new(),
+        );
+
+        let mut started: HashSet<String> = HashSet::new();
+        let mut completed: HashSet<String> = HashSet::new();
+        let mut saw_error_event = false;
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { tool_use_id, .. } => {
+                    started.insert(tool_use_id);
+                }
+                ChatEvent::ToolComplete {
+                    tool_use_id,
+                    is_error,
+                    ..
+                } => {
+                    assert!(is_error, "expected error completions on abort");
+                    completed.insert(tool_use_id);
+                }
+                ChatEvent::Error { .. } => {
+                    saw_error_event = true;
+                    break;
+                }
+                ChatEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        let err = handle.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("AfterToolCall"));
+        assert!(saw_error_event, "expected final Error event");
+        assert_eq!(
+            started, completed,
+            "all started tool calls must have matching completion events"
+        );
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let tool_result_count = messages.iter().filter(|m| m.role == Role::Tool).count();
+        assert_eq!(
+            tool_result_count, 2,
+            "synthetic tool results must be persisted"
         );
     }
 
@@ -3710,5 +4738,392 @@ mod tests {
             "cancelled run should return cancelled result"
         );
         assert_eq!(result.iterations, 0);
+    }
+
+    #[tokio::test]
+    async fn safe_batch_cancel_still_applies_after_tool_hook_for_completed_results() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                "safe_slow",
+                "safe slow",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "safe_slow",
+                    delay_ms: 200,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![tool_use_response("t1", "safe_slow", "{}")];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let mut hooks = HookRegistry::new();
+        hooks
+            .register(
+                HookPoint::AfterToolCall,
+                100,
+                "sanitize",
+                Arc::new(OverrideToolOutputHook),
+                5000,
+            )
+            .unwrap();
+        let runtime = runtime.with_hooks(Arc::new(RwLock::new(hooks)));
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        let cancel_for_task = cancel.clone();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("run"),
+            default_agent(),
+            cancel_for_task,
+        );
+
+        let mut saw_start = false;
+        let mut saw_cancel_done = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { tool_use_id, .. } if tool_use_id == "t1" => {
+                    saw_start = true;
+                    cancel.cancel();
+                }
+                ChatEvent::Done {
+                    stop_reason: StopReason::Cancelled,
+                    ..
+                } => {
+                    saw_cancel_done = true;
+                    break;
+                }
+                ChatEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(saw_start, "expected ToolStart before cancellation");
+        assert!(saw_cancel_done, "expected Done(cancelled) event");
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.cancelled, "run should return cancelled result");
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let tool_result = messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("tool_result should be persisted on cancel");
+        match &tool_result.content[0] {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => {
+                assert_eq!(content, "sanitized");
+                assert!(!is_error, "hook should be able to clear error flag");
+            }
+            _ => panic!("expected ToolResult"),
+        }
+    }
+
+    #[tokio::test]
+    async fn safe_batch_cancel_respects_interrupt_behavior_per_tool() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                "safe_block",
+                "safe blocking tool",
+                empty_schema.clone(),
+                Arc::new(DelayedInternalTool {
+                    name: "safe_block",
+                    delay_ms: 120,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Block,
+                }),
+            )
+            .unwrap();
+        registry
+            .register_internal(
+                "safe_cancel",
+                "safe cancelable tool",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "safe_cancel",
+                    delay_ms: 350,
+                    concurrent_safe: true,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![vec![
+            CompletionDelta {
+                text: None,
+                thinking: None,
+                tool_use: Some(encmind_core::traits::ToolUseDelta {
+                    id: "t1".into(),
+                    name: "safe_block".into(),
+                    input_json: "{}".into(),
+                }),
+                finish_reason: None,
+            },
+            CompletionDelta {
+                text: None,
+                thinking: None,
+                tool_use: Some(encmind_core::traits::ToolUseDelta {
+                    id: "t2".into(),
+                    name: "safe_cancel".into(),
+                    input_json: "{}".into(),
+                }),
+                finish_reason: Some(FinishReason::ToolUse),
+            },
+        ]];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("run"),
+            default_agent(),
+            cancel.clone(),
+        );
+
+        let mut saw_t1_start = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { tool_use_id, .. } if tool_use_id == "t1" => {
+                    saw_t1_start = true;
+                    cancel.cancel();
+                }
+                ChatEvent::Done {
+                    stop_reason: StopReason::Cancelled,
+                    ..
+                } => break,
+                ChatEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_t1_start,
+            "expected safe_block ToolStart before cancellation"
+        );
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.cancelled, "run should return cancelled result");
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let mut by_tool_use_id: HashMap<String, (String, bool)> = HashMap::new();
+        for msg in messages.iter().filter(|m| m.role == Role::Tool) {
+            if let ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } = &msg.content[0]
+            {
+                by_tool_use_id.insert(tool_use_id.clone(), (content.clone(), *is_error));
+            }
+        }
+
+        let (block_output, block_error) = by_tool_use_id
+            .get("t1")
+            .expect("expected tool_result for blocking tool");
+        assert_eq!(block_output, "safe_block");
+        assert!(
+            !block_error,
+            "blocking tool should finish normally after cancellation"
+        );
+
+        let (cancel_output, cancel_error) = by_tool_use_id
+            .get("t2")
+            .expect("expected tool_result for cancelable tool");
+        assert!(cancel_output.contains("request cancelled"));
+        assert!(
+            *cancel_error,
+            "cancelable tool should be short-circuited as error on cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupt_behavior_override_applies_by_tool_name() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                "seq_cancel",
+                "sequential cancelable tool",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "seq_cancel",
+                    delay_ms: 120,
+                    concurrent_safe: false,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(
+            vec![tool_use_response("t1", "seq_cancel", "{}")],
+            128_000,
+        ));
+        let store = Arc::new(InMemorySessionStore::new());
+        let mut config = RuntimeConfig {
+            max_tool_iterations: 10,
+            ..Default::default()
+        };
+        config
+            .per_tool_interrupt_behavior
+            .insert("seq_cancel".to_string(), ToolInterruptBehavior::Block);
+        config.blocking_tool_cancel_grace = Duration::from_millis(250);
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            config,
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("run"),
+            default_agent(),
+            cancel.clone(),
+        );
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { tool_use_id, .. } if tool_use_id == "t1" => {
+                    cancel.cancel();
+                }
+                ChatEvent::Done {
+                    stop_reason: StopReason::Cancelled,
+                    ..
+                }
+                | ChatEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.cancelled, "run should return cancelled result");
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let (output, is_error) = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .find_map(|m| match &m.content[0] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == "t1" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("expected tool_result for override test");
+        assert_eq!(output, "seq_cancel");
+        assert!(!is_error, "override should force blocking behavior");
+    }
+
+    #[tokio::test]
+    async fn blocking_tool_cancel_grace_fail_closes() {
+        let mut registry = ToolRegistry::new();
+        let empty_schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                "seq_block",
+                "sequential blocking tool",
+                empty_schema,
+                Arc::new(DelayedInternalTool {
+                    name: "seq_block",
+                    delay_ms: 1_000,
+                    concurrent_safe: false,
+                    interrupt_behavior: ToolInterruptBehavior::Block,
+                }),
+            )
+            .unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(
+            vec![tool_use_response("t1", "seq_block", "{}")],
+            128_000,
+        ));
+        let store = Arc::new(InMemorySessionStore::new());
+        let config = RuntimeConfig {
+            max_tool_iterations: 10,
+            blocking_tool_cancel_grace: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            config,
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let cancel = CancellationToken::new();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("run"),
+            default_agent(),
+            cancel.clone(),
+        );
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { tool_use_id, .. } if tool_use_id == "t1" => {
+                    cancel.cancel();
+                }
+                ChatEvent::Done {
+                    stop_reason: StopReason::Cancelled,
+                    ..
+                }
+                | ChatEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(result.cancelled, "run should return cancelled result");
+
+        let messages = store
+            .get_messages(&session.id, Pagination::default())
+            .await
+            .unwrap();
+        let (output, is_error) = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .find_map(|m| match &m.content[0] {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == "t1" => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .expect("expected tool_result for blocking timeout test");
+        assert!(output.contains("cancel grace"));
+        assert!(
+            is_error,
+            "blocking tool timeout should fail-close with an error result"
+        );
     }
 }

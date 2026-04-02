@@ -2075,6 +2075,10 @@ struct DigestSummarizeHandler {
 
 #[async_trait]
 impl InternalToolHandler for DigestSummarizeHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
@@ -2123,6 +2127,10 @@ struct DigestUrlHandler {
 
 #[async_trait]
 impl InternalToolHandler for DigestUrlHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
@@ -2211,6 +2219,10 @@ struct DigestFileHandler {
 
 #[async_trait]
 impl InternalToolHandler for DigestFileHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
@@ -2376,6 +2388,10 @@ async fn ensure_whisper_client(
 
 #[async_trait]
 impl InternalToolHandler for DigestTranscribeHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        false // Resource-intensive external Whisper API call
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,
@@ -2478,6 +2494,10 @@ struct DigestListFilesHandler {
 
 #[async_trait]
 impl InternalToolHandler for DigestListFilesHandler {
+    fn is_concurrent_safe(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         input: serde_json::Value,

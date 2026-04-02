@@ -435,6 +435,33 @@ pub trait InternalToolHandler: Send + Sync {
         session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<String, AppError>;
+
+    /// Whether this tool is safe for concurrent execution with other safe tools.
+    ///
+    /// Read-only tools (search, fetch, file read, list) should return `true`.
+    /// Destructive tools (file write, bash, git commit) should return `false`.
+    /// Default is `false` (sequential execution).
+    fn is_concurrent_safe(&self) -> bool {
+        false
+    }
+
+    /// How this tool behaves when the user cancels an in-flight run.
+    ///
+    /// - `Cancel`: pending executions may be short-circuited with a synthetic
+    ///   cancelled result.
+    /// - `Block`: once scheduled, runtime waits for completion and persists the
+    ///   real tool result before finishing cancellation.
+    ///
+    /// Default is `Cancel` to preserve legacy behavior.
+    fn interrupt_behavior(&self) -> ToolInterruptBehavior {
+        ToolInterruptBehavior::Cancel
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolInterruptBehavior {
+    Cancel,
+    Block,
 }
 
 #[async_trait]

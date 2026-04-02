@@ -324,7 +324,14 @@ pub async fn handle_send(
         token_count: None,
     };
 
-    let (max_context_memories, api_provider_disclosure, tok_config, bash_mode, tool_calls_per_run) = {
+    let (
+        max_context_memories,
+        api_provider_disclosure,
+        tok_config,
+        bash_mode,
+        tool_calls_per_run,
+        max_parallel_safe_tools,
+    ) = {
         let config = state.config.read().await;
         let disclosure = match &config.llm.mode {
             encmind_core::config::InferenceMode::ApiProvider { provider } => Some(provider.clone()),
@@ -336,6 +343,7 @@ pub async fn handle_send(
             config.token_optimization.clone(),
             config.security.bash_mode.clone(),
             config.security.rate_limit.tool_calls_per_run,
+            config.agent_pool.max_concurrent_agents as usize,
         )
     };
 
@@ -356,6 +364,7 @@ pub async fn handle_send(
             ..ContextConfig::default()
         },
         tool_calls_per_run: Some(tool_calls_per_run),
+        max_parallel_safe_tools,
         ..RuntimeConfig::default()
     };
 

@@ -4119,6 +4119,7 @@ pub(crate) fn initialize_tool_registry(
                 ..ContextConfig::default()
             },
             tool_calls_per_run: Some(config.security.rate_limit.tool_calls_per_run),
+            max_parallel_safe_tools: config.agent_pool.max_concurrent_agents as usize,
             ..RuntimeConfig::default()
         };
 

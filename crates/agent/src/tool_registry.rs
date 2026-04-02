@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use encmind_core::error::{AppError, McpError};
-use encmind_core::traits::{McpClient, Skill, ToolDefinition};
+use encmind_core::traits::{McpClient, Skill, ToolDefinition, ToolInterruptBehavior};
 use encmind_core::types::{AgentId, SessionId};
 use sha2::{Digest, Sha256};
 
@@ -29,6 +29,10 @@ struct RegisteredTool {
     /// Original tool name on the remote server (MCP tools only).
     /// Used for dispatch: we call the server with this name, not the namespaced key.
     remote_tool_name: Option<String>,
+    /// Whether this tool is safe for concurrent execution with other safe tools.
+    concurrent_safe: bool,
+    /// How this tool behaves when a run is cancelled mid-turn.
+    interrupt_behavior: ToolInterruptBehavior,
 }
 
 /// Validate a tool or alias name.
@@ -191,6 +195,8 @@ impl ToolRegistry {
                 },
                 skill_id: None,
                 remote_tool_name: None,
+                concurrent_safe: false, // WASM skills default to sequential
+                interrupt_behavior: ToolInterruptBehavior::Cancel,
             },
         );
         Ok(())
@@ -258,6 +264,8 @@ impl ToolRegistry {
                     },
                     skill_id: None,
                     remote_tool_name: Some(tool.name),
+                    concurrent_safe: false, // MCP tools default to sequential
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
                 },
             );
         }
@@ -278,6 +286,8 @@ impl ToolRegistry {
                 "duplicate tool name '{name}' during internal registration"
             )));
         }
+        let concurrent_safe = handler.is_concurrent_safe();
+        let interrupt_behavior = handler.interrupt_behavior();
         self.tools.insert(
             name.to_owned(),
             RegisteredTool {
@@ -289,6 +299,8 @@ impl ToolRegistry {
                 },
                 skill_id: None,
                 remote_tool_name: None,
+                concurrent_safe,
+                interrupt_behavior,
             },
         );
         Ok(())
@@ -312,6 +324,8 @@ impl ToolRegistry {
                 "duplicate tool name '{name}' during skill tool registration"
             )));
         }
+        let concurrent_safe = handler.is_concurrent_safe();
+        let interrupt_behavior = handler.interrupt_behavior();
         self.tools.insert(
             name.to_owned(),
             RegisteredTool {
@@ -323,6 +337,8 @@ impl ToolRegistry {
                 },
                 skill_id: Some(skill_id.to_owned()),
                 remote_tool_name: None,
+                concurrent_safe,
+                interrupt_behavior,
             },
         );
         Ok(())
@@ -387,6 +403,28 @@ impl ToolRegistry {
     /// Get tool definitions for LLM completion params.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
         self.tools.values().map(|t| t.definition.clone()).collect()
+    }
+
+    /// Check if a tool is safe for concurrent execution.
+    ///
+    /// Aliases are resolved transparently.
+    pub fn is_tool_concurrent_safe(&self, name: &str) -> bool {
+        let resolved = self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name);
+        self.tools
+            .get(resolved)
+            .map(|t| t.concurrent_safe)
+            .unwrap_or(false)
+    }
+
+    /// Interrupt behavior for a tool when a run cancellation is requested.
+    ///
+    /// Aliases are resolved transparently. Unknown tools default to `Cancel`.
+    pub fn tool_interrupt_behavior(&self, name: &str) -> ToolInterruptBehavior {
+        let resolved = self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name);
+        self.tools
+            .get(resolved)
+            .map(|t| t.interrupt_behavior)
+            .unwrap_or(ToolInterruptBehavior::Cancel)
     }
 
     /// Dispatch a tool call by name. Aliases are resolved transparently.
