@@ -133,6 +133,35 @@ impl AppConfig {
         if self.agent_pool.max_concurrent_agents == 0 {
             errors.push("agent_pool.max_concurrent_agents must be > 0".to_string());
         }
+        if self.agent_pool.max_parallel_safe_tools == 0 {
+            errors.push("agent_pool.max_parallel_safe_tools must be > 0".to_string());
+        }
+        if self.security.blocking_tool_cancel_grace_secs == 0 {
+            errors.push("security.blocking_tool_cancel_grace_secs must be > 0".to_string());
+        }
+        let mut normalized_interrupt_tools: HashMap<String, String> = HashMap::new();
+        for (tool_name, behavior) in &self.security.per_tool_interrupt_behavior {
+            let canonical_tool_name = tool_name.trim().to_ascii_lowercase();
+            if canonical_tool_name.is_empty() {
+                errors.push(
+                    "security.per_tool_interrupt_behavior: tool name must not be empty".to_string(),
+                );
+                continue;
+            }
+            if let Some(existing) =
+                normalized_interrupt_tools.insert(canonical_tool_name, tool_name.clone())
+            {
+                errors.push(format!(
+                    "security.per_tool_interrupt_behavior has duplicate keys after normalization: '{existing}' and '{tool_name}'"
+                ));
+            }
+            let normalized = behavior.trim().to_ascii_lowercase();
+            if normalized != "cancel" && normalized != "block" {
+                errors.push(format!(
+                    "security.per_tool_interrupt_behavior['{tool_name}'] must be 'cancel' or 'block'"
+                ));
+            }
+        }
 
         if self.memory.enabled {
             if self.memory.embedding_dimensions == 0 {
@@ -992,10 +1021,21 @@ pub struct SecurityConfig {
     #[serde(default)]
     pub tls_lifecycle: TlsLifecycleConfig,
     pub external_vault: Option<ExternalVaultConfig>,
+    /// Per-tool interrupt behavior overrides. Keys are tool names, values are
+    /// "cancel" or "block". Overrides the handler's declared behavior.
+    #[serde(default)]
+    pub per_tool_interrupt_behavior: HashMap<String, String>,
+    /// Grace period (seconds) for Block-interrupt tools on cancellation.
+    /// After this timeout, a synthetic error result is returned.
+    #[serde(default = "default_blocking_tool_cancel_grace_secs")]
+    pub blocking_tool_cancel_grace_secs: u64,
 }
 
 fn default_audit_retention_days() -> u32 {
     7
+}
+fn default_blocking_tool_cancel_grace_secs() -> u64 {
+    10
 }
 
 impl Default for SecurityConfig {
@@ -1011,6 +1051,8 @@ impl Default for SecurityConfig {
             key_rotation: KeyRotationConfig::default(),
             tls_lifecycle: TlsLifecycleConfig::default(),
             external_vault: None,
+            per_tool_interrupt_behavior: HashMap::new(),
+            blocking_tool_cancel_grace_secs: default_blocking_tool_cancel_grace_secs(),
         }
     }
 }
@@ -1145,6 +1187,10 @@ pub struct AgentPoolConfig {
     pub max_concurrent_agents: u32,
     #[serde(default = "default_session_timeout")]
     pub per_session_timeout_secs: u64,
+    /// Maximum number of concurrent-safe tools to dispatch in parallel per turn.
+    /// Independent of max_concurrent_agents (which limits concurrent sessions).
+    #[serde(default = "default_max_parallel_safe_tools")]
+    pub max_parallel_safe_tools: usize,
 }
 
 fn default_max_concurrent_agents() -> u32 {
@@ -1153,12 +1199,16 @@ fn default_max_concurrent_agents() -> u32 {
 fn default_session_timeout() -> u64 {
     300
 }
+fn default_max_parallel_safe_tools() -> usize {
+    4
+}
 
 impl Default for AgentPoolConfig {
     fn default() -> Self {
         Self {
             max_concurrent_agents: default_max_concurrent_agents(),
             per_session_timeout_secs: default_session_timeout(),
+            max_parallel_safe_tools: default_max_parallel_safe_tools(),
         }
     }
 }
@@ -3403,6 +3453,73 @@ plugin_policy:
             errors2.iter().any(|e| e.contains("tool_calls_per_run")),
             "expected tool_calls_per_run error, got: {:?}",
             errors2
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_parallel_tool_and_interrupt_config() {
+        let mut config = valid_config();
+        config.agent_pool.max_parallel_safe_tools = 0;
+        config.security.blocking_tool_cancel_grace_secs = 0;
+        config
+            .security
+            .per_tool_interrupt_behavior
+            .insert("netprobe_fetch".to_string(), "pause".to_string());
+        config
+            .security
+            .per_tool_interrupt_behavior
+            .insert("   ".to_string(), "cancel".to_string());
+
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("agent_pool.max_parallel_safe_tools")),
+            "expected max_parallel_safe_tools error, got: {:?}",
+            errors
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("blocking_tool_cancel_grace_secs")),
+            "expected blocking_tool_cancel_grace_secs error, got: {:?}",
+            errors
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must be 'cancel' or 'block'")),
+            "expected per_tool_interrupt_behavior value error, got: {:?}",
+            errors
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("tool name must not be empty")),
+            "expected per_tool_interrupt_behavior key error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_interrupt_behavior_keys_after_normalization() {
+        let mut config = valid_config();
+        config
+            .security
+            .per_tool_interrupt_behavior
+            .insert("netprobe_fetch".to_string(), "cancel".to_string());
+        config
+            .security
+            .per_tool_interrupt_behavior
+            .insert(" NetProbe_Fetch ".to_string(), "block".to_string());
+
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate keys after normalization")),
+            "expected duplicate normalized key error, got: {:?}",
+            errors
         );
     }
 

@@ -19,6 +19,7 @@ pub mod protocol;
 pub mod query_guard;
 pub mod rate_limiter;
 pub mod routes;
+pub mod runtime_config;
 pub mod server;
 pub mod skill_timer;
 pub mod state;

@@ -295,6 +295,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
         let base_reg = Arc::new(ToolRegistry::new());
 
@@ -348,6 +349,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         let handler = SpawnAgentHandler::new(
@@ -379,6 +381,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         let handler = SpawnAgentHandler::new(
@@ -416,6 +419,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         let handler = SpawnAgentHandler::new(
@@ -457,6 +461,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         let mut allow_map = HashMap::new();
@@ -523,6 +528,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         let skill_a_calls = Arc::new(AtomicUsize::new(0));
@@ -628,6 +634,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
         let calls = Arc::new(AtomicUsize::new(0));
 
@@ -725,6 +732,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
         let calls = Arc::new(AtomicUsize::new(0));
 

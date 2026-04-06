@@ -173,6 +173,7 @@ mod tests {
         let pool = AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: max_concurrent,
             per_session_timeout_secs: timeout_secs,
+            ..Default::default()
         });
 
         let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(responses, 128_000));
@@ -214,6 +215,7 @@ mod tests {
         let pool = AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
+            ..Default::default()
         });
         assert_eq!(pool.available_permits(), 4);
     }
@@ -224,6 +226,7 @@ mod tests {
         let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 2,
             per_session_timeout_secs: 60,
+            ..Default::default()
         }));
 
         // Verify the semaphore behavior directly.
@@ -289,6 +292,7 @@ mod tests {
         let pool = AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 2,
             per_session_timeout_secs: 1, // 1 second timeout
+            ..Default::default()
         });
 
         let llm: Arc<dyn LlmBackend> = Arc::new(HangingLlmBackend);
@@ -363,6 +367,7 @@ mod tests {
         let pool = AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 1,
             per_session_timeout_secs: 1,
+            ..Default::default()
         });
 
         let llm: Arc<dyn LlmBackend> = Arc::new(HangingLlmBackend);

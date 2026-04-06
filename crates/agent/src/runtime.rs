@@ -1082,6 +1082,17 @@ impl AgentRuntime {
         }
     }
 
+    async fn emit_remaining_safe_batch_completions(
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+        prepared: &[(String, String, PreparedToolCall)],
+        start_order: usize,
+        output: &str,
+    ) {
+        for (tool_use_id, tool_name, _) in prepared.iter().skip(start_order) {
+            Self::emit_tool_complete_event(event_tx, tool_use_id, tool_name, output, true).await;
+        }
+    }
+
     async fn invoke_after_tool_call_deny_hook(
         &self,
         session_id: &SessionId,
@@ -1353,11 +1364,22 @@ impl AgentRuntime {
     }
 
     fn resolve_tool_interrupt_behavior(&self, tool_name: &str) -> ToolInterruptBehavior {
-        self.config
-            .per_tool_interrupt_behavior
-            .get(tool_name)
-            .copied()
-            .unwrap_or_else(|| self.tool_registry.tool_interrupt_behavior(tool_name))
+        let overrides = &self.config.per_tool_interrupt_behavior;
+        if let Some(behavior) = overrides.get(tool_name).copied() {
+            return behavior;
+        }
+        let normalized = tool_name.trim().to_ascii_lowercase();
+        if let Some(behavior) = overrides.get(normalized.as_str()).copied() {
+            return behavior;
+        }
+        // Backward-compat path for in-memory configs that still carry raw keys.
+        if let Some((_, behavior)) = overrides
+            .iter()
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(normalized.as_str()))
+        {
+            return *behavior;
+        }
+        self.tool_registry.tool_interrupt_behavior(tool_name)
     }
 
     fn normalize_dispatch_outcome(
@@ -1637,23 +1659,37 @@ impl AgentRuntime {
                                     (input.clone(), hook_output, hook_error)
                                 }
                                 Err(e) => {
-                                    self.persist_completed_tool_call(
-                                        session_id,
-                                        state.tool_calls,
-                                        CompletedToolCall {
-                                            tool_use_id: id.clone(),
-                                            tool_name: name.clone(),
-                                            input: input.clone(),
-                                            output: format!("Error: hook aborted — {e}"),
-                                            is_error: true,
-                                        },
-                                        state.event_tx,
-                                    )
-                                    .await?;
+                                    if let Err(persist_err) = self
+                                        .persist_completed_tool_call(
+                                            session_id,
+                                            state.tool_calls,
+                                            CompletedToolCall {
+                                                tool_use_id: id.clone(),
+                                                tool_name: name.clone(),
+                                                input: input.clone(),
+                                                output: format!("Error: hook aborted — {e}"),
+                                                is_error: true,
+                                            },
+                                            state.event_tx,
+                                        )
+                                        .await
+                                    {
+                                        Self::emit_remaining_safe_batch_completions(
+                                            state.event_tx,
+                                            &prepared,
+                                            next_order_to_persist + 1,
+                                            "Error: aborted due to persistence failure",
+                                        )
+                                        .await;
+                                        return Err(persist_err);
+                                    }
                                     let _ = state.loop_detector.record_and_check(name, true);
 
-                                    for (remaining_id, remaining_name, remaining_prepared_call) in
-                                        prepared.iter().skip(next_order_to_persist + 1)
+                                    for (
+                                        remaining_order,
+                                        (remaining_id, remaining_name, remaining_prepared_call),
+                                    ) in
+                                        prepared.iter().enumerate().skip(next_order_to_persist + 1)
                                     {
                                         let remaining_input = match remaining_prepared_call {
                                             PreparedToolCall::Ready { input } => input.clone(),
@@ -1661,7 +1697,8 @@ impl AgentRuntime {
                                                 input.clone()
                                             }
                                         };
-                                        self.persist_completed_tool_call(
+                                        if let Err(persist_err) = self
+                                            .persist_completed_tool_call(
                                             session_id,
                                             state.tool_calls,
                                             CompletedToolCall {
@@ -1675,7 +1712,17 @@ impl AgentRuntime {
                                             },
                                             state.event_tx,
                                         )
-                                        .await?;
+                                        .await
+                                        {
+                                            Self::emit_remaining_safe_batch_completions(
+                                                state.event_tx,
+                                                &prepared,
+                                                remaining_order + 1,
+                                                "Error: aborted due to persistence failure",
+                                            )
+                                            .await;
+                                            return Err(persist_err);
+                                        }
                                         let _ = state
                                             .loop_detector
                                             .record_and_check(remaining_name, true);
@@ -1686,19 +1733,30 @@ impl AgentRuntime {
                         }
                     };
 
-                    self.persist_completed_tool_call(
-                        session_id,
-                        state.tool_calls,
-                        CompletedToolCall {
-                            tool_use_id: id.clone(),
-                            tool_name: name.clone(),
-                            input,
-                            output,
-                            is_error,
-                        },
-                        state.event_tx,
-                    )
-                    .await?;
+                    if let Err(persist_err) = self
+                        .persist_completed_tool_call(
+                            session_id,
+                            state.tool_calls,
+                            CompletedToolCall {
+                                tool_use_id: id.clone(),
+                                tool_name: name.clone(),
+                                input,
+                                output,
+                                is_error,
+                            },
+                            state.event_tx,
+                        )
+                        .await
+                    {
+                        Self::emit_remaining_safe_batch_completions(
+                            state.event_tx,
+                            &prepared,
+                            next_order_to_persist + 1,
+                            "Error: aborted due to persistence failure",
+                        )
+                        .await;
+                        return Err(persist_err);
+                    }
 
                     let violation = state.loop_detector.record_and_check(name, is_error);
                     if loop_violation.is_none() {
@@ -1726,7 +1784,13 @@ impl AgentRuntime {
                 match next_result {
                     Some((order, tool_name, output, is_error)) => {
                         if is_error {
-                            warn!(order, tool = %tool_name, "parallel tool dispatch failed");
+                            let preview: String = output.chars().take(200).collect();
+                            warn!(
+                                order,
+                                tool = %tool_name,
+                                error = %preview,
+                                "parallel tool dispatch failed"
+                            );
                         }
                         dispatch_results_by_order.insert(order, (output, is_error));
                     }
@@ -1790,42 +1854,66 @@ impl AgentRuntime {
                     {
                         Ok((hook_output, hook_error)) => (input.clone(), hook_output, hook_error),
                         Err(e) => {
-                            self.persist_completed_tool_call(
-                                session_id,
-                                state.tool_calls,
-                                CompletedToolCall {
-                                    tool_use_id: id.clone(),
-                                    tool_name: name.clone(),
-                                    input: input.clone(),
-                                    output: format!("Error: hook aborted — {e}"),
-                                    is_error: true,
-                                },
-                                state.event_tx,
-                            )
-                            .await?;
+                            if let Err(persist_err) = self
+                                .persist_completed_tool_call(
+                                    session_id,
+                                    state.tool_calls,
+                                    CompletedToolCall {
+                                        tool_use_id: id.clone(),
+                                        tool_name: name.clone(),
+                                        input: input.clone(),
+                                        output: format!("Error: hook aborted — {e}"),
+                                        is_error: true,
+                                    },
+                                    state.event_tx,
+                                )
+                                .await
+                            {
+                                Self::emit_remaining_safe_batch_completions(
+                                    state.event_tx,
+                                    &prepared,
+                                    next_order_to_persist + 1,
+                                    "Error: aborted due to persistence failure",
+                                )
+                                .await;
+                                return Err(persist_err);
+                            }
                             let _ = state.loop_detector.record_and_check(name, true);
 
-                            for (remaining_id, remaining_name, remaining_prepared_call) in
-                                prepared.iter().skip(next_order_to_persist + 1)
+                            for (
+                                remaining_order,
+                                (remaining_id, remaining_name, remaining_prepared_call),
+                            ) in prepared.iter().enumerate().skip(next_order_to_persist + 1)
                             {
                                 let remaining_input = match remaining_prepared_call {
                                     PreparedToolCall::Ready { input } => input.clone(),
                                     PreparedToolCall::Finalized { input, .. } => input.clone(),
                                 };
-                                self.persist_completed_tool_call(
-                                    session_id,
-                                    state.tool_calls,
-                                    CompletedToolCall {
-                                        tool_use_id: remaining_id.clone(),
-                                        tool_name: remaining_name.clone(),
-                                        input: remaining_input,
-                                        output: "Error: aborted by hook (sibling tool abort)"
-                                            .to_string(),
-                                        is_error: true,
-                                    },
-                                    state.event_tx,
-                                )
-                                .await?;
+                                if let Err(persist_err) = self
+                                    .persist_completed_tool_call(
+                                        session_id,
+                                        state.tool_calls,
+                                        CompletedToolCall {
+                                            tool_use_id: remaining_id.clone(),
+                                            tool_name: remaining_name.clone(),
+                                            input: remaining_input,
+                                            output: "Error: aborted by hook (sibling tool abort)"
+                                                .to_string(),
+                                            is_error: true,
+                                        },
+                                        state.event_tx,
+                                    )
+                                    .await
+                                {
+                                    Self::emit_remaining_safe_batch_completions(
+                                        state.event_tx,
+                                        &prepared,
+                                        remaining_order + 1,
+                                        "Error: aborted due to persistence failure",
+                                    )
+                                    .await;
+                                    return Err(persist_err);
+                                }
                                 let _ = state.loop_detector.record_and_check(remaining_name, true);
                             }
                             return Err(e);
@@ -1834,19 +1922,30 @@ impl AgentRuntime {
                 }
             };
 
-            self.persist_completed_tool_call(
-                session_id,
-                state.tool_calls,
-                CompletedToolCall {
-                    tool_use_id: id.clone(),
-                    tool_name: name.clone(),
-                    input,
-                    output,
-                    is_error,
-                },
-                state.event_tx,
-            )
-            .await?;
+            if let Err(persist_err) = self
+                .persist_completed_tool_call(
+                    session_id,
+                    state.tool_calls,
+                    CompletedToolCall {
+                        tool_use_id: id.clone(),
+                        tool_name: name.clone(),
+                        input,
+                        output,
+                        is_error,
+                    },
+                    state.event_tx,
+                )
+                .await
+            {
+                Self::emit_remaining_safe_batch_completions(
+                    state.event_tx,
+                    &prepared,
+                    next_order_to_persist + 1,
+                    "Error: aborted due to persistence failure",
+                )
+                .await;
+                return Err(persist_err);
+            }
 
             let violation = state.loop_detector.record_and_check(name, is_error);
             if loop_violation.is_none() {
@@ -1876,15 +1975,6 @@ impl AgentRuntime {
             is_error: completed.is_error,
         });
 
-        Self::emit_tool_complete_event(
-            event_tx,
-            &completed.tool_use_id,
-            &completed.tool_name,
-            &completed.output,
-            completed.is_error,
-        )
-        .await;
-
         let limit = self
             .config
             .per_tool_output_chars
@@ -1905,7 +1995,7 @@ impl AgentRuntime {
             id: MessageId::new(),
             role: Role::Tool,
             content: vec![ContentBlock::ToolResult {
-                tool_use_id: completed.tool_use_id,
+                tool_use_id: completed.tool_use_id.clone(),
                 content: persisted_output,
                 is_error: completed.is_error,
             }],
@@ -1913,9 +2003,37 @@ impl AgentRuntime {
             token_count: None,
         };
 
-        self.session_store
+        // Persist before emitting ToolComplete. If persistence fails, emit a
+        // synthetic ToolComplete error to preserve start/complete pairing.
+        match self
+            .session_store
             .append_message(session_id, &tool_result_msg)
-            .await?;
+            .await
+        {
+            Ok(()) => {
+                Self::emit_tool_complete_event(
+                    event_tx,
+                    &completed.tool_use_id,
+                    &completed.tool_name,
+                    &completed.output,
+                    completed.is_error,
+                )
+                .await;
+            }
+            Err(e) => {
+                let emit_output = format!("Error: failed to persist tool result — {e}");
+                Self::emit_tool_complete_event(
+                    event_tx,
+                    &completed.tool_use_id,
+                    &completed.tool_name,
+                    &emit_output,
+                    true,
+                )
+                .await;
+                return Err(e.into());
+            }
+        }
+
         Ok(())
     }
 
@@ -4987,7 +5105,7 @@ mod tests {
         };
         config
             .per_tool_interrupt_behavior
-            .insert("seq_cancel".to_string(), ToolInterruptBehavior::Block);
+            .insert(" Seq_Cancel ".to_string(), ToolInterruptBehavior::Block);
         config.blocking_tool_cancel_grace = Duration::from_millis(250);
         let runtime = AgentRuntime::new(
             llm,

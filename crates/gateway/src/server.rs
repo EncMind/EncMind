@@ -65,6 +65,7 @@ use crate::plugin_api::{RegisteredPluginTimer, RegisteredPluginTransform};
 use crate::plugin_manager::PluginManager;
 use crate::rate_limiter::SessionRateLimiter;
 use crate::routes::build_router;
+use crate::runtime_config::parse_tool_interrupt_behavior_map;
 use crate::skill_timer::{
     reconcile_all_timers, SkillTimerLimits, SkillTimerRunner, SkillTimerRuntimeSpec,
     TimerWasmDependencies,
@@ -4119,7 +4120,13 @@ pub(crate) fn initialize_tool_registry(
                 ..ContextConfig::default()
             },
             tool_calls_per_run: Some(config.security.rate_limit.tool_calls_per_run),
-            max_parallel_safe_tools: config.agent_pool.max_concurrent_agents as usize,
+            max_parallel_safe_tools: config.agent_pool.max_parallel_safe_tools,
+            per_tool_interrupt_behavior: parse_tool_interrupt_behavior_map(
+                &config.security.per_tool_interrupt_behavior,
+            ),
+            blocking_tool_cancel_grace: std::time::Duration::from_secs(
+                config.security.blocking_tool_cancel_grace_secs,
+            ),
             ..RuntimeConfig::default()
         };
 
