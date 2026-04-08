@@ -4127,6 +4127,7 @@ pub(crate) fn initialize_tool_registry(
             blocking_tool_cancel_grace: std::time::Duration::from_secs(
                 config.security.blocking_tool_cancel_grace_secs,
             ),
+            workspace_trust: config.security.workspace_trust.clone(),
             ..RuntimeConfig::default()
         };
 

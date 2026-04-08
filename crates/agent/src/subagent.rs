@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -140,11 +141,13 @@ impl InternalToolHandler for SpawnAgentHandler {
         // Build a sub-runtime WITHOUT the spawn tool (single-level enforcement).
         // Also enforce per-agent skill tool filtering.
         let sub_registry = self.base_registry.filtered_for_agent(&agent_config.skills);
+        let mut sub_runtime_config = self.runtime_config.clone();
+        sub_runtime_config.workspace_dir = agent_config.workspace.as_ref().map(PathBuf::from);
         let mut sub_runtime = AgentRuntime::new(
             self.llm.clone(),
             self.session_store.clone(),
             Arc::new(sub_registry),
-            self.runtime_config.clone(),
+            sub_runtime_config,
         );
         if let Some(ref firewall) = self.firewall {
             sub_runtime = sub_runtime.with_firewall(firewall.clone());
@@ -188,7 +191,9 @@ impl InternalToolHandler for SpawnAgentHandler {
             )
             .await?;
 
-        // Extract the text response
+        // Extract the text response first. If workspace trust blocked one or more
+        // subagent tools, preserve this partial response in the propagated error
+        // so the parent agent can still use recovered context.
         let response_text = result
             .response
             .content
@@ -199,6 +204,29 @@ impl InternalToolHandler for SpawnAgentHandler {
             })
             .collect::<Vec<_>>()
             .join("\n");
+
+        let denied_tools: Vec<String> = result
+            .tool_calls
+            .iter()
+            .filter(|call| call.deny_reason.as_deref() == Some("workspace_untrusted"))
+            .map(|call| call.name.clone())
+            .collect();
+        if !denied_tools.is_empty() {
+            let mut detail = format!(
+                "subagent '{}' blocked by workspace trust policy for tools: {}",
+                target_agent_id,
+                denied_tools.join(", ")
+            );
+            let trimmed = response_text.trim();
+            if !trimmed.is_empty() {
+                detail.push_str("\npartial subagent response:\n");
+                detail.push_str(trimmed);
+            }
+            return Err(AppError::ToolDenied {
+                reason: "workspace_untrusted".to_string(),
+                message: detail,
+            });
+        }
 
         Ok(response_text)
     }
@@ -811,6 +839,97 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "bash_exec should NOT have been called during spawn 2 (still 1 from spawn 1)"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_applies_workspace_trust_gate_for_target_agent_workspace() {
+        struct CountingBashHandler {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl InternalToolHandler for CountingBashHandler {
+            async fn handle(
+                &self,
+                _input: serde_json::Value,
+                _session_id: &SessionId,
+                _agent_id: &AgentId,
+            ) -> Result<String, AppError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("ran".into())
+            }
+        }
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(
+            vec![
+                tool_use_response("t1", "bash_exec", r#"{"command":"ls"}"#),
+                text_response("done"),
+            ],
+            128_000,
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let trusted_root = tempfile::tempdir().unwrap();
+        let untrusted_workspace = tempfile::tempdir().unwrap();
+        let mut researcher = researcher_config();
+        researcher.workspace = Some(untrusted_workspace.path().display().to_string());
+        let registry: Arc<dyn AgentRegistry> = Arc::new(TestAgentRegistry::new(vec![researcher]));
+        let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
+            max_concurrent_agents: 4,
+            per_session_timeout_secs: 60,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mut base_registry = ToolRegistry::new();
+        base_registry
+            .register_internal(
+                "bash_exec",
+                "bash tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                }),
+                Arc::new(CountingBashHandler {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+
+        let mut runtime_config = RuntimeConfig::default();
+        runtime_config.workspace_trust.trusted_paths = vec![trusted_root.path().to_path_buf()];
+        runtime_config.workspace_trust.untrusted_default = "readonly".to_string();
+
+        let handler = SpawnAgentHandler::new(
+            llm,
+            store,
+            registry,
+            pool,
+            Arc::new(base_registry),
+            runtime_config,
+        );
+
+        let result = handler
+            .handle(
+                serde_json::json!({"agent_id": "researcher", "task": "run bash"}),
+                &SessionId::new(),
+                &AgentId::default(),
+            )
+            .await;
+        assert!(result.is_err());
+        let output = result.err().unwrap().to_string();
+        assert!(
+            output.contains("workspace_untrusted"),
+            "expected workspace_untrusted deny reason, got: {output}"
+        );
+        assert!(
+            output.contains("partial subagent response"),
+            "expected partial response details in propagated error, got: {output}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "bash_exec should be blocked by workspace trust in untrusted workspace"
         );
     }
 }

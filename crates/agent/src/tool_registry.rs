@@ -409,7 +409,7 @@ impl ToolRegistry {
     ///
     /// Aliases are resolved transparently.
     pub fn is_tool_concurrent_safe(&self, name: &str) -> bool {
-        let resolved = self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name);
+        let resolved = self.resolve_tool_name(name);
         self.tools
             .get(resolved)
             .map(|t| t.concurrent_safe)
@@ -420,11 +420,18 @@ impl ToolRegistry {
     ///
     /// Aliases are resolved transparently. Unknown tools default to `Cancel`.
     pub fn tool_interrupt_behavior(&self, name: &str) -> ToolInterruptBehavior {
-        let resolved = self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name);
+        let resolved = self.resolve_tool_name(name);
         self.tools
             .get(resolved)
             .map(|t| t.interrupt_behavior)
             .unwrap_or(ToolInterruptBehavior::Cancel)
+    }
+
+    /// Resolve a tool name to its canonical registered tool name.
+    ///
+    /// If `name` is an alias, returns the alias target. Otherwise returns `name`.
+    pub fn resolve_tool_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name)
     }
 
     /// Dispatch a tool call by name. Aliases are resolved transparently.
@@ -436,7 +443,7 @@ impl ToolRegistry {
         session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<String, AppError> {
-        let resolved = self.aliases.get(name).map(|s| s.as_str()).unwrap_or(name);
+        let resolved = self.resolve_tool_name(name);
         let tool = self
             .tools
             .get(resolved)
@@ -1022,6 +1029,17 @@ mod tests {
         reg.register_skill(Arc::new(TestEchoSkill)).unwrap();
         reg.register_alias("echo.v1", "echo").unwrap();
         assert!(reg.has_tool("echo.v1"));
+    }
+
+    #[test]
+    fn resolve_tool_name_returns_canonical_target_for_aliases() {
+        let mut reg = ToolRegistry::new();
+        reg.register_skill(Arc::new(TestEchoSkill)).unwrap();
+        reg.register_alias("echo_alias", "echo").unwrap();
+
+        assert_eq!(reg.resolve_tool_name("echo_alias"), "echo");
+        assert_eq!(reg.resolve_tool_name("echo"), "echo");
+        assert_eq!(reg.resolve_tool_name("missing_tool"), "missing_tool");
     }
 
     #[tokio::test]

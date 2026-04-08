@@ -61,6 +61,9 @@ pub struct RuntimeConfig {
     /// How long to wait for a `Block` tool to finish after cancellation
     /// before fail-closing with an error result.
     pub blocking_tool_cancel_grace: Duration,
+    /// Workspace trust configuration. When set, tools are filtered based on
+    /// whether `workspace_dir` is in the trusted set.
+    pub workspace_trust: encmind_core::config::WorkspaceTrustConfig,
 }
 
 impl Default for RuntimeConfig {
@@ -78,6 +81,7 @@ impl Default for RuntimeConfig {
             max_parallel_safe_tools: DEFAULT_MAX_PARALLEL_SAFE_TOOLS,
             per_tool_interrupt_behavior: HashMap::new(),
             blocking_tool_cancel_grace: Duration::from_secs(10),
+            workspace_trust: encmind_core::config::WorkspaceTrustConfig::default(),
         }
     }
 }
@@ -89,6 +93,7 @@ pub struct ToolCallRecord {
     pub input: serde_json::Value,
     pub output: String,
     pub is_error: bool,
+    pub deny_reason: Option<String>,
 }
 
 /// Streaming events emitted during an agent run.
@@ -173,6 +178,7 @@ enum PreparedToolCall {
         input: serde_json::Value,
         output: String,
         is_error: bool,
+        deny_reason: Option<String>,
     },
 }
 
@@ -182,6 +188,7 @@ struct CompletedToolCall {
     input: serde_json::Value,
     output: String,
     is_error: bool,
+    deny_reason: Option<String>,
 }
 
 struct DenyHookDetails<'a> {
@@ -722,6 +729,7 @@ impl AgentRuntime {
                             input,
                             output,
                             is_error,
+                            deny_reason,
                         }) => {
                             Self::emit_tool_start_event(&event_tx, id, name, &input).await;
                             self.persist_completed_tool_call(
@@ -733,6 +741,7 @@ impl AgentRuntime {
                                     input,
                                     output,
                                     is_error,
+                                    deny_reason,
                                 },
                                 &event_tx,
                             )
@@ -757,10 +766,10 @@ impl AgentRuntime {
                         Ok(PreparedToolCall::Ready { input }) => {
                             Self::emit_tool_start_event(&event_tx, id, name, &input).await;
                             let interrupt_behavior = self.resolve_tool_interrupt_behavior(name);
-                            let (output, is_error) = if cancel.is_cancelled()
+                            let (output, is_error, deny_reason) = if cancel.is_cancelled()
                                 && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel)
                             {
-                                ("Error: request cancelled".to_string(), true)
+                                ("Error: request cancelled".to_string(), true, None)
                             } else {
                                 let mut dispatch_future = Box::pin(self.tool_registry.dispatch(
                                     name,
@@ -771,13 +780,13 @@ impl AgentRuntime {
                                 match interrupt_behavior {
                                     ToolInterruptBehavior::Cancel => {
                                         tokio::select! {
-                                            _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true),
-                                            result = dispatch_future.as_mut() => self.normalize_dispatch_outcome(name, result),
+                                            _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
+                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, result),
                                         }
                                     }
                                     ToolInterruptBehavior::Block => {
                                         tokio::select! {
-                                            result = dispatch_future.as_mut() => self.normalize_dispatch_outcome(name, result),
+                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, result),
                                             _ = cancel.cancelled() => {
                                                 self.await_blocking_dispatch_with_grace(name, &mut dispatch_future).await
                                             },
@@ -786,7 +795,7 @@ impl AgentRuntime {
                                 }
                             };
 
-                            let (output, is_error) = match self
+                            let (output, is_error, deny_reason) = match self
                                 .apply_after_tool_call_hook(
                                     session_id,
                                     &agent_config.id,
@@ -797,7 +806,10 @@ impl AgentRuntime {
                                 )
                                 .await
                             {
-                                Ok(v) => v,
+                                Ok((hook_output, hook_error)) => {
+                                    let deny_reason = if hook_error { deny_reason } else { None };
+                                    (hook_output, hook_error, deny_reason)
+                                }
                                 Err(e) => {
                                     self.persist_completed_tool_call(
                                         session_id,
@@ -808,6 +820,7 @@ impl AgentRuntime {
                                             input: input.clone(),
                                             output: format!("Error: hook aborted — {e}"),
                                             is_error: true,
+                                            deny_reason: None,
                                         },
                                         &event_tx,
                                     )
@@ -825,6 +838,7 @@ impl AgentRuntime {
                                     input,
                                     output,
                                     is_error,
+                                    deny_reason,
                                 },
                                 &event_tx,
                             )
@@ -858,6 +872,7 @@ impl AgentRuntime {
                                     input: parsed_input.clone(),
                                     output: format!("Error: hook aborted — {e}"),
                                     is_error: true,
+                                    deny_reason: None,
                                 },
                                 &event_tx,
                             )
@@ -1159,6 +1174,45 @@ impl AgentRuntime {
                 input,
                 output,
                 is_error: true,
+                deny_reason: Some("immutable_deny_list".to_string()),
+            });
+        }
+
+        // Governance step 1b: workspace trust gate.
+        let trust_tool_name = self.tool_registry.resolve_tool_name(tool_name);
+        let trust_level = crate::workspace_trust::evaluate_trust(
+            self.config.workspace_dir.as_deref(),
+            &self.config.workspace_trust,
+        );
+        if !crate::workspace_trust::is_tool_allowed(trust_tool_name, trust_level) {
+            warn!(
+                tool = %tool_name,
+                resolved_tool = %trust_tool_name,
+                trust_level = ?trust_level,
+                workspace = ?self.config.workspace_dir,
+                "tool blocked by workspace trust policy"
+            );
+            let output = format!(
+                "Error: tool '{}' is not available in untrusted workspace",
+                tool_name
+            );
+            self.invoke_after_tool_call_deny_hook(
+                session_id,
+                agent_id,
+                tool_name,
+                &input,
+                DenyHookDetails {
+                    output: &output,
+                    deny_reason: "workspace_untrusted",
+                    risk_level: None,
+                },
+            )
+            .await;
+            return Ok(PreparedToolCall::Finalized {
+                input,
+                output,
+                is_error: true,
+                deny_reason: Some("workspace_untrusted".to_string()),
             });
         }
 
@@ -1229,6 +1283,7 @@ impl AgentRuntime {
                     input,
                     output,
                     is_error: true,
+                    deny_reason: Some("immutable_deny_list".to_string()),
                 });
             }
         }
@@ -1261,6 +1316,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error: true,
+                        deny_reason: Some("egress_firewall".to_string()),
                     });
                 }
             }
@@ -1286,6 +1342,7 @@ impl AgentRuntime {
                     input,
                     output,
                     is_error: true,
+                    deny_reason: Some("policy_denied".to_string()),
                 });
             }
 
@@ -1315,6 +1372,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error: true,
+                        deny_reason: Some("approval_denied".to_string()),
                     });
                 }
             }
@@ -1383,15 +1441,23 @@ impl AgentRuntime {
     }
 
     fn normalize_dispatch_outcome(
-        &self,
         tool_name: &str,
         dispatch_result: Result<String, AppError>,
-    ) -> (String, bool) {
+    ) -> (String, bool, Option<String>) {
         match dispatch_result {
-            Ok(result) => (result, false),
+            Ok(result) => (result, false, None),
+            Err(AppError::ToolDenied { reason, message }) => {
+                warn!(
+                    tool = %tool_name,
+                    deny_reason = %reason,
+                    message = %message,
+                    "tool dispatch denied"
+                );
+                (format!("Error: {message}"), true, Some(reason))
+            }
             Err(e) => {
                 warn!(tool = %tool_name, error = %e, "tool dispatch failed");
-                (format!("Error: {e}"), true)
+                (format!("Error: {e}"), true, None)
             }
         }
     }
@@ -1400,13 +1466,13 @@ impl AgentRuntime {
         &self,
         tool_name: &str,
         dispatch_future: &mut std::pin::Pin<Box<F>>,
-    ) -> (String, bool)
+    ) -> (String, bool, Option<String>)
     where
         F: std::future::Future<Output = Result<String, AppError>> + Send,
     {
         let grace = self.config.blocking_tool_cancel_grace;
         match tokio::time::timeout(grace, dispatch_future.as_mut()).await {
-            Ok(result) => self.normalize_dispatch_outcome(tool_name, result),
+            Ok(result) => Self::normalize_dispatch_outcome(tool_name, result),
             Err(_) => {
                 warn!(
                     tool = %tool_name,
@@ -1419,6 +1485,7 @@ impl AgentRuntime {
                         grace.as_millis()
                     ),
                     true,
+                    None,
                 )
             }
         }
@@ -1462,6 +1529,7 @@ impl AgentRuntime {
                             input: parsed_input.clone(),
                             output: format!("Error: hook aborted — {e}"),
                             is_error: true,
+                            deny_reason: None,
                         },
                         state.event_tx,
                     )
@@ -1513,7 +1581,8 @@ impl AgentRuntime {
 
         // Dispatch ready tools in bounded parallelism and keep only out-of-order
         // results in memory. As soon as a contiguous prefix is ready, persist it.
-        let mut dispatch_results_by_order: HashMap<usize, (String, bool)> = HashMap::new();
+        let mut dispatch_results_by_order: HashMap<usize, (String, bool, Option<String>)> =
+            HashMap::new();
         let mut next_order_to_persist = 0usize;
         let requested = self.config.max_parallel_safe_tools;
         let parallelism = requested.clamp(1, MAX_PARALLEL_SAFE_TOOLS_CAP);
@@ -1525,91 +1594,98 @@ impl AgentRuntime {
                 "parallel tool concurrency clamped"
             );
         }
+
         if !ready_dispatches.is_empty() {
             let mut dispatch_stream =
                 futures::stream::iter(ready_dispatches.into_iter().map(
                     |(order, name, input, interrupt_behavior)| {
-                    let tool_registry = self.tool_registry.clone();
-                    let dispatch_session_id = session_id.clone();
-                    let dispatch_agent_id = agent_id.clone();
-                    let dispatch_cancel = state.cancel.clone();
-                    let cancel_grace = self.config.blocking_tool_cancel_grace;
-                    let dispatch_name = name.clone();
-                    async move {
-                        let dispatch_future = std::panic::AssertUnwindSafe(tool_registry.dispatch(
-                            &dispatch_name,
-                            input,
-                            &dispatch_session_id,
-                            &dispatch_agent_id,
-                        ))
-                        .catch_unwind();
-                        tokio::pin!(dispatch_future);
+                        let tool_registry = self.tool_registry.clone();
+                        let dispatch_session_id = session_id.clone();
+                        let dispatch_agent_id = agent_id.clone();
+                        let dispatch_cancel = state.cancel.clone();
+                        let cancel_grace = self.config.blocking_tool_cancel_grace;
+                        let dispatch_name = name.clone();
+                        async move {
+                            let dispatch_future = std::panic::AssertUnwindSafe(tool_registry.dispatch(
+                                &dispatch_name,
+                                input,
+                                &dispatch_session_id,
+                                &dispatch_agent_id,
+                            ))
+                            .catch_unwind();
+                            tokio::pin!(dispatch_future);
 
-                        let normalize = |dispatch_result: Result<
-                            Result<String, AppError>,
-                            Box<dyn std::any::Any + Send>,
-                        >| {
-                            let dispatch_result = match dispatch_result {
-                                Ok(inner) => inner,
-                                Err(_) => Err(AppError::Internal(
-                                    "parallel tool task panicked".to_string(),
-                                )),
+                            let normalize = |dispatch_result: Result<
+                                Result<String, AppError>,
+                                Box<dyn std::any::Any + Send>,
+                            >| {
+                                let dispatch_result = match dispatch_result {
+                                    Ok(inner) => inner,
+                                    Err(_) => Err(AppError::Internal(
+                                        "parallel tool task panicked".to_string(),
+                                    )),
+                                };
+                                Self::normalize_dispatch_outcome(&dispatch_name, dispatch_result)
                             };
-                            match dispatch_result {
-                                Ok(result) => (result, false),
-                                Err(e) => (format!("Error: {e}"), true),
-                            }
-                        };
 
-                        let (output, is_error) = match interrupt_behavior {
-                            ToolInterruptBehavior::Cancel => {
-                                tokio::select! {
-                                    _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true),
-                                    result = dispatch_future.as_mut() => normalize(result),
-                                }
-                            }
-                            ToolInterruptBehavior::Block => {
-                                if dispatch_cancel.is_cancelled() {
-                                    match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
-                                        Ok(result) => normalize(result),
-                                        Err(_) => {
-                                            warn!(
-                                                tool = %name,
-                                                grace_ms = cancel_grace.as_millis(),
-                                                "blocking tool did not finish within cancel grace"
-                                            );
-                                            (
-                                                format!("Error: blocking tool did not finish within cancel grace ({}ms)", cancel_grace.as_millis()),
-                                                true,
-                                            )
-                                        },
-                                    }
-                                } else {
+                            let (output, is_error, deny_reason) = match interrupt_behavior {
+                                ToolInterruptBehavior::Cancel => {
                                     tokio::select! {
+                                        _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
                                         result = dispatch_future.as_mut() => normalize(result),
-                                        _ = dispatch_cancel.cancelled() => {
-                                            match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
-                                                Ok(result) => normalize(result),
-                                                Err(_) => {
-                                                    warn!(
-                                                        tool = %name,
-                                                        grace_ms = cancel_grace.as_millis(),
-                                                        "blocking tool did not finish within cancel grace"
-                                                    );
-                                                    (
-                                                        format!("Error: blocking tool did not finish within cancel grace ({}ms)", cancel_grace.as_millis()),
-                                                        true,
-                                                    )
-                                                },
+                                    }
+                                }
+                                ToolInterruptBehavior::Block => {
+                                    if dispatch_cancel.is_cancelled() {
+                                        match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
+                                            Ok(result) => normalize(result),
+                                            Err(_) => {
+                                                warn!(
+                                                    tool = %name,
+                                                    grace_ms = cancel_grace.as_millis(),
+                                                    "blocking tool did not finish within cancel grace"
+                                                );
+                                                (
+                                                    format!(
+                                                        "Error: blocking tool did not finish within cancel grace ({}ms)",
+                                                        cancel_grace.as_millis()
+                                                    ),
+                                                    true,
+                                                    None,
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        tokio::select! {
+                                            result = dispatch_future.as_mut() => normalize(result),
+                                            _ = dispatch_cancel.cancelled() => {
+                                                match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
+                                                    Ok(result) => normalize(result),
+                                                    Err(_) => {
+                                                        warn!(
+                                                            tool = %name,
+                                                            grace_ms = cancel_grace.as_millis(),
+                                                            "blocking tool did not finish within cancel grace"
+                                                        );
+                                                        (
+                                                            format!(
+                                                                "Error: blocking tool did not finish within cancel grace ({}ms)",
+                                                                cancel_grace.as_millis()
+                                                            ),
+                                                            true,
+                                                            None,
+                                                        )
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
-                        };
-                        (order, name, output, is_error)
-                    }
-                }))
+                            };
+                            (order, name, output, is_error, deny_reason)
+                        }
+                    },
+                ))
                 .buffer_unordered(parallelism);
 
             loop {
@@ -1625,24 +1701,35 @@ impl AgentRuntime {
                         .unwrap_or(ToolInterruptBehavior::Cancel);
                     let short_circuit_cancel = cancel_requested
                         && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
-                    let (input, output, is_error) = match prepared_call {
+
+                    let (input, output, is_error, deny_reason) = match prepared_call {
                         PreparedToolCall::Finalized {
                             input,
                             output,
                             is_error,
-                        } => (input.clone(), output.clone(), *is_error),
+                            deny_reason,
+                        } => (
+                            input.clone(),
+                            output.clone(),
+                            *is_error,
+                            deny_reason.clone(),
+                        ),
                         PreparedToolCall::Ready { input } => {
                             let maybe_dispatch =
                                 dispatch_results_by_order.remove(&next_order_to_persist);
-                            let (dispatch_output, dispatch_error) = if short_circuit_cancel {
-                                maybe_dispatch
-                                    .unwrap_or(("Error: request cancelled".to_string(), true))
-                            } else {
-                                let Some(result) = maybe_dispatch else {
-                                    break;
+                            let (dispatch_output, dispatch_error, dispatch_deny_reason) =
+                                if short_circuit_cancel {
+                                    maybe_dispatch.unwrap_or((
+                                        "Error: request cancelled".to_string(),
+                                        true,
+                                        None,
+                                    ))
+                                } else {
+                                    let Some(result) = maybe_dispatch else {
+                                        break;
+                                    };
+                                    result
                                 };
-                                result
-                            };
 
                             match self
                                 .apply_after_tool_call_hook(
@@ -1655,9 +1742,16 @@ impl AgentRuntime {
                                 )
                                 .await
                             {
-                                Ok((hook_output, hook_error)) => {
-                                    (input.clone(), hook_output, hook_error)
-                                }
+                                Ok((hook_output, hook_error)) => (
+                                    input.clone(),
+                                    hook_output,
+                                    hook_error,
+                                    if hook_error {
+                                        dispatch_deny_reason
+                                    } else {
+                                        None
+                                    },
+                                ),
                                 Err(e) => {
                                     if let Err(persist_err) = self
                                         .persist_completed_tool_call(
@@ -1669,6 +1763,7 @@ impl AgentRuntime {
                                                 input: input.clone(),
                                                 output: format!("Error: hook aborted — {e}"),
                                                 is_error: true,
+                                                deny_reason: None,
                                             },
                                             state.event_tx,
                                         )
@@ -1699,20 +1794,21 @@ impl AgentRuntime {
                                         };
                                         if let Err(persist_err) = self
                                             .persist_completed_tool_call(
-                                            session_id,
-                                            state.tool_calls,
-                                            CompletedToolCall {
-                                                tool_use_id: remaining_id.clone(),
-                                                tool_name: remaining_name.clone(),
-                                                input: remaining_input,
-                                                output:
-                                                    "Error: aborted by hook (sibling tool abort)"
-                                                        .to_string(),
-                                                is_error: true,
-                                            },
-                                            state.event_tx,
-                                        )
-                                        .await
+                                                session_id,
+                                                state.tool_calls,
+                                                CompletedToolCall {
+                                                    tool_use_id: remaining_id.clone(),
+                                                    tool_name: remaining_name.clone(),
+                                                    input: remaining_input,
+                                                    output:
+                                                        "Error: aborted by hook (sibling tool abort)"
+                                                            .to_string(),
+                                                    is_error: true,
+                                                    deny_reason: None,
+                                                },
+                                                state.event_tx,
+                                            )
+                                            .await
                                         {
                                             Self::emit_remaining_safe_batch_completions(
                                                 state.event_tx,
@@ -1743,6 +1839,7 @@ impl AgentRuntime {
                                 input,
                                 output,
                                 is_error,
+                                deny_reason,
                             },
                             state.event_tx,
                         )
@@ -1782,7 +1879,7 @@ impl AgentRuntime {
                 };
 
                 match next_result {
-                    Some((order, tool_name, output, is_error)) => {
+                    Some((order, tool_name, output, is_error, deny_reason)) => {
                         if is_error {
                             let preview: String = output.chars().take(200).collect();
                             warn!(
@@ -1792,7 +1889,7 @@ impl AgentRuntime {
                                 "parallel tool dispatch failed"
                             );
                         }
-                        dispatch_results_by_order.insert(order, (output, is_error));
+                        dispatch_results_by_order.insert(order, (output, is_error, deny_reason));
                     }
                     None => {
                         // Stream ended unexpectedly. Missing results are handled
@@ -1816,31 +1913,44 @@ impl AgentRuntime {
                 .unwrap_or(ToolInterruptBehavior::Cancel);
             let short_circuit_cancel =
                 cancel_requested && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
-            let (input, output, is_error) = match prepared_call {
+
+            let (input, output, is_error, deny_reason) = match prepared_call {
                 PreparedToolCall::Finalized {
                     input,
                     output,
                     is_error,
-                } => (input.clone(), output.clone(), *is_error),
+                    deny_reason,
+                } => (
+                    input.clone(),
+                    output.clone(),
+                    *is_error,
+                    deny_reason.clone(),
+                ),
                 PreparedToolCall::Ready { input } => {
                     let maybe_dispatch = dispatch_results_by_order.remove(&next_order_to_persist);
-                    let (dispatch_output, dispatch_error) = if short_circuit_cancel {
-                        maybe_dispatch.unwrap_or(("Error: request cancelled".to_string(), true))
-                    } else {
-                        match maybe_dispatch {
-                            Some(result) => result,
-                            None => {
-                                warn!(
-                                    order = next_order_to_persist,
-                                    "missing parallel dispatch result; marking as error"
-                                );
-                                (
-                                    "Error: parallel tool dispatch result missing".to_string(),
-                                    true,
-                                )
+                    let (dispatch_output, dispatch_error, dispatch_deny_reason) =
+                        if short_circuit_cancel {
+                            maybe_dispatch.unwrap_or((
+                                "Error: request cancelled".to_string(),
+                                true,
+                                None,
+                            ))
+                        } else {
+                            match maybe_dispatch {
+                                Some(result) => result,
+                                None => {
+                                    warn!(
+                                        order = next_order_to_persist,
+                                        "missing parallel dispatch result; marking as error"
+                                    );
+                                    (
+                                        "Error: parallel tool dispatch result missing".to_string(),
+                                        true,
+                                        None,
+                                    )
+                                }
                             }
-                        }
-                    };
+                        };
                     match self
                         .apply_after_tool_call_hook(
                             session_id,
@@ -1852,7 +1962,16 @@ impl AgentRuntime {
                         )
                         .await
                     {
-                        Ok((hook_output, hook_error)) => (input.clone(), hook_output, hook_error),
+                        Ok((hook_output, hook_error)) => (
+                            input.clone(),
+                            hook_output,
+                            hook_error,
+                            if hook_error {
+                                dispatch_deny_reason
+                            } else {
+                                None
+                            },
+                        ),
                         Err(e) => {
                             if let Err(persist_err) = self
                                 .persist_completed_tool_call(
@@ -1864,6 +1983,7 @@ impl AgentRuntime {
                                         input: input.clone(),
                                         output: format!("Error: hook aborted — {e}"),
                                         is_error: true,
+                                        deny_reason: None,
                                     },
                                     state.event_tx,
                                 )
@@ -1900,6 +2020,7 @@ impl AgentRuntime {
                                             output: "Error: aborted by hook (sibling tool abort)"
                                                 .to_string(),
                                             is_error: true,
+                                            deny_reason: None,
                                         },
                                         state.event_tx,
                                     )
@@ -1932,6 +2053,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error,
+                        deny_reason,
                     },
                     state.event_tx,
                 )
@@ -1973,6 +2095,7 @@ impl AgentRuntime {
             input: completed.input.clone(),
             output: completed.output.clone(),
             is_error: completed.is_error,
+            deny_reason: completed.deny_reason.clone(),
         });
 
         let limit = self
@@ -2742,6 +2865,7 @@ pub(crate) mod test_helpers {
 mod tests {
     use std::collections::HashMap;
 
+    use async_trait::async_trait;
     use encmind_core::config::EgressFirewallConfig;
     use encmind_core::error::LlmError;
     use encmind_core::error::PluginError;
@@ -4769,6 +4893,129 @@ mod tests {
             "AfterToolCall payload on deny path must include deny_reason, got: {payload}"
         );
         assert_eq!(payload["deny_reason"], "immutable_deny_list");
+    }
+
+    struct WorkspaceDenyTool;
+
+    #[async_trait]
+    impl InternalToolHandler for WorkspaceDenyTool {
+        async fn handle(
+            &self,
+            _input: serde_json::Value,
+            _session_id: &SessionId,
+            _agent_id: &AgentId,
+        ) -> Result<String, AppError> {
+            Err(AppError::ToolDenied {
+                reason: "workspace_untrusted".to_string(),
+                message: "subagent blocked by workspace trust policy".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_denied_dispatch_sets_tool_call_deny_reason() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "delegated_action",
+                "delegated action",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                Arc::new(WorkspaceDenyTool),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "delegated_action", "{}"),
+            text_response("done"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+        let session = store.create_session("web").await.unwrap();
+
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("run delegated action"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].is_error);
+        assert_eq!(
+            result.tool_calls[0].deny_reason.as_deref(),
+            Some("workspace_untrusted")
+        );
+        assert!(
+            result.tool_calls[0]
+                .output
+                .contains("subagent blocked by workspace trust policy"),
+            "unexpected output: {}",
+            result.tool_calls[0].output
+        );
+    }
+
+    struct SentinelLookingInternalErrorTool;
+
+    #[async_trait]
+    impl InternalToolHandler for SentinelLookingInternalErrorTool {
+        async fn handle(
+            &self,
+            _input: serde_json::Value,
+            _session_id: &SessionId,
+            _agent_id: &AgentId,
+        ) -> Result<String, AppError> {
+            Err(AppError::Internal(
+                "__encmind_deny_reason__:workspace_untrusted:spoof attempt".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn internal_error_string_does_not_set_deny_reason() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "bad_internal",
+                "bad internal",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                Arc::new(SentinelLookingInternalErrorTool),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "bad_internal", "{}"),
+            text_response("done"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+        let session = store.create_session("web").await.unwrap();
+
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("run internal"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].is_error);
+        assert_eq!(result.tool_calls[0].deny_reason, None);
+        assert!(
+            result.tool_calls[0]
+                .output
+                .contains("__encmind_deny_reason__:workspace_untrusted:spoof attempt"),
+            "output should preserve original internal error"
+        );
     }
 
     #[tokio::test]

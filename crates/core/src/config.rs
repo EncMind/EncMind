@@ -163,6 +163,32 @@ impl AppConfig {
             }
         }
 
+        // Workspace trust validation
+        {
+            let action = self
+                .security
+                .workspace_trust
+                .untrusted_default
+                .trim()
+                .to_ascii_lowercase();
+            if !["readonly", "deny", "allow"].contains(&action.as_str()) {
+                errors.push(format!(
+                    "security.workspace_trust.untrusted_default must be 'readonly', 'deny', or 'allow'; got '{action}'"
+                ));
+            }
+            let no_workspace_action = self
+                .security
+                .workspace_trust
+                .no_workspace_default
+                .trim()
+                .to_ascii_lowercase();
+            if !["trusted", "readonly", "deny"].contains(&no_workspace_action.as_str()) {
+                errors.push(format!(
+                    "security.workspace_trust.no_workspace_default must be 'trusted', 'readonly', or 'deny'; got '{no_workspace_action}'"
+                ));
+            }
+        }
+
         if self.memory.enabled {
             if self.memory.embedding_dimensions == 0 {
                 errors.push("memory.embedding_dimensions must be > 0".to_string());
@@ -1029,6 +1055,54 @@ pub struct SecurityConfig {
     /// After this timeout, a synthetic error result is returned.
     #[serde(default = "default_blocking_tool_cancel_grace_secs")]
     pub blocking_tool_cancel_grace_secs: u64,
+    /// Workspace trust settings. Controls which tools are available based on
+    /// whether the session's workspace path is in the trusted set.
+    #[serde(default)]
+    pub workspace_trust: WorkspaceTrustConfig,
+}
+
+/// Workspace trust configuration.
+///
+/// When a session operates in a workspace (directory), the trust gate checks
+/// whether that path is in `trusted_paths`. Untrusted workspaces restrict
+/// the tool set to built-in read-only tools — no plugin tools, no skills,
+/// no MCP tools, no bash.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkspaceTrustConfig {
+    /// Paths that are pre-trusted. Workspace paths under any of these are
+    /// considered trusted without interactive prompt.
+    #[serde(default)]
+    pub trusted_paths: Vec<PathBuf>,
+    /// Default action for untrusted workspaces.
+    /// - "readonly": restrict to built-in read-only tools (default)
+    /// - "deny": reject all tool calls
+    /// - "allow": no trust restriction (disable the trust gate)
+    #[serde(default = "default_untrusted_action")]
+    pub untrusted_default: String,
+    /// Action when a session has no workspace path set.
+    /// - "trusted": treat no-workspace sessions as trusted (default)
+    /// - "readonly": restrict to read-only tool allowlist
+    /// - "deny": reject all tool calls
+    #[serde(default = "default_no_workspace_action")]
+    pub no_workspace_default: String,
+}
+
+fn default_untrusted_action() -> String {
+    "readonly".to_string()
+}
+
+fn default_no_workspace_action() -> String {
+    "trusted".to_string()
+}
+
+impl Default for WorkspaceTrustConfig {
+    fn default() -> Self {
+        Self {
+            trusted_paths: Vec::new(),
+            untrusted_default: default_untrusted_action(),
+            no_workspace_default: default_no_workspace_action(),
+        }
+    }
 }
 
 fn default_audit_retention_days() -> u32 {
@@ -1053,6 +1127,7 @@ impl Default for SecurityConfig {
             external_vault: None,
             per_tool_interrupt_behavior: HashMap::new(),
             blocking_tool_cancel_grace_secs: default_blocking_tool_cancel_grace_secs(),
+            workspace_trust: WorkspaceTrustConfig::default(),
         }
     }
 }
@@ -2331,6 +2406,13 @@ fn expand_tilde_path(path: &Path) -> PathBuf {
 fn expand_path_fields(config: &mut AppConfig) {
     config.storage.db_path = expand_tilde_path(&config.storage.db_path);
     config.skills.wasm_dir = expand_tilde_path(&config.skills.wasm_dir);
+    config.security.workspace_trust.trusted_paths = config
+        .security
+        .workspace_trust
+        .trusted_paths
+        .iter()
+        .map(|path| expand_tilde_path(path))
+        .collect();
 
     if let Some(path) = config.storage.backup_dir.take() {
         config.storage.backup_dir = Some(expand_tilde_path(&path));
@@ -4544,6 +4626,37 @@ access_policy:
                 .iter()
                 .any(|e| e.contains("plugins.digest config is invalid")),
             "expected digest parse error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn expand_path_fields_expands_workspace_trust_trusted_paths_tilde() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+
+        let mut config = AppConfig::default();
+        config.security.workspace_trust.trusted_paths = vec![PathBuf::from("~/trusted-workspace")];
+
+        expand_path_fields(&mut config);
+
+        assert_eq!(
+            config.security.workspace_trust.trusted_paths,
+            vec![home.join("trusted-workspace")]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_workspace_trust_no_workspace_default() {
+        let mut config = AppConfig::default();
+        config.security.workspace_trust.no_workspace_default = "invalid".to_string();
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains(
+                "security.workspace_trust.no_workspace_default must be 'trusted', 'readonly', or 'deny'"
+            )),
+            "expected validation error, got: {:?}",
             errors
         );
     }

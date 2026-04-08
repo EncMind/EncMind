@@ -30,6 +30,9 @@ pub enum AppError {
     #[error(transparent)]
     Plugin(#[from] PluginError),
 
+    #[error("tool denied ({reason}): {message}")]
+    ToolDenied { reason: String, message: String },
+
     #[error("{0}")]
     Internal(String),
 }

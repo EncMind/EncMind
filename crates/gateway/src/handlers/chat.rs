@@ -330,6 +330,7 @@ pub async fn handle_send(
         api_provider_disclosure,
         tok_config,
         bash_mode,
+        workspace_trust,
         tool_calls_per_run,
         max_parallel_safe_tools,
         per_tool_interrupt_behavior,
@@ -345,6 +346,7 @@ pub async fn handle_send(
             disclosure,
             config.token_optimization.clone(),
             config.security.bash_mode.clone(),
+            config.security.workspace_trust.clone(),
             config.security.rate_limit.tool_calls_per_run,
             config.agent_pool.max_parallel_safe_tools,
             config.security.per_tool_interrupt_behavior.clone(),
@@ -374,6 +376,7 @@ pub async fn handle_send(
             &per_tool_interrupt_behavior,
         ),
         blocking_tool_cancel_grace: Duration::from_secs(blocking_tool_cancel_grace_secs),
+        workspace_trust,
         ..RuntimeConfig::default()
     };
 
@@ -503,6 +506,21 @@ pub async fn handle_send(
         }
     };
 
+    // Audit workspace trust denials.
+    for call in &run_result.tool_calls {
+        if call.deny_reason.as_deref() == Some("workspace_untrusted") {
+            let _ = state.audit.append(
+                "security",
+                "workspace_trust_denied",
+                Some(&format!(
+                    "tool '{}' blocked by workspace trust policy",
+                    call.name
+                )),
+                Some(agent_id.as_str()),
+            );
+        }
+    }
+
     // Audit loop-break events for parity with rate-limit / budget audit.
     if let Some(ref reason) = run_result.loop_break {
         append_loop_break_audit(state, run_result.loop_break_code.as_deref(), reason);
@@ -548,6 +566,7 @@ pub async fn handle_send(
                 "input": call.input,
                 "output": call.output,
                 "is_error": call.is_error,
+                "deny_reason": call.deny_reason,
             })
         })
         .collect::<Vec<_>>();
@@ -862,7 +881,7 @@ mod tests {
     use encmind_core::traits::{
         CompletionDelta, CompletionParams, FinishReason, LlmBackend, ModelInfo,
     };
-    use encmind_core::types::{AgentId, ContentBlock, SessionId};
+    use encmind_core::types::{AgentConfig, AgentId, ContentBlock, SessionId};
     use futures::Stream;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1572,6 +1591,7 @@ mod tests {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0]["name"], "bash_exec");
                 assert_eq!(tool_calls[0]["is_error"], true);
+                assert_eq!(tool_calls[0]["deny_reason"], "policy_denied");
                 let output = tool_calls[0]["output"].as_str().unwrap_or_default();
                 assert!(
                     output.contains("denied by security policy"),
@@ -1585,6 +1605,116 @@ mod tests {
             bash_tool_calls.load(Ordering::SeqCst),
             0,
             "bash tool should not execute when bash_mode=deny"
+        );
+        assert_eq!(
+            llm_calls.load(Ordering::SeqCst),
+            2,
+            "runtime should perform tool round then final response round"
+        );
+
+        let entries = state
+            .audit
+            .query(
+                encmind_storage::audit::AuditFilter {
+                    category: Some("security".to_string()),
+                    action: Some("workspace_trust_denied".to_string()),
+                    since: None,
+                    until: None,
+                    skill_id: None,
+                },
+                10,
+                0,
+            )
+            .expect("audit query should succeed");
+        assert!(
+            entries.is_empty(),
+            "did not expect workspace_trust_denied audit entry for bash policy denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_applies_workspace_trust_gate_from_config() {
+        let state = make_test_state();
+        let llm_calls = Arc::new(AtomicUsize::new(0));
+        let bash_tool_calls = Arc::new(AtomicUsize::new(0));
+        let trusted_root = tempfile::tempdir().unwrap();
+        let untrusted_workspace = tempfile::tempdir().unwrap();
+
+        let mut agent: AgentConfig = state
+            .agent_registry
+            .get_agent(&AgentId::default())
+            .await
+            .unwrap()
+            .expect("default agent exists");
+        agent.workspace = Some(untrusted_workspace.path().display().to_string());
+        state
+            .agent_registry
+            .update_agent(&AgentId::default(), agent)
+            .await
+            .unwrap();
+
+        {
+            let mut config = state.config.write().await;
+            config.security.bash_mode = BashMode::Allowlist {
+                patterns: vec!["echo*".to_string()],
+            };
+            config.security.workspace_trust.trusted_paths = vec![trusted_root.path().to_path_buf()];
+            config.security.workspace_trust.untrusted_default = "readonly".to_string();
+            config.token_optimization.auto_title_enabled = false;
+        }
+
+        {
+            let mut runtime = state.runtime.write().await;
+            runtime.llm_backend = Some(Arc::new(TwoTurnBashLlm::new(llm_calls.clone())));
+
+            let mut registry = ToolRegistry::new();
+            registry
+                .register_internal(
+                    "bash_exec",
+                    "bash",
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    }),
+                    Arc::new(CountingBashTool {
+                        calls: bash_tool_calls.clone(),
+                    }),
+                )
+                .unwrap();
+            runtime.tool_registry = Arc::new(registry);
+        }
+
+        let response = handle_send(
+            &state,
+            serde_json::json!({
+                "text": "run bash in untrusted workspace",
+            }),
+            "req-workspace-trust-1",
+            None,
+        )
+        .await;
+
+        match response {
+            ServerMessage::Res { result, .. } => {
+                let tool_calls = result["tool_calls"].as_array().expect("tool_calls array");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0]["name"], "bash_exec");
+                assert_eq!(tool_calls[0]["is_error"], true);
+                assert_eq!(tool_calls[0]["deny_reason"], "workspace_untrusted");
+                let output = tool_calls[0]["output"].as_str().unwrap_or_default();
+                assert!(
+                    output.contains("not available in untrusted workspace"),
+                    "got: {output}"
+                );
+            }
+            other => panic!("expected success response, got: {other:?}"),
+        }
+
+        assert_eq!(
+            bash_tool_calls.load(Ordering::SeqCst),
+            0,
+            "bash tool should not execute in untrusted readonly workspace"
         );
         assert_eq!(
             llm_calls.load(Ordering::SeqCst),
