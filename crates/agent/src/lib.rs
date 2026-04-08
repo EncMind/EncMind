@@ -8,6 +8,7 @@ pub mod pool;
 pub mod registry;
 pub mod risk_classifier;
 pub mod runtime;
+pub mod scheduler;
 pub mod subagent;
 pub mod tool_registry;
 pub mod workspace_trust;

@@ -64,6 +64,11 @@ pub struct RuntimeConfig {
     /// Workspace trust configuration. When set, tools are filtered based on
     /// whether `workspace_dir` is in the trusted set.
     pub workspace_trust: encmind_core::config::WorkspaceTrustConfig,
+    /// Priority class for this run. Used by subagent spawns so that a
+    /// background parent (e.g. cron) does not escalate its children to
+    /// interactive priority. The top-level entrypoint is scheduled by
+    /// the pool directly — this field only affects nested spawns.
+    pub query_class: crate::scheduler::QueryClass,
 }
 
 impl Default for RuntimeConfig {
@@ -82,6 +87,7 @@ impl Default for RuntimeConfig {
             per_tool_interrupt_behavior: HashMap::new(),
             blocking_tool_cancel_grace: Duration::from_secs(10),
             workspace_trust: encmind_core::config::WorkspaceTrustConfig::default(),
+            query_class: crate::scheduler::QueryClass::Interactive,
         }
     }
 }
@@ -93,7 +99,9 @@ pub struct ToolCallRecord {
     pub input: serde_json::Value,
     pub output: String,
     pub is_error: bool,
-    pub deny_reason: Option<String>,
+    /// Set when governance denied the call. Carries typed provenance
+    /// (source subsystem, optional rule id, reason, input fingerprint).
+    pub decision: Option<encmind_core::permission::PermissionDecision>,
 }
 
 /// Streaming events emitted during an agent run.
@@ -178,7 +186,7 @@ enum PreparedToolCall {
         input: serde_json::Value,
         output: String,
         is_error: bool,
-        deny_reason: Option<String>,
+        decision: Option<encmind_core::permission::PermissionDecision>,
     },
 }
 
@@ -188,12 +196,12 @@ struct CompletedToolCall {
     input: serde_json::Value,
     output: String,
     is_error: bool,
-    deny_reason: Option<String>,
+    decision: Option<encmind_core::permission::PermissionDecision>,
 }
 
 struct DenyHookDetails<'a> {
     output: &'a str,
-    deny_reason: &'a str,
+    decision: &'a encmind_core::permission::PermissionDecision,
     risk_level: Option<&'a str>,
 }
 
@@ -290,6 +298,18 @@ impl AgentRuntime {
         }
     }
 
+    fn prompt_visible_tools(&self) -> Vec<String> {
+        let trust_level = crate::workspace_trust::evaluate_trust(
+            self.config.workspace_dir.as_deref(),
+            &self.config.workspace_trust,
+        );
+        self.tool_registry
+            .tool_names()
+            .into_iter()
+            .filter(|tool_name| crate::workspace_trust::is_tool_allowed(tool_name, trust_level))
+            .collect()
+    }
+
     /// Run a single user turn, streaming events as they happen.
     ///
     /// Returns a receiver that yields `ChatEvent`s in real-time:
@@ -366,6 +386,25 @@ impl AgentRuntime {
 
     /// Internal run implementation that optionally emits streaming events.
     async fn run_inner(
+        &self,
+        session_id: &SessionId,
+        user_message: Message,
+        agent_config: &AgentConfig,
+        cancel: CancellationToken,
+        event_tx: Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+    ) -> Result<RunResult, AppError> {
+        // Bind the run's priority class to a task-local so nested tool
+        // handlers (SpawnAgentHandler in particular) can read it when
+        // acquiring agent-pool permits. The scope lasts exactly one
+        // run; subagent invocations run within the same task and
+        // therefore inherit it automatically.
+        let class = self.config.query_class;
+        crate::scheduler::CURRENT_QUERY_CLASS
+            .scope(class, self.run_inner_body(session_id, user_message, agent_config, cancel, event_tx))
+            .await
+    }
+
+    async fn run_inner_body(
         &self,
         session_id: &SessionId,
         user_message: Message,
@@ -469,9 +508,16 @@ impl AgentRuntime {
             }
 
             // 2a. Build context
+            let available_tools = self.prompt_visible_tools();
             let (mut context, max_output) = self
                 .context_manager
-                .build_context(session_id, agent_config, &self.session_store, &self.llm)
+                .build_context(
+                    session_id,
+                    agent_config,
+                    &self.session_store,
+                    &self.llm,
+                    &available_tools,
+                )
                 .await?;
 
             // 2b. Normalize messages before token counting and LLM call.
@@ -729,7 +775,7 @@ impl AgentRuntime {
                             input,
                             output,
                             is_error,
-                            deny_reason,
+                            decision,
                         }) => {
                             Self::emit_tool_start_event(&event_tx, id, name, &input).await;
                             self.persist_completed_tool_call(
@@ -741,7 +787,7 @@ impl AgentRuntime {
                                     input,
                                     output,
                                     is_error,
-                                    deny_reason,
+                                    decision,
                                 },
                                 &event_tx,
                             )
@@ -766,7 +812,7 @@ impl AgentRuntime {
                         Ok(PreparedToolCall::Ready { input }) => {
                             Self::emit_tool_start_event(&event_tx, id, name, &input).await;
                             let interrupt_behavior = self.resolve_tool_interrupt_behavior(name);
-                            let (output, is_error, deny_reason) = if cancel.is_cancelled()
+                            let (output, is_error, decision) = if cancel.is_cancelled()
                                 && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel)
                             {
                                 ("Error: request cancelled".to_string(), true, None)
@@ -781,21 +827,21 @@ impl AgentRuntime {
                                     ToolInterruptBehavior::Cancel => {
                                         tokio::select! {
                                             _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
-                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, result),
+                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
                                         }
                                     }
                                     ToolInterruptBehavior::Block => {
                                         tokio::select! {
-                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, result),
+                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
                                             _ = cancel.cancelled() => {
-                                                self.await_blocking_dispatch_with_grace(name, &mut dispatch_future).await
+                                                self.await_blocking_dispatch_with_grace(name, &input, &mut dispatch_future).await
                                             },
                                         }
                                     }
                                 }
                             };
 
-                            let (output, is_error, deny_reason) = match self
+                            let (output, is_error, decision) = match self
                                 .apply_after_tool_call_hook(
                                     session_id,
                                     &agent_config.id,
@@ -803,12 +849,13 @@ impl AgentRuntime {
                                     &input,
                                     output,
                                     is_error,
+                                    decision.as_ref(),
                                 )
                                 .await
                             {
                                 Ok((hook_output, hook_error)) => {
-                                    let deny_reason = if hook_error { deny_reason } else { None };
-                                    (hook_output, hook_error, deny_reason)
+                                    let decision = if hook_error { decision } else { None };
+                                    (hook_output, hook_error, decision)
                                 }
                                 Err(e) => {
                                     self.persist_completed_tool_call(
@@ -820,7 +867,7 @@ impl AgentRuntime {
                                             input: input.clone(),
                                             output: format!("Error: hook aborted — {e}"),
                                             is_error: true,
-                                            deny_reason: None,
+                                            decision: None,
                                         },
                                         &event_tx,
                                     )
@@ -838,7 +885,7 @@ impl AgentRuntime {
                                     input,
                                     output,
                                     is_error,
-                                    deny_reason,
+                                    decision,
                                 },
                                 &event_tx,
                             )
@@ -872,7 +919,7 @@ impl AgentRuntime {
                                     input: parsed_input.clone(),
                                     output: format!("Error: hook aborted — {e}"),
                                     is_error: true,
-                                    deny_reason: None,
+                                    decision: None,
                                 },
                                 &event_tx,
                             )
@@ -1108,6 +1155,20 @@ impl AgentRuntime {
         }
     }
 
+    /// Compatibility view of a `PermissionDecision`: prefer `rule_id`,
+    /// fall back to the source name. Emitted as the legacy flat
+    /// `deny_reason` field on hook payloads and chat.send responses
+    /// so existing consumers of the pre-structured contract keep
+    /// working. Will be removed in a future major revision.
+    fn legacy_deny_reason(
+        decision: &encmind_core::permission::PermissionDecision,
+    ) -> String {
+        decision
+            .rule_id
+            .clone()
+            .unwrap_or_else(|| decision.source.as_str().to_string())
+    }
+
     async fn invoke_after_tool_call_deny_hook(
         &self,
         session_id: &SessionId,
@@ -1116,12 +1177,20 @@ impl AgentRuntime {
         input: &serde_json::Value,
         details: DenyHookDetails<'_>,
     ) {
+        use encmind_core::hooks::ToolOutcome;
+        let decision_value =
+            serde_json::to_value(details.decision).unwrap_or(serde_json::Value::Null);
+        let legacy_reason = Self::legacy_deny_reason(details.decision);
         let mut payload = serde_json::json!({
             "tool_name": tool_name,
             "input": input.clone(),
             "output": details.output,
             "is_error": true,
-            "deny_reason": details.deny_reason,
+            "outcome": ToolOutcome::Denied.as_str(),
+            "decision": decision_value,
+            // Deprecated: kept during the structured-decision transition.
+            // Prefer `decision.rule_id` / `decision.source`.
+            "deny_reason": legacy_reason,
         });
         if let Some(level) = details.risk_level {
             payload["risk_level"] = serde_json::Value::String(level.to_owned());
@@ -1144,6 +1213,7 @@ impl AgentRuntime {
         tool_name: &str,
         parsed_input: &serde_json::Value,
     ) -> Result<PreparedToolCall, AppError> {
+        use encmind_core::permission::{DecisionSource, PermissionDecision};
         let mut input = parsed_input.clone();
 
         // Governance step 1: immutable deny-list.
@@ -1158,6 +1228,9 @@ impl AgentRuntime {
                 "Error: operation denied by security policy — {}",
                 risk.reason
             );
+            let decision = PermissionDecision::new(DecisionSource::RiskClassifier, risk.reason)
+                .with_rule_id("immutable_deny_list")
+                .with_input_fingerprint(&input);
             self.invoke_after_tool_call_deny_hook(
                 session_id,
                 agent_id,
@@ -1165,7 +1238,7 @@ impl AgentRuntime {
                 &input,
                 DenyHookDetails {
                     output: &output,
-                    deny_reason: "immutable_deny_list",
+                    decision: &decision,
                     risk_level: Some(&format!("{:?}", risk.level)),
                 },
             )
@@ -1174,7 +1247,7 @@ impl AgentRuntime {
                 input,
                 output,
                 is_error: true,
-                deny_reason: Some("immutable_deny_list".to_string()),
+                decision: Some(decision),
             });
         }
 
@@ -1196,6 +1269,15 @@ impl AgentRuntime {
                 "Error: tool '{}' is not available in untrusted workspace",
                 tool_name
             );
+            let decision = PermissionDecision::new(
+                DecisionSource::WorkspaceTrust,
+                format!("tool '{tool_name}' is not available in untrusted workspace"),
+            )
+            // rule_id matches the legacy `deny_reason` code verbatim so
+            // `legacy_deny_reason()` emits the original string for
+            // backward-compat consumers.
+            .with_rule_id("workspace_untrusted")
+            .with_input_fingerprint(&input);
             self.invoke_after_tool_call_deny_hook(
                 session_id,
                 agent_id,
@@ -1203,7 +1285,7 @@ impl AgentRuntime {
                 &input,
                 DenyHookDetails {
                     output: &output,
-                    deny_reason: "workspace_untrusted",
+                    decision: &decision,
                     risk_level: None,
                 },
             )
@@ -1212,7 +1294,7 @@ impl AgentRuntime {
                 input,
                 output,
                 is_error: true,
-                deny_reason: Some("workspace_untrusted".to_string()),
+                decision: Some(decision),
             });
         }
 
@@ -1267,6 +1349,10 @@ impl AgentRuntime {
                     "Error: operation denied by security policy — {}",
                     post_hook_risk.reason
                 );
+                let decision =
+                    PermissionDecision::new(DecisionSource::RiskClassifier, post_hook_risk.reason)
+                        .with_rule_id("immutable_deny_list")
+                        .with_input_fingerprint(&input);
                 self.invoke_after_tool_call_deny_hook(
                     session_id,
                     agent_id,
@@ -1274,7 +1360,7 @@ impl AgentRuntime {
                     &input,
                     DenyHookDetails {
                         output: &output,
-                        deny_reason: "immutable_deny_list",
+                        decision: &decision,
                         risk_level: Some(&format!("{:?}", post_hook_risk.level)),
                     },
                 )
@@ -1283,7 +1369,7 @@ impl AgentRuntime {
                     input,
                     output,
                     is_error: true,
-                    deny_reason: Some("immutable_deny_list".to_string()),
+                    decision: Some(decision),
                 });
             }
         }
@@ -1300,6 +1386,10 @@ impl AgentRuntime {
                         "tool call blocked by egress firewall"
                     );
                     let output = format!("Error: {e}");
+                    let decision =
+                        PermissionDecision::new(DecisionSource::Firewall, e.to_string())
+                            .with_rule_id("egress_firewall")
+                            .with_input_fingerprint(&input);
                     self.invoke_after_tool_call_deny_hook(
                         session_id,
                         agent_id,
@@ -1307,7 +1397,7 @@ impl AgentRuntime {
                         &input,
                         DenyHookDetails {
                             output: &output,
-                            deny_reason: "egress_firewall",
+                            decision: &decision,
                             risk_level: None,
                         },
                     )
@@ -1316,7 +1406,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error: true,
-                        deny_reason: Some("egress_firewall".to_string()),
+                        decision: Some(decision),
                     });
                 }
             }
@@ -1326,6 +1416,12 @@ impl AgentRuntime {
         if let Some(checker) = &self.approval_checker {
             if checker.is_denied(tool_name) {
                 let output = format!("Error: tool '{}' is denied by security policy", tool_name);
+                let decision = PermissionDecision::new(
+                    DecisionSource::Approval,
+                    format!("tool '{tool_name}' is denied by security policy"),
+                )
+                .with_rule_id("policy_denied")
+                .with_input_fingerprint(&input);
                 self.invoke_after_tool_call_deny_hook(
                     session_id,
                     agent_id,
@@ -1333,7 +1429,7 @@ impl AgentRuntime {
                     &input,
                     DenyHookDetails {
                         output: &output,
-                        deny_reason: "policy_denied",
+                        decision: &decision,
                         risk_level: None,
                     },
                 )
@@ -1342,7 +1438,7 @@ impl AgentRuntime {
                     input,
                     output,
                     is_error: true,
-                    deny_reason: Some("policy_denied".to_string()),
+                    decision: Some(decision),
                 });
             }
 
@@ -1353,9 +1449,12 @@ impl AgentRuntime {
                     session_id: session_id.clone(),
                     agent_id: agent_id.clone(),
                 };
-                let decision = self.approval_handler.request_approval(req).await;
-                if let ApprovalDecision::Denied { reason } = decision {
+                let approval_decision = self.approval_handler.request_approval(req).await;
+                if let ApprovalDecision::Denied { reason } = approval_decision {
                     let output = format!("Error: tool '{}' denied: {}", tool_name, reason);
+                    let decision = PermissionDecision::new(DecisionSource::Approval, reason)
+                        .with_rule_id("approval_denied")
+                        .with_input_fingerprint(&input);
                     self.invoke_after_tool_call_deny_hook(
                         session_id,
                         agent_id,
@@ -1363,7 +1462,7 @@ impl AgentRuntime {
                         &input,
                         DenyHookDetails {
                             output: &output,
-                            deny_reason: "approval_denied",
+                            decision: &decision,
                             risk_level: None,
                         },
                     )
@@ -1372,7 +1471,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error: true,
-                        deny_reason: Some("approval_denied".to_string()),
+                        decision: Some(decision),
                     });
                 }
             }
@@ -1381,6 +1480,7 @@ impl AgentRuntime {
         Ok(PreparedToolCall::Ready { input })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_after_tool_call_hook(
         &self,
         session_id: &SessionId,
@@ -1389,9 +1489,22 @@ impl AgentRuntime {
         input: &serde_json::Value,
         output: String,
         is_error: bool,
+        decision: Option<&encmind_core::permission::PermissionDecision>,
     ) -> Result<(String, bool), AppError> {
+        use encmind_core::hooks::ToolOutcome;
         let mut output = output;
         let mut is_error = is_error;
+        let outcome = ToolOutcome::classify(is_error, decision.is_some());
+        let decision_value = decision
+            .map(|d| serde_json::to_value(d).unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null);
+        // Deprecated flat `deny_reason`, emitted only when a structured
+        // decision is present, so existing consumers that key off this
+        // field continue to work during the transition window.
+        let legacy_reason = decision
+            .map(Self::legacy_deny_reason)
+            .map(serde_json::Value::String)
+            .unwrap_or(serde_json::Value::Null);
         if let Some(override_payload) = self
             .execute_hook(
                 HookPoint::AfterToolCall,
@@ -1403,6 +1516,9 @@ impl AgentRuntime {
                     "input": input.clone(),
                     "output": output.clone(),
                     "is_error": is_error,
+                    "outcome": outcome.as_str(),
+                    "decision": decision_value,
+                    "deny_reason": legacy_reason,
                 }),
             )
             .await?
@@ -1442,8 +1558,14 @@ impl AgentRuntime {
 
     fn normalize_dispatch_outcome(
         tool_name: &str,
+        dispatch_input: &serde_json::Value,
         dispatch_result: Result<String, AppError>,
-    ) -> (String, bool, Option<String>) {
+    ) -> (
+        String,
+        bool,
+        Option<encmind_core::permission::PermissionDecision>,
+    ) {
+        use encmind_core::permission::{DecisionSource, PermissionDecision};
         match dispatch_result {
             Ok(result) => (result, false, None),
             Err(AppError::ToolDenied { reason, message }) => {
@@ -1453,7 +1575,23 @@ impl AgentRuntime {
                     message = %message,
                     "tool dispatch denied"
                 );
-                (format!("Error: {message}"), true, Some(reason))
+                // Map tool-level denial reasons to the appropriate
+                // decision source. The rule_id always mirrors the legacy
+                // `deny_reason` string verbatim so `legacy_deny_reason()`
+                // emits the same codes existing consumers saw before the
+                // structured transition. Unknown reasons fall back to
+                // Approval (the most common operator-configured denial
+                // path) with the original string as the rule_id.
+                let source = match reason.as_str() {
+                    "workspace_untrusted" => DecisionSource::WorkspaceTrust,
+                    "egress_firewall" => DecisionSource::Firewall,
+                    "approval_denied" | "policy_denied" => DecisionSource::Approval,
+                    _ => DecisionSource::Approval,
+                };
+                let decision = PermissionDecision::new(source, message.clone())
+                    .with_rule_id(reason.clone())
+                    .with_input_fingerprint(dispatch_input);
+                (format!("Error: {message}"), true, Some(decision))
             }
             Err(e) => {
                 warn!(tool = %tool_name, error = %e, "tool dispatch failed");
@@ -1465,14 +1603,19 @@ impl AgentRuntime {
     async fn await_blocking_dispatch_with_grace<F>(
         &self,
         tool_name: &str,
+        dispatch_input: &serde_json::Value,
         dispatch_future: &mut std::pin::Pin<Box<F>>,
-    ) -> (String, bool, Option<String>)
+    ) -> (
+        String,
+        bool,
+        Option<encmind_core::permission::PermissionDecision>,
+    )
     where
         F: std::future::Future<Output = Result<String, AppError>> + Send,
     {
         let grace = self.config.blocking_tool_cancel_grace;
         match tokio::time::timeout(grace, dispatch_future.as_mut()).await {
-            Ok(result) => Self::normalize_dispatch_outcome(tool_name, result),
+            Ok(result) => Self::normalize_dispatch_outcome(tool_name, dispatch_input, result),
             Err(_) => {
                 warn!(
                     tool = %tool_name,
@@ -1529,7 +1672,7 @@ impl AgentRuntime {
                             input: parsed_input.clone(),
                             output: format!("Error: hook aborted — {e}"),
                             is_error: true,
-                            deny_reason: None,
+                            decision: None,
                         },
                         state.event_tx,
                     )
@@ -1581,8 +1724,14 @@ impl AgentRuntime {
 
         // Dispatch ready tools in bounded parallelism and keep only out-of-order
         // results in memory. As soon as a contiguous prefix is ready, persist it.
-        let mut dispatch_results_by_order: HashMap<usize, (String, bool, Option<String>)> =
-            HashMap::new();
+        let mut dispatch_results_by_order: HashMap<
+            usize,
+            (
+                String,
+                bool,
+                Option<encmind_core::permission::PermissionDecision>,
+            ),
+        > = HashMap::new();
         let mut next_order_to_persist = 0usize;
         let requested = self.config.max_parallel_safe_tools;
         let parallelism = requested.clamp(1, MAX_PARALLEL_SAFE_TOOLS_CAP);
@@ -1605,6 +1754,10 @@ impl AgentRuntime {
                         let dispatch_cancel = state.cancel.clone();
                         let cancel_grace = self.config.blocking_tool_cancel_grace;
                         let dispatch_name = name.clone();
+                        // Retain a copy of the input so normalize can attach
+                        // an input fingerprint to dispatch-level denials for
+                        // audit correlation.
+                        let fingerprint_input = input.clone();
                         async move {
                             let dispatch_future = std::panic::AssertUnwindSafe(tool_registry.dispatch(
                                 &dispatch_name,
@@ -1625,10 +1778,14 @@ impl AgentRuntime {
                                         "parallel tool task panicked".to_string(),
                                     )),
                                 };
-                                Self::normalize_dispatch_outcome(&dispatch_name, dispatch_result)
+                                Self::normalize_dispatch_outcome(
+                                    &dispatch_name,
+                                    &fingerprint_input,
+                                    dispatch_result,
+                                )
                             };
 
-                            let (output, is_error, deny_reason) = match interrupt_behavior {
+                            let (output, is_error, decision) = match interrupt_behavior {
                                 ToolInterruptBehavior::Cancel => {
                                     tokio::select! {
                                         _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
@@ -1682,7 +1839,7 @@ impl AgentRuntime {
                                     }
                                 }
                             };
-                            (order, name, output, is_error, deny_reason)
+                            (order, name, output, is_error, decision)
                         }
                     },
                 ))
@@ -1702,22 +1859,22 @@ impl AgentRuntime {
                     let short_circuit_cancel = cancel_requested
                         && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
 
-                    let (input, output, is_error, deny_reason) = match prepared_call {
+                    let (input, output, is_error, decision) = match prepared_call {
                         PreparedToolCall::Finalized {
                             input,
                             output,
                             is_error,
-                            deny_reason,
+                            decision,
                         } => (
                             input.clone(),
                             output.clone(),
                             *is_error,
-                            deny_reason.clone(),
+                            decision.clone(),
                         ),
                         PreparedToolCall::Ready { input } => {
                             let maybe_dispatch =
                                 dispatch_results_by_order.remove(&next_order_to_persist);
-                            let (dispatch_output, dispatch_error, dispatch_deny_reason) =
+                            let (dispatch_output, dispatch_error, dispatch_decision) =
                                 if short_circuit_cancel {
                                     maybe_dispatch.unwrap_or((
                                         "Error: request cancelled".to_string(),
@@ -1739,6 +1896,7 @@ impl AgentRuntime {
                                     input,
                                     dispatch_output,
                                     dispatch_error,
+                                    dispatch_decision.as_ref(),
                                 )
                                 .await
                             {
@@ -1747,7 +1905,7 @@ impl AgentRuntime {
                                     hook_output,
                                     hook_error,
                                     if hook_error {
-                                        dispatch_deny_reason
+                                        dispatch_decision
                                     } else {
                                         None
                                     },
@@ -1763,7 +1921,7 @@ impl AgentRuntime {
                                                 input: input.clone(),
                                                 output: format!("Error: hook aborted — {e}"),
                                                 is_error: true,
-                                                deny_reason: None,
+                                                decision: None,
                                             },
                                             state.event_tx,
                                         )
@@ -1804,7 +1962,7 @@ impl AgentRuntime {
                                                         "Error: aborted by hook (sibling tool abort)"
                                                             .to_string(),
                                                     is_error: true,
-                                                    deny_reason: None,
+                                                    decision: None,
                                                 },
                                                 state.event_tx,
                                             )
@@ -1839,7 +1997,7 @@ impl AgentRuntime {
                                 input,
                                 output,
                                 is_error,
-                                deny_reason,
+                                decision,
                             },
                             state.event_tx,
                         )
@@ -1879,7 +2037,7 @@ impl AgentRuntime {
                 };
 
                 match next_result {
-                    Some((order, tool_name, output, is_error, deny_reason)) => {
+                    Some((order, tool_name, output, is_error, decision)) => {
                         if is_error {
                             let preview: String = output.chars().take(200).collect();
                             warn!(
@@ -1889,7 +2047,7 @@ impl AgentRuntime {
                                 "parallel tool dispatch failed"
                             );
                         }
-                        dispatch_results_by_order.insert(order, (output, is_error, deny_reason));
+                        dispatch_results_by_order.insert(order, (output, is_error, decision));
                     }
                     None => {
                         // Stream ended unexpectedly. Missing results are handled
@@ -1914,21 +2072,21 @@ impl AgentRuntime {
             let short_circuit_cancel =
                 cancel_requested && matches!(interrupt_behavior, ToolInterruptBehavior::Cancel);
 
-            let (input, output, is_error, deny_reason) = match prepared_call {
+            let (input, output, is_error, decision) = match prepared_call {
                 PreparedToolCall::Finalized {
                     input,
                     output,
                     is_error,
-                    deny_reason,
+                    decision,
                 } => (
                     input.clone(),
                     output.clone(),
                     *is_error,
-                    deny_reason.clone(),
+                    decision.clone(),
                 ),
                 PreparedToolCall::Ready { input } => {
                     let maybe_dispatch = dispatch_results_by_order.remove(&next_order_to_persist);
-                    let (dispatch_output, dispatch_error, dispatch_deny_reason) =
+                    let (dispatch_output, dispatch_error, dispatch_decision) =
                         if short_circuit_cancel {
                             maybe_dispatch.unwrap_or((
                                 "Error: request cancelled".to_string(),
@@ -1959,6 +2117,7 @@ impl AgentRuntime {
                             input,
                             dispatch_output,
                             dispatch_error,
+                            dispatch_decision.as_ref(),
                         )
                         .await
                     {
@@ -1967,7 +2126,7 @@ impl AgentRuntime {
                             hook_output,
                             hook_error,
                             if hook_error {
-                                dispatch_deny_reason
+                                dispatch_decision
                             } else {
                                 None
                             },
@@ -1983,7 +2142,7 @@ impl AgentRuntime {
                                         input: input.clone(),
                                         output: format!("Error: hook aborted — {e}"),
                                         is_error: true,
-                                        deny_reason: None,
+                                        decision: None,
                                     },
                                     state.event_tx,
                                 )
@@ -2020,7 +2179,7 @@ impl AgentRuntime {
                                             output: "Error: aborted by hook (sibling tool abort)"
                                                 .to_string(),
                                             is_error: true,
-                                            deny_reason: None,
+                                            decision: None,
                                         },
                                         state.event_tx,
                                     )
@@ -2053,7 +2212,7 @@ impl AgentRuntime {
                         input,
                         output,
                         is_error,
-                        deny_reason,
+                        decision,
                     },
                     state.event_tx,
                 )
@@ -2095,7 +2254,7 @@ impl AgentRuntime {
             input: completed.input.clone(),
             output: completed.output.clone(),
             is_error: completed.is_error,
-            deny_reason: completed.deny_reason.clone(),
+            decision: completed.decision.clone(),
         });
 
         let limit = self
@@ -3143,6 +3302,64 @@ mod tests {
         fn interrupt_behavior(&self) -> ToolInterruptBehavior {
             self.interrupt_behavior
         }
+    }
+
+    fn register_noop_internal_tool(registry: &mut ToolRegistry, name: &str) {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {}
+        });
+        registry
+            .register_internal(
+                name,
+                name,
+                schema,
+                Arc::new(DelayedInternalTool {
+                    name: "noop",
+                    delay_ms: 0,
+                    concurrent_safe: false,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn prompt_visible_tools_respects_workspace_trust_readonly() {
+        let mut registry = ToolRegistry::new();
+        register_noop_internal_tool(&mut registry, "file_read");
+        register_noop_internal_tool(&mut registry, "file_list");
+        register_noop_internal_tool(&mut registry, "local_file_read");
+        register_noop_internal_tool(&mut registry, "local_file_list");
+        register_noop_internal_tool(&mut registry, "node_file_read");
+        register_noop_internal_tool(&mut registry, "netprobe_search");
+        register_noop_internal_tool(&mut registry, "bash_exec");
+
+        let runtime = AgentRuntime::new(
+            Arc::new(MockLlmBackend::new(128_000)),
+            Arc::new(InMemorySessionStore::new()) as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            RuntimeConfig {
+                workspace_dir: Some(std::path::PathBuf::from("/tmp/untrusted")),
+                workspace_trust: encmind_core::config::WorkspaceTrustConfig {
+                    trusted_paths: vec![std::path::PathBuf::from("/home/trusted")],
+                    untrusted_default: "readonly".to_string(),
+                    no_workspace_default: "trusted".to_string(),
+                },
+                ..Default::default()
+            },
+        );
+
+        let visible = runtime.prompt_visible_tools();
+        assert_eq!(
+            visible,
+            vec![
+                "file_list".to_string(),
+                "file_read".to_string(),
+                "local_file_list".to_string(),
+                "local_file_read".to_string(),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -4838,7 +5055,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deny_list_block_emits_deny_reason_in_hook_payload() {
+    async fn deny_list_block_emits_structured_decision_in_hook_payload() {
         let mut registry = ToolRegistry::new();
         registry.register_skill(Arc::new(TestEchoSkill)).unwrap();
 
@@ -4878,8 +5095,18 @@ mod tests {
         // Tool should have been denied.
         assert_eq!(result.tool_calls.len(), 1);
         assert!(result.tool_calls[0].is_error);
+        let decision = result.tool_calls[0]
+            .decision
+            .as_ref()
+            .expect("deny path must set a structured decision");
+        assert_eq!(
+            decision.source,
+            encmind_core::permission::DecisionSource::RiskClassifier
+        );
+        assert_eq!(decision.rule_id.as_deref(), Some("immutable_deny_list"));
+        assert!(decision.input_fingerprint.is_some());
 
-        // AfterToolCall hook should have received a payload with deny_reason.
+        // AfterToolCall hook should have received the structured decision + outcome.
         let captured = payloads.lock().unwrap();
         assert_eq!(
             captured.len(),
@@ -4888,10 +5115,13 @@ mod tests {
         );
         let payload = &captured[0];
         assert_eq!(payload["is_error"], true);
-        assert!(
-            payload.get("deny_reason").is_some(),
-            "AfterToolCall payload on deny path must include deny_reason, got: {payload}"
-        );
+        assert_eq!(payload["outcome"], "denied");
+        let decision_payload = payload
+            .get("decision")
+            .expect("payload must include structured decision");
+        assert_eq!(decision_payload["source"], "risk_classifier");
+        assert_eq!(decision_payload["rule_id"], "immutable_deny_list");
+        // Legacy compat field must also be present for existing plugins.
         assert_eq!(payload["deny_reason"], "immutable_deny_list");
     }
 
@@ -4913,7 +5143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_denied_dispatch_sets_tool_call_deny_reason() {
+    async fn tool_denied_dispatch_sets_tool_call_decision() {
         let mut registry = ToolRegistry::new();
         registry
             .register_internal(
@@ -4946,10 +5176,24 @@ mod tests {
 
         assert_eq!(result.tool_calls.len(), 1);
         assert!(result.tool_calls[0].is_error);
+        let decision = result.tool_calls[0]
+            .decision
+            .as_ref()
+            .expect("dispatch denial must set a structured decision");
         assert_eq!(
-            result.tool_calls[0].deny_reason.as_deref(),
-            Some("workspace_untrusted")
+            decision.source,
+            encmind_core::permission::DecisionSource::WorkspaceTrust
         );
+        // rule_id is pinned to the legacy deny_reason code verbatim so
+        // `legacy_deny_reason()` emits the original backward-compat value.
+        assert_eq!(decision.rule_id.as_deref(), Some("workspace_untrusted"));
+        // Dispatch-level denials must also carry the input fingerprint
+        // for audit correlation, matching the governance-level path.
+        assert!(
+            decision.input_fingerprint.is_some(),
+            "dispatch-level denial should attach input fingerprint"
+        );
+        assert_eq!(decision.input_fingerprint.as_ref().unwrap().len(), 12);
         assert!(
             result.tool_calls[0]
                 .output
@@ -4975,8 +5219,179 @@ mod tests {
         }
     }
 
+    struct ClassCapturingTool {
+        captured: Arc<std::sync::Mutex<Option<crate::scheduler::QueryClass>>>,
+    }
+
+    #[async_trait]
+    impl InternalToolHandler for ClassCapturingTool {
+        async fn handle(
+            &self,
+            _input: serde_json::Value,
+            _session_id: &SessionId,
+            _agent_id: &AgentId,
+        ) -> Result<String, AppError> {
+            *self.captured.lock().unwrap() = Some(crate::scheduler::current_query_class());
+            Ok("ok".to_string())
+        }
+    }
+
     #[tokio::test]
-    async fn internal_error_string_does_not_set_deny_reason() {
+    async fn run_inner_scopes_query_class_task_local_to_runtime_config() {
+        // When config.query_class = Background, any tool dispatched
+        // during the run must observe Background via the task-local.
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "capture_class",
+                "capture task-local class",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                Arc::new(ClassCapturingTool {
+                    captured: captured.clone(),
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "capture_class", "{}"),
+            text_response("done"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        // Rebuild the runtime with query_class = Background.
+        let runtime = AgentRuntime::new(
+            runtime.llm.clone(),
+            runtime.session_store.clone(),
+            runtime.tool_registry.clone(),
+            RuntimeConfig {
+                query_class: crate::scheduler::QueryClass::Background,
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let _ = runtime
+            .run(
+                &session.id,
+                make_user_msg("trigger"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            *captured,
+            Some(crate::scheduler::QueryClass::Background),
+            "tool handler should observe Background via task-local set by run_inner"
+        );
+    }
+
+    #[tokio::test]
+    async fn normalize_dispatch_outcome_pins_rule_ids_to_legacy_codes() {
+        // Each mapped denial reason must produce a PermissionDecision
+        // whose rule_id equals the legacy deny_reason code verbatim,
+        // so `legacy_deny_reason()` emits the original string.
+        let input = serde_json::json!({"arg": "x"});
+        for (reason, expected_source) in [
+            (
+                "workspace_untrusted",
+                encmind_core::permission::DecisionSource::WorkspaceTrust,
+            ),
+            (
+                "egress_firewall",
+                encmind_core::permission::DecisionSource::Firewall,
+            ),
+            (
+                "approval_denied",
+                encmind_core::permission::DecisionSource::Approval,
+            ),
+            (
+                "policy_denied",
+                encmind_core::permission::DecisionSource::Approval,
+            ),
+            (
+                "some_custom_reason",
+                encmind_core::permission::DecisionSource::Approval,
+            ),
+        ] {
+            let (_, is_error, decision) = AgentRuntime::normalize_dispatch_outcome(
+                "t",
+                &input,
+                Err(AppError::ToolDenied {
+                    reason: reason.to_string(),
+                    message: format!("denied: {reason}"),
+                }),
+            );
+            assert!(is_error, "{reason} should be an error");
+            let decision = decision.expect("dispatch denial must produce a decision");
+            assert_eq!(decision.source, expected_source, "source for {reason}");
+            assert_eq!(
+                decision.rule_id.as_deref(),
+                Some(reason),
+                "rule_id must match legacy code verbatim for {reason}"
+            );
+            assert!(
+                decision.input_fingerprint.is_some(),
+                "input_fingerprint must be attached for {reason}"
+            );
+            // The compat derivation MUST match the original string.
+            assert_eq!(AgentRuntime::legacy_deny_reason(&decision), reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_inner_defaults_query_class_to_interactive() {
+        // Default RuntimeConfig must observe Interactive.
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "capture_class",
+                "capture task-local class",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                Arc::new(ClassCapturingTool {
+                    captured: captured.clone(),
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "capture_class", "{}"),
+            text_response("done"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let session = store.create_session("web").await.unwrap();
+        let _ = runtime
+            .run(
+                &session.id,
+                make_user_msg("trigger"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            *captured,
+            Some(crate::scheduler::QueryClass::Interactive),
+            "default RuntimeConfig should use Interactive query class"
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_error_string_does_not_set_decision() {
         let mut registry = ToolRegistry::new();
         registry
             .register_internal(
@@ -5009,7 +5424,10 @@ mod tests {
 
         assert_eq!(result.tool_calls.len(), 1);
         assert!(result.tool_calls[0].is_error);
-        assert_eq!(result.tool_calls[0].deny_reason, None);
+        assert!(
+            result.tool_calls[0].decision.is_none(),
+            "internal error sentinel must not be re-interpreted as a structured decision"
+        );
         assert!(
             result.tool_calls[0]
                 .output

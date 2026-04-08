@@ -382,7 +382,15 @@ pub(crate) async fn execute_cron_job(
     if let Some(ref model) = job.model {
         send_params["model"] = serde_json::Value::String(model.clone());
     }
-    let response = super::chat::handle_send(state, send_params, &req_id, None).await;
+    // Cron runs are background — yield to interactive traffic.
+    let response = super::chat::handle_send_with_class(
+        state,
+        send_params,
+        &req_id,
+        None,
+        encmind_agent::scheduler::QueryClass::Background,
+    )
+    .await;
 
     match response {
         ServerMessage::Res { result, .. } => Ok(result),

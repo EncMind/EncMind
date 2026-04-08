@@ -25,6 +25,25 @@ pub struct ContextConfig {
     /// threshold (in chars) will be truncated in-place before dropping whole
     /// messages. Set to 0 to disable. Default: 4096 chars.
     pub sliding_window_truncation_threshold: usize,
+    /// Inject behavioral governance constraints into the system prompt.
+    /// These prevent common LLM failure modes (over-engineering, faking results,
+    /// lazy delegation) by codifying rules instead of relying on model self-discipline.
+    /// Default: true.
+    pub inject_behavioral_governance: bool,
+    /// Inject tool usage grammar into the system prompt.
+    /// Tells the model to prefer structured tools over shell workarounds
+    /// (use file_read instead of `cat`, etc.).
+    /// Default: true.
+    pub inject_tool_usage_grammar: bool,
+    /// Inject browser safety rules into the system prompt when browser tools
+    /// are available. Default: true.
+    pub inject_browser_safety_rules: bool,
+    /// Inject coordinator-mode guidance into the system prompt when the
+    /// `agents_spawn` tool is available. Tells the model how to delegate
+    /// work to sub-agents effectively (synthesize results, don't delegate
+    /// trivial tasks, don't spawn workers to check each other).
+    /// Default: true.
+    pub inject_coordinator_mode: bool,
 }
 
 impl Default for ContextConfig {
@@ -37,8 +56,230 @@ impl Default for ContextConfig {
             channel: None,
             api_provider_disclosure: None,
             sliding_window_truncation_threshold: 4096,
+            inject_behavioral_governance: true,
+            inject_tool_usage_grammar: true,
+            inject_browser_safety_rules: true,
+            inject_coordinator_mode: true,
         }
     }
+}
+
+/// Behavioral governance rules — codified to prevent common LLM failure modes.
+/// These are general AI assistant rules, not coding-specific.
+const BEHAVIORAL_GOVERNANCE: &str = "
+## Behavioral guidelines
+
+- Do exactly what was asked. No scope creep.
+- Read context before acting.
+- Report results honestly. Never fabricate tool output.
+- If unsure, ask instead of guessing.
+- If something fails, diagnose root cause before retrying.
+- Be concise. No filler.
+- Do not give time estimates unless asked.
+- Stop when the task is complete.";
+
+/// Coordinator-mode guidance — injected when the agent can spawn sub-agents.
+/// Prevents common multi-agent anti-patterns: trivial delegation, checker-on-checker
+/// loops, and raw pass-through of worker output without synthesis.
+const COORDINATOR_MODE: &str = "
+## Coordinator mode
+
+You can spawn sub-agents to delegate work. Use this capability carefully:
+
+- You are the orchestrator, not the worker. Your job is to plan, delegate, and synthesize — not to forward raw worker output.
+- Do not delegate trivial tasks (a single file read, one search, one lookup). Do them directly.
+- Do not spawn workers to check each other's work. If verification is needed, do it yourself or ask the user.
+- Synthesize worker results into a single coherent answer before responding to the user. Never paste raw worker transcripts.
+- If a worker's task is incomplete, continue with that same worker instead of spawning a new one for the same topic.
+- When the task does not need delegation, answer directly without spawning.";
+
+fn has_agents_spawn_tool(available_tools: &[String]) -> bool {
+    available_tools
+        .iter()
+        .any(|name| normalized_tool_name(name) == "agents_spawn")
+}
+
+/// Tool usage grammar — tells the model to prefer structured tools over shell workarounds.
+/// Only includes tool families that the agent has access to.
+#[derive(Default)]
+struct ToolFamilies {
+    file_read: Option<String>,
+    file_list: Option<String>,
+    netprobe_fetch: Option<String>,
+    netprobe_search: Option<String>,
+    grep: Option<String>,
+    glob: Option<String>,
+    bash_exec: Option<String>,
+    browser_any: bool,
+    browser_act: Option<String>,
+}
+
+fn normalized_tool_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| match c {
+            '.' | '-' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+fn tool_name_preference_rank(normalized_name: &str, base_name: &str) -> u8 {
+    if normalized_name == base_name {
+        return 0;
+    }
+    if normalized_name == format!("node_{base_name}") {
+        return 1;
+    }
+    if normalized_name == format!("local_{base_name}") {
+        return 2;
+    }
+    if normalized_name.ends_with(&format!("_{base_name}")) {
+        return 3;
+    }
+    4
+}
+
+fn choose_preferred_tool(
+    slot: &mut Option<String>,
+    raw_name: &str,
+    normalized_name: &str,
+    base_name: &str,
+) {
+    match slot {
+        Some(existing) => {
+            let existing_normalized = normalized_tool_name(existing);
+            let existing_rank = tool_name_preference_rank(&existing_normalized, base_name);
+            let candidate_rank = tool_name_preference_rank(normalized_name, base_name);
+            if candidate_rank < existing_rank {
+                *slot = Some(raw_name.to_string());
+            }
+        }
+        None => *slot = Some(raw_name.to_string()),
+    }
+}
+
+fn detect_tool_families(available_tools: &[String]) -> ToolFamilies {
+    let mut families = ToolFamilies::default();
+    for raw_name in available_tools {
+        let name = normalized_tool_name(raw_name);
+        if name == "file_read" || name.ends_with("_file_read") {
+            choose_preferred_tool(&mut families.file_read, raw_name, &name, "file_read");
+        }
+        if name == "file_list" || name.ends_with("_file_list") {
+            choose_preferred_tool(&mut families.file_list, raw_name, &name, "file_list");
+        }
+        if name == "netprobe_fetch" || name.ends_with("_netprobe_fetch") {
+            choose_preferred_tool(
+                &mut families.netprobe_fetch,
+                raw_name,
+                &name,
+                "netprobe_fetch",
+            );
+        }
+        if name == "netprobe_search" || name.ends_with("_netprobe_search") {
+            choose_preferred_tool(
+                &mut families.netprobe_search,
+                raw_name,
+                &name,
+                "netprobe_search",
+            );
+        }
+        if name == "grep" || name.ends_with("_grep") {
+            choose_preferred_tool(&mut families.grep, raw_name, &name, "grep");
+        }
+        if name == "glob" || name.ends_with("_glob") {
+            choose_preferred_tool(&mut families.glob, raw_name, &name, "glob");
+        }
+        if name == "bash_exec" || name.ends_with("_bash_exec") {
+            choose_preferred_tool(&mut families.bash_exec, raw_name, &name, "bash_exec");
+        }
+        let is_browser_tool = matches!(
+            name.as_str(),
+            "browser_navigate" | "browser_screenshot" | "browser_get_text" | "browser_act"
+        ) || name.ends_with("_browser_navigate")
+            || name.ends_with("_browser_screenshot")
+            || name.ends_with("_browser_get_text")
+            || name.ends_with("_browser_act");
+        if is_browser_tool {
+            families.browser_any = true;
+        }
+        if name == "browser_act" || name.ends_with("_browser_act") {
+            choose_preferred_tool(&mut families.browser_act, raw_name, &name, "browser_act");
+        }
+    }
+    families
+}
+
+fn build_tool_usage_grammar(tool_families: &ToolFamilies) -> String {
+    let mut rules = Vec::new();
+    if let Some(tool_name) = &tool_families.file_read {
+        rules.push(format!(
+            "- To read a file → use `{tool_name}` (not shell `cat`/`head`/`tail`)"
+        ));
+    }
+    if let Some(tool_name) = &tool_families.file_list {
+        rules.push(format!(
+            "- To list a directory → use `{tool_name}` (not shell `ls`)"
+        ));
+    }
+    if let Some(tool_name) = &tool_families.netprobe_fetch {
+        rules.push(format!(
+            "- To fetch a URL → use `{tool_name}` (not shell `curl`/`wget`)"
+        ));
+    }
+    if let Some(tool_name) = &tool_families.netprobe_search {
+        rules.push(format!("- To search the web → use `{tool_name}`"));
+    }
+    if let Some(tool_name) = &tool_families.grep {
+        rules.push(format!(
+            "- To search file contents → use `{tool_name}` (not shell `find | grep`)"
+        ));
+    }
+    if let Some(tool_name) = &tool_families.glob {
+        rules.push(format!("- To match file paths → use `{tool_name}`"));
+    }
+    if let Some(tool_name) = &tool_families.bash_exec {
+        rules.push(format!(
+            "- Reserve `{tool_name}` for operations that genuinely require a shell."
+        ));
+    }
+
+    if rules.is_empty() {
+        return String::new();
+    }
+
+    let mut out =
+        String::from("\n## Tool usage\n\nWhen tools are available, use them correctly:\n\n");
+    out.push_str(&rules.join("\n"));
+    out.push_str(
+        "\n\nCalling shell commands as a workaround for missing tools is fragile and discouraged.",
+    );
+    out
+}
+
+fn build_browser_safety_rules(tool_families: &ToolFamilies) -> String {
+    if !tool_families.browser_any {
+        return String::new();
+    }
+
+    let mut out = String::from("\n## Browser safety\n\n");
+    if let Some(tool_name) = &tool_families.browser_act {
+        out.push_str(&format!(
+            "- Prefer `{tool_name}` for multi-step/stateful flows.\n"
+        ));
+    } else {
+        out.push_str(
+            "- Use available browser tools cautiously for stateful flows; avoid blind retries.\n",
+        );
+    }
+    out.push_str(
+        "- Do not repeat the same failing action in a loop. Stop and report after 3 tries.\n\
+         - If a dialog/popup blocks progress, dismiss it and continue once; then report if still blocked.\n\
+         - Use explicit waits/timeouts for page actions and fail fast on repeated timeouts.",
+    );
+    out
 }
 
 /// Manages context construction for LLM calls.
@@ -65,10 +306,52 @@ impl ContextManager {
     /// Build the system message from an agent's configuration.
     /// When a channel is configured, a channel-awareness hint is appended.
     pub fn build_system_message(&self, agent_config: &AgentConfig) -> Message {
+        self.build_system_message_with_tools(agent_config, &[])
+    }
+
+    /// Build the system message with knowledge of which tools are available.
+    /// This enables tool usage grammar to only reference tools that are
+    /// currently visible for the run (registered + policy-allowed).
+    pub fn build_system_message_with_tools(
+        &self,
+        agent_config: &AgentConfig,
+        available_tools: &[String],
+    ) -> Message {
         let mut text = agent_config
             .system_prompt
             .clone()
             .unwrap_or_else(|| "You are a helpful assistant.".to_owned());
+
+        // Behavioral governance — codified rules to prevent common LLM failure modes.
+        if self.config.inject_behavioral_governance {
+            text.push_str(BEHAVIORAL_GOVERNANCE);
+        }
+
+        // Tool usage grammar — prefer structured tools over shell workarounds.
+        // Only includes rules for tools that are actually available.
+        let tool_families = detect_tool_families(available_tools);
+        if self.config.inject_tool_usage_grammar {
+            let grammar = build_tool_usage_grammar(&tool_families);
+            if !grammar.is_empty() {
+                text.push_str(&grammar);
+            }
+        }
+
+        // Browser safety prompt rules are only injected when browser tools
+        // are actually present.
+        if self.config.inject_browser_safety_rules {
+            let rules = build_browser_safety_rules(&tool_families);
+            if !rules.is_empty() {
+                text.push_str(&rules);
+            }
+        }
+
+        // Coordinator-mode guidance is only injected when the agent can
+        // spawn sub-agents. Prevents trivial delegation and raw pass-through
+        // of worker output.
+        if self.config.inject_coordinator_mode && has_agents_spawn_tool(available_tools) {
+            text.push_str(COORDINATOR_MODE);
+        }
 
         if let Some(channel_label) = self
             .config
@@ -147,11 +430,12 @@ impl ContextManager {
         agent_config: &AgentConfig,
         session_store: &Arc<dyn SessionStore>,
         llm: &Arc<dyn LlmBackend>,
+        available_tools: &[String],
     ) -> Result<(Vec<Message>, u32), AppError> {
         const HISTORY_PAGE_SIZE: u32 = 1000;
         const MAX_CONTEXT_HISTORY_MESSAGES: usize = 10000;
 
-        let mut system_msg = self.build_system_message(agent_config);
+        let mut system_msg = self.build_system_message_with_tools(agent_config, available_tools);
 
         // Read paginated history and keep the newest N messages.
         let mut history: Vec<Message> = Vec::new();
@@ -383,13 +667,318 @@ mod tests {
 
     #[test]
     fn build_system_message_uses_prompt() {
-        let cm = ContextManager::new(ContextConfig::default());
+        let cm = ContextManager::new(ContextConfig {
+            inject_behavioral_governance: false,
+            inject_tool_usage_grammar: false,
+            inject_browser_safety_rules: false,
+            ..ContextConfig::default()
+        });
         let agent = default_agent();
         let msg = cm.build_system_message(&agent);
         assert_eq!(msg.role, Role::System);
         match &msg.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "You are a test assistant."),
             _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn build_system_message_includes_behavioral_governance() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["file_read".to_string(), "netprobe_search".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.starts_with("You are a test assistant."));
+                assert!(text.contains("Behavioral guidelines"));
+                assert!(text.contains("Report results honestly"));
+                assert!(text.contains("Tool usage"));
+                assert!(text.contains("file_read"));
+                assert!(text.contains("netprobe_search"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn build_system_message_governance_can_be_disabled() {
+        let cm = ContextManager::new(ContextConfig {
+            inject_behavioral_governance: false,
+            inject_tool_usage_grammar: false,
+            inject_browser_safety_rules: false,
+            ..ContextConfig::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message(&agent);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Behavioral guidelines"));
+                assert!(!text.contains("Tool usage"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn tool_grammar_only_includes_available_tools() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+
+        // Only file_read is registered.
+        let msg = cm.build_system_message_with_tools(&agent, &["file_read".to_string()]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("file_read"));
+                assert!(!text.contains("netprobe_fetch"));
+                assert!(!text.contains("netprobe_search"));
+                assert!(!text.contains("file_list"));
+                assert!(!text.contains("bash_exec"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn tool_grammar_detects_prefixed_tool_families() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &[
+                "node_file_read".to_string(),
+                "local_file_list".to_string(),
+                "node_bash_exec".to_string(),
+            ],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("node_file_read"));
+                assert!(text.contains("local_file_list"));
+                assert!(text.contains("node_bash_exec"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn tool_grammar_prefers_node_over_local_variant_when_both_exist() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &[
+                "local_file_read".to_string(),
+                "node_file_read".to_string(),
+                "local_bash_exec".to_string(),
+                "node_bash_exec".to_string(),
+            ],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("node_file_read"));
+                assert!(!text.contains("local_file_read"));
+                assert!(text.contains("node_bash_exec"));
+                assert!(!text.contains("local_bash_exec"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn tool_grammar_omits_section_if_no_tools_match() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+
+        // No registered tools that match the grammar.
+        let msg = cm.build_system_message_with_tools(&agent, &["custom_tool".to_string()]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Tool usage"));
+                // Behavioral guidelines still present.
+                assert!(text.contains("Behavioral guidelines"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn build_system_message_grammar_independent_of_governance() {
+        // Tool usage grammar can be enabled without behavioral governance.
+        let cm = ContextManager::new(ContextConfig {
+            inject_behavioral_governance: false,
+            inject_tool_usage_grammar: true,
+            inject_browser_safety_rules: false,
+            ..ContextConfig::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(&agent, &["file_read".to_string()]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Behavioral guidelines"));
+                assert!(text.contains("Tool usage"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn browser_safety_rules_only_injected_when_browser_tools_exist() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+
+        let with_browser = cm.build_system_message_with_tools(
+            &agent,
+            &["browser_navigate".to_string(), "browser_act".to_string()],
+        );
+        match &with_browser.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("Browser safety"));
+                assert!(text.contains("Prefer `browser_act`"));
+            }
+            _ => panic!("expected Text"),
+        }
+
+        let without_browser = cm.build_system_message_with_tools(
+            &agent,
+            &["file_read".to_string(), "bash_exec".to_string()],
+        );
+        match &without_browser.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Browser safety"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn browser_safety_rules_can_be_disabled() {
+        let cm = ContextManager::new(ContextConfig {
+            inject_browser_safety_rules: false,
+            ..ContextConfig::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["browser_navigate".to_string(), "browser_act".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Browser safety"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn browser_safety_rules_adapt_when_browser_act_unavailable() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &[
+                "browser_navigate".to_string(),
+                "browser_get_text".to_string(),
+            ],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("Browser safety"));
+                assert!(!text.contains("Prefer `browser_act`"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn browser_safety_rules_do_not_match_unrelated_tool_names() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["custom_browser_helper".to_string(), "file_read".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Browser safety"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn coordinator_mode_injected_when_agents_spawn_registered() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["agents_spawn".to_string(), "file_read".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(text.contains("Coordinator mode"));
+                assert!(text.contains("orchestrator"));
+                assert!(text.contains("Synthesize worker results"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn coordinator_mode_omitted_when_no_spawn_tool() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["file_read".to_string(), "bash_exec".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Coordinator mode"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn coordinator_mode_can_be_disabled() {
+        let cm = ContextManager::new(ContextConfig {
+            inject_coordinator_mode: false,
+            ..ContextConfig::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(
+            &agent,
+            &["agents_spawn".to_string(), "file_read".to_string()],
+        );
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(!text.contains("Coordinator mode"));
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn coordinator_mode_matches_normalized_tool_name() {
+        // agents.spawn, agents-spawn, AGENTS_SPAWN should all trigger coordinator mode.
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        for raw in ["agents.spawn", "agents-spawn", "AGENTS_SPAWN"] {
+            let msg = cm.build_system_message_with_tools(&agent, &[raw.to_string()]);
+            match &msg.content[0] {
+                ContentBlock::Text { text } => {
+                    assert!(
+                        text.contains("Coordinator mode"),
+                        "expected coordinator mode for {raw}"
+                    );
+                }
+                _ => panic!("expected Text"),
+            }
         }
     }
 
@@ -458,7 +1047,12 @@ mod tests {
 
     #[test]
     fn build_system_message_uses_default_when_none() {
-        let cm = ContextManager::new(ContextConfig::default());
+        let cm = ContextManager::new(ContextConfig {
+            inject_behavioral_governance: false,
+            inject_tool_usage_grammar: false,
+            inject_browser_safety_rules: false,
+            ..ContextConfig::default()
+        });
         let agent = AgentConfig {
             system_prompt: None,
             ..default_agent()
@@ -567,7 +1161,7 @@ mod tests {
         let agent = default_agent();
 
         let (messages, max_output) = cm
-            .build_context(&session.id, &agent, &store, &llm)
+            .build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -702,7 +1296,7 @@ mod tests {
         let agent = default_agent();
 
         let (messages, _) = cm
-            .build_context(&session.id, &agent, &store, &llm)
+            .build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -730,7 +1324,7 @@ mod tests {
         let agent = default_agent();
 
         let (messages, _) = cm
-            .build_context(&session.id, &agent, &store, &llm)
+            .build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -777,7 +1371,7 @@ mod tests {
         let agent = default_agent();
 
         let (messages, _) = cm
-            .build_context(&session.id, &agent, &store, &llm)
+            .build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -802,7 +1396,9 @@ mod tests {
         let agent = default_agent();
 
         // Should not error — gracefully degrades
-        let result = cm.build_context(&session.id, &agent, &store, &llm).await;
+        let result = cm
+            .build_context(&session.id, &agent, &store, &llm, &[])
+            .await;
         assert!(result.is_ok());
 
         // System message should not contain memory section
@@ -848,7 +1444,7 @@ mod tests {
 
         let cm = ContextManager::new(ContextConfig::default()).with_memory(memory_search);
         let agent = default_agent();
-        cm.build_context(&session.id, &agent, &store, &llm)
+        cm.build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -877,7 +1473,7 @@ mod tests {
         })
         .with_memory(memory_search);
         let agent = default_agent();
-        cm.build_context(&session.id, &agent, &store, &llm)
+        cm.build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 
@@ -906,7 +1502,7 @@ mod tests {
         .with_memory(memory_search);
         let agent = default_agent();
         let (messages, _) = cm
-            .build_context(&session.id, &agent, &store, &llm)
+            .build_context(&session.id, &agent, &store, &llm, &[])
             .await
             .unwrap();
 

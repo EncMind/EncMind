@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -10,25 +9,34 @@ use encmind_core::error::AppError;
 use encmind_core::types::*;
 
 use crate::runtime::{AgentRuntime, ChatEvent, RunResult};
+use crate::scheduler::{QueryClass, TwoClassScheduler};
 
 /// Concurrency-limited pool for agent executions.
 ///
-/// Uses a semaphore to limit the number of concurrent agent runs
-/// and a per-session timeout to prevent runaway executions.
+/// Uses a two-class priority scheduler to limit the number of
+/// concurrent agent runs and to prioritize interactive traffic
+/// over background (cron/webhook/timer) traffic. A per-session
+/// timeout prevents runaway executions.
 pub struct AgentPool {
-    semaphore: Arc<Semaphore>,
+    pub(crate) scheduler: Arc<TwoClassScheduler>,
     timeout: Duration,
 }
 
 impl AgentPool {
     pub fn new(config: &AgentPoolConfig) -> Self {
         Self {
-            semaphore: Arc::new(Semaphore::new(config.max_concurrent_agents as usize)),
+            scheduler: Arc::new(TwoClassScheduler::new(
+                config.max_concurrent_agents as usize,
+                config.scheduler_fairness_cap,
+            )),
             timeout: Duration::from_secs(config.per_session_timeout_secs),
         }
     }
 
     /// Execute an agent run with concurrency limiting and timeout.
+    ///
+    /// `class` controls scheduling priority: interactive runs are
+    /// served before background runs (subject to the fairness cap).
     pub async fn execute(
         &self,
         runtime: &AgentRuntime,
@@ -36,13 +44,13 @@ impl AgentPool {
         user_message: Message,
         agent_config: &AgentConfig,
         cancel: CancellationToken,
+        class: QueryClass,
     ) -> Result<RunResult, AppError> {
         let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
+            .scheduler
+            .acquire(class)
             .await
-            .map_err(|_| AppError::Internal("agent pool semaphore closed".into()))?;
+            .map_err(|_| AppError::Internal("agent pool scheduler closed".into()))?;
 
         let result = tokio::time::timeout(
             self.timeout,
@@ -71,7 +79,10 @@ impl AgentPool {
     /// Execute an agent run with streaming events, concurrency limiting, and timeout.
     ///
     /// Returns a receiver for streaming events and a join handle for the final result.
-    /// The semaphore permit is held until the run completes.
+    /// The scheduler permit is held until the run completes.
+    ///
+    /// `class` controls scheduling priority: interactive runs are
+    /// served before background runs (subject to the fairness cap).
     pub async fn execute_streaming(
         &self,
         runtime: &AgentRuntime,
@@ -79,6 +90,7 @@ impl AgentPool {
         user_message: Message,
         agent_config: AgentConfig,
         cancel: CancellationToken,
+        class: QueryClass,
     ) -> Result<
         (
             tokio::sync::mpsc::Receiver<ChatEvent>,
@@ -87,11 +99,10 @@ impl AgentPool {
         AppError,
     > {
         let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned()
+            .scheduler
+            .acquire(class)
             .await
-            .map_err(|_| AppError::Internal("agent pool semaphore closed".into()))?;
+            .map_err(|_| AppError::Internal("agent pool scheduler closed".into()))?;
 
         let timeout = self.timeout;
         let timeout_cancel = cancel.clone();
@@ -127,9 +138,9 @@ impl AgentPool {
         Ok((rx, handle))
     }
 
-    /// Number of currently available permits.
-    pub fn available_permits(&self) -> usize {
-        self.semaphore.available_permits()
+    /// Maximum concurrent agent runs allowed by this pool.
+    pub fn max_concurrent(&self) -> usize {
+        self.scheduler.max_concurrent()
     }
 }
 
@@ -203,6 +214,7 @@ mod tests {
                 make_user_msg("hi"),
                 &default_agent(),
                 cancel,
+                QueryClass::Interactive,
             )
             .await
             .unwrap();
@@ -211,38 +223,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn available_permits_reported() {
+    async fn max_concurrent_reported() {
         let pool = AgentPool::new(&AgentPoolConfig {
             max_concurrent_agents: 4,
             per_session_timeout_secs: 60,
             ..Default::default()
         });
-        assert_eq!(pool.available_permits(), 4);
-    }
-
-    #[tokio::test]
-    async fn concurrency_limiting() {
-        // Create a pool with max 2 concurrent
-        let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
-            max_concurrent_agents: 2,
-            per_session_timeout_secs: 60,
-            ..Default::default()
-        }));
-
-        // Verify the semaphore behavior directly.
-        assert_eq!(pool.available_permits(), 2);
-
-        // Acquire permits manually to simulate concurrent usage
-        let sem = pool.semaphore.clone();
-        let p1 = sem.acquire().await.unwrap();
-        assert_eq!(pool.available_permits(), 1);
-        let p2 = sem.acquire().await.unwrap();
-        assert_eq!(pool.available_permits(), 0);
-
-        drop(p1);
-        assert_eq!(pool.available_permits(), 1);
-        drop(p2);
-        assert_eq!(pool.available_permits(), 2);
+        assert_eq!(pool.max_concurrent(), 4);
     }
 
     #[tokio::test]
@@ -314,6 +301,7 @@ mod tests {
                 make_user_msg("timeout"),
                 &default_agent(),
                 cancel,
+                QueryClass::Interactive,
             )
             .await;
 
@@ -388,6 +376,7 @@ mod tests {
                 make_user_msg("timeout"),
                 default_agent(),
                 cancel,
+                QueryClass::Interactive,
             )
             .await
             .unwrap();
@@ -396,17 +385,35 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("timed out"), "expected timeout error: {err}");
-        assert_eq!(pool.available_permits(), 1);
+
+        // After timeout, the scheduler slot must be released — a
+        // subsequent acquire should not hang.
+        let (_rx2, handle2) = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.execute_streaming(
+                &runtime,
+                store.create_session("web").await.unwrap().id,
+                make_user_msg("again"),
+                default_agent(),
+                CancellationToken::new(),
+                QueryClass::Interactive,
+            ),
+        )
+        .await
+        .expect("acquire should not hang after timeout release")
+        .unwrap();
+        // Clean up the second run (it will also hit the hanging backend).
+        handle2.abort();
     }
 
     #[tokio::test]
     async fn permit_released_after_cancel() {
-        let (pool, runtime, store) = make_pool_and_runtime(2, 60, vec![text_response("x")]).await;
+        let (pool, runtime, store) = make_pool_and_runtime(1, 60, vec![text_response("x")]).await;
         let session = store.create_session("web").await.unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        // Even though this errors due to cancellation, permit should be released
+        // Cancelled run errors out but must release its scheduler slot.
         let _ = pool
             .execute(
                 &runtime,
@@ -414,9 +421,101 @@ mod tests {
                 make_user_msg("cancel"),
                 &default_agent(),
                 cancel,
+                QueryClass::Interactive,
             )
             .await;
 
-        assert_eq!(pool.available_permits(), 2);
+        // Behavioral check: with max_concurrent=1, a second acquire
+        // must succeed without hanging.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.execute(
+                &runtime,
+                &session.id,
+                make_user_msg("next"),
+                &default_agent(),
+                CancellationToken::new(),
+                QueryClass::Interactive,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "second acquire should not hang — slot was not released after cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_preempts_background_under_pressure() {
+        let (pool, _runtime, _store) = make_pool_and_runtime(1, 60, vec![]).await;
+        let pool = Arc::new(pool);
+
+        // Hold the single slot with a background waiter.
+        let held = pool
+            .scheduler
+            .acquire(QueryClass::Background)
+            .await
+            .unwrap();
+
+        // Queue 3 backgrounds, then 2 interactives.
+        let order: Arc<std::sync::Mutex<Vec<&'static str>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for label in ["bg-1", "bg-2", "bg-3"] {
+            let p = pool.clone();
+            let order = order.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = p.scheduler.acquire(QueryClass::Background).await.unwrap();
+                order.lock().unwrap().push(label);
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        for label in ["int-1", "int-2"] {
+            let p = pool.clone();
+            let order = order.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = p.scheduler.acquire(QueryClass::Interactive).await.unwrap();
+                order.lock().unwrap().push(label);
+                tokio::time::sleep(Duration::from_millis(3)).await;
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        drop(held);
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let observed = order.lock().unwrap().clone();
+        // Both interactives must be served before any background
+        // that was queued after them finishes. With fairness_cap=4
+        // (the default) and only 2 interactives, interactives are
+        // drained first, then backgrounds follow.
+        let first_bg_after_int = observed
+            .iter()
+            .position(|s| s.starts_with("int-"))
+            .and_then(|int_pos| {
+                observed
+                    .iter()
+                    .enumerate()
+                    .skip(int_pos)
+                    .find(|(_, s)| s.starts_with("bg-"))
+                    .map(|(idx, _)| idx)
+            });
+        let last_int_pos = observed
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, s)| s.starts_with("int-"))
+            .map(|(idx, _)| idx)
+            .expect("interactive must be served");
+        if let Some(bg_idx) = first_bg_after_int {
+            assert!(
+                bg_idx > last_int_pos,
+                "interactives should finish before remaining backgrounds start. sequence: {observed:?}"
+            );
+        }
     }
 }

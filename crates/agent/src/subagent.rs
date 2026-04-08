@@ -31,8 +31,8 @@ pub struct SpawnAgentHandler {
     runtime_config: RuntimeConfig,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
     approval_checker: Option<ToolApprovalChecker>,
-    /// Live config for reading `bash_mode` per invocation.
-    /// When set, takes precedence over the static `approval_checker`.
+    /// Live config for reading runtime policy per invocation.
+    /// When set, takes precedence over static runtime/approval snapshots.
     config: Option<Arc<RwLock<AppConfig>>>,
     firewall: Option<Arc<EgressFirewall>>,
     // caller_agent_id -> allowed target agent IDs
@@ -73,9 +73,9 @@ impl SpawnAgentHandler {
         self
     }
 
-    /// Set shared config for live `bash_mode` reads per invocation.
-    /// When set, `handle()` builds a fresh `ToolApprovalChecker` each time
-    /// instead of using the static `approval_checker`.
+    /// Set shared config for live policy reads per invocation.
+    /// When set, `handle()` refreshes prompt-injection toggles and builds a
+    /// fresh `ToolApprovalChecker` instead of using static snapshots.
     pub fn with_config(mut self, config: Arc<RwLock<AppConfig>>) -> Self {
         self.config = Some(config);
         self
@@ -143,6 +143,43 @@ impl InternalToolHandler for SpawnAgentHandler {
         let sub_registry = self.base_registry.filtered_for_agent(&agent_config.skills);
         let mut sub_runtime_config = self.runtime_config.clone();
         sub_runtime_config.workspace_dir = agent_config.workspace.as_ref().map(PathBuf::from);
+
+        // Live-read prompt injection toggles, workspace trust, and bash policy
+        // from current config (not the init snapshot), so operator changes take
+        // effect immediately.
+        let (live_workspace_trust, live_bash_mode) = if let Some(ref cfg) = self.config {
+            let guard = cfg.read().await;
+            sub_runtime_config
+                .context_config
+                .sliding_window_truncation_threshold =
+                guard.token_optimization.sliding_window_truncation_threshold;
+            sub_runtime_config
+                .context_config
+                .inject_behavioral_governance =
+                guard.token_optimization.inject_behavioral_governance;
+            sub_runtime_config.context_config.inject_tool_usage_grammar =
+                guard.token_optimization.inject_tool_usage_grammar;
+            sub_runtime_config
+                .context_config
+                .inject_browser_safety_rules = guard.token_optimization.inject_browser_safety_rules;
+            sub_runtime_config.context_config.inject_coordinator_mode =
+                guard.token_optimization.inject_coordinator_mode;
+            (
+                Some(guard.security.workspace_trust.clone()),
+                Some(guard.security.bash_mode.clone()),
+            )
+        } else {
+            (None, None)
+        };
+        if let Some(workspace_trust) = live_workspace_trust {
+            sub_runtime_config.workspace_trust = workspace_trust;
+        };
+        // Inherit the parent's class from the task-local set by
+        // `AgentRuntime::run_inner` so the nested run scopes the same
+        // class into its own task-local. Although current policy
+        // forbids further nesting, this keeps the invariant local.
+        let parent_class = crate::scheduler::current_query_class();
+        sub_runtime_config.query_class = parent_class;
         let mut sub_runtime = AgentRuntime::new(
             self.llm.clone(),
             self.session_store.clone(),
@@ -154,11 +191,7 @@ impl InternalToolHandler for SpawnAgentHandler {
         }
         if let Some(ref handler) = self.approval_handler {
             // Prefer live config over static checker
-            let checker = if let Some(ref cfg) = self.config {
-                let bash_mode = {
-                    let guard = cfg.read().await;
-                    guard.security.bash_mode.clone()
-                };
+            let checker = if let Some(bash_mode) = live_bash_mode {
                 ToolApprovalChecker::new(bash_mode)
             } else if let Some(ref static_checker) = self.approval_checker {
                 static_checker.clone()
@@ -180,6 +213,10 @@ impl InternalToolHandler for SpawnAgentHandler {
         };
 
         let cancel = CancellationToken::new();
+        // `parent_class` was captured above from the task-local so the
+        // sub_runtime's config and the pool acquisition agree. A
+        // background parent (e.g. cron) must not escalate its
+        // subagents to interactive priority.
         let result = self
             .agent_pool
             .execute(
@@ -188,6 +225,7 @@ impl InternalToolHandler for SpawnAgentHandler {
                 user_msg,
                 &agent_config,
                 cancel,
+                parent_class,
             )
             .await?;
 
@@ -208,7 +246,11 @@ impl InternalToolHandler for SpawnAgentHandler {
         let denied_tools: Vec<String> = result
             .tool_calls
             .iter()
-            .filter(|call| call.deny_reason.as_deref() == Some("workspace_untrusted"))
+            .filter(|call| {
+                call.decision.as_ref().is_some_and(|d| {
+                    d.source == encmind_core::permission::DecisionSource::WorkspaceTrust
+                })
+            })
             .map(|call| call.name.clone())
             .collect();
         if !denied_tools.is_empty() {
@@ -834,6 +876,145 @@ mod tests {
             result2.is_ok(),
             "spawn 2 should succeed (agent runs, bash denied): {:?}",
             result2
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "bash_exec should NOT have been called during spawn 2 (still 1 from spawn 1)"
+        );
+    }
+
+    /// Regression test: mutating shared config between spawns changes workspace trust.
+    ///
+    /// Same SpawnAgentHandler instance, first spawn with trusted workspace permits bash,
+    /// then config is mutated to remove trust, second spawn blocks bash via workspace gate.
+    #[tokio::test]
+    async fn live_config_updates_workspace_trust_between_spawns() {
+        struct CountingBashHandler {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl InternalToolHandler for CountingBashHandler {
+            async fn handle(
+                &self,
+                _input: serde_json::Value,
+                _session_id: &SessionId,
+                _agent_id: &AgentId,
+            ) -> Result<String, AppError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok("ran".into())
+            }
+        }
+
+        #[derive(Default)]
+        struct ApproveAll;
+
+        #[async_trait]
+        impl ApprovalHandler for ApproveAll {
+            async fn request_approval(&self, _request: ApprovalRequest) -> ApprovalDecision {
+                ApprovalDecision::Approved
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mut researcher = researcher_config();
+        researcher.workspace = Some(workspace.path().display().to_string());
+
+        // 4 scripted responses: 2 per spawn (tool_use + text)
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(
+            vec![
+                // Spawn 1: trusted workspace → tool runs
+                tool_use_response("t1", "bash_exec", r#"{"command":"ls"}"#),
+                text_response("bash ran ok"),
+                // Spawn 2: untrusted workspace → tool blocked
+                tool_use_response("t2", "bash_exec", r#"{"command":"ls"}"#),
+                text_response("bash denied by workspace trust"),
+            ],
+            128_000,
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+        let registry: Arc<dyn AgentRegistry> = Arc::new(TestAgentRegistry::new(vec![researcher]));
+        let pool = Arc::new(AgentPool::new(&AgentPoolConfig {
+            max_concurrent_agents: 4,
+            per_session_timeout_secs: 60,
+            ..Default::default()
+        }));
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mut base_registry = ToolRegistry::new();
+        base_registry
+            .register_internal(
+                "bash_exec",
+                "bash tool",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
+                }),
+                Arc::new(CountingBashHandler {
+                    calls: calls.clone(),
+                }),
+            )
+            .unwrap();
+
+        // Start with trusted workspace.
+        let mut config = AppConfig::default();
+        config.security.bash_mode = BashMode::Allowlist {
+            patterns: vec!["ls*".into()],
+        };
+        config.security.workspace_trust.trusted_paths = vec![workspace.path().to_path_buf()];
+        config.security.workspace_trust.untrusted_default = "readonly".to_string();
+        let shared_config = Arc::new(RwLock::new(config));
+
+        let handler = SpawnAgentHandler::new(
+            llm,
+            store,
+            registry,
+            pool,
+            Arc::new(base_registry),
+            RuntimeConfig::default(),
+        )
+        .with_approval(
+            Arc::new(ApproveAll),
+            // Static checker (will be overridden by live config).
+            ToolApprovalChecker::new(BashMode::Ask),
+        )
+        .with_config(shared_config.clone());
+
+        let result1 = handler
+            .handle(
+                serde_json::json!({"agent_id": "researcher", "task": "list files"}),
+                &SessionId::new(),
+                &AgentId::default(),
+            )
+            .await;
+        assert!(result1.is_ok(), "spawn 1 should succeed: {:?}", result1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "bash_exec should have been called once during spawn 1"
+        );
+
+        // Mutate shared config to make the same workspace untrusted.
+        {
+            let mut cfg = shared_config.write().await;
+            let other = tempfile::tempdir().unwrap();
+            cfg.security.workspace_trust.trusted_paths = vec![other.path().to_path_buf()];
+            cfg.security.workspace_trust.untrusted_default = "readonly".to_string();
+        }
+
+        let result2 = handler
+            .handle(
+                serde_json::json!({"agent_id": "researcher", "task": "list files again"}),
+                &SessionId::new(),
+                &AgentId::default(),
+            )
+            .await;
+        assert!(result2.is_err(), "spawn 2 should fail: {:?}", result2);
+        let err_text = result2.err().unwrap().to_string();
+        assert!(
+            err_text.contains("workspace_untrusted"),
+            "expected workspace_untrusted deny reason, got: {err_text}"
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),

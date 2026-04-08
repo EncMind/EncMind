@@ -4117,6 +4117,12 @@ pub(crate) fn initialize_tool_registry(
                 sliding_window_truncation_threshold: config
                     .token_optimization
                     .sliding_window_truncation_threshold,
+                inject_behavioral_governance: config
+                    .token_optimization
+                    .inject_behavioral_governance,
+                inject_tool_usage_grammar: config.token_optimization.inject_tool_usage_grammar,
+                inject_browser_safety_rules: config.token_optimization.inject_browser_safety_rules,
+                inject_coordinator_mode: config.token_optimization.inject_coordinator_mode,
                 ..ContextConfig::default()
             },
             tool_calls_per_run: Some(config.security.rate_limit.tool_calls_per_run),

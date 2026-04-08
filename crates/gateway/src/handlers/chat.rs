@@ -46,6 +46,26 @@ pub async fn handle_send(
     req_id: &str,
     ws_sender: Option<crate::ws::WsSender>,
 ) -> ServerMessage {
+    handle_send_with_class(
+        state,
+        params,
+        req_id,
+        ws_sender,
+        encmind_agent::scheduler::QueryClass::Interactive,
+    )
+    .await
+}
+
+/// Like `handle_send`, but with an explicit priority class. Used by
+/// background entrypoints (cron, webhook runners, workflow timers)
+/// that should yield to user-initiated traffic.
+pub async fn handle_send_with_class(
+    state: &AppState,
+    params: serde_json::Value,
+    req_id: &str,
+    ws_sender: Option<crate::ws::WsSender>,
+    query_class: encmind_agent::scheduler::QueryClass,
+) -> ServerMessage {
     let text = params
         .get("text")
         .and_then(|v| v.as_str())
@@ -368,6 +388,10 @@ pub async fn handle_send(
             channel: Some(channel.clone()),
             api_provider_disclosure,
             sliding_window_truncation_threshold: tok_config.sliding_window_truncation_threshold,
+            inject_behavioral_governance: tok_config.inject_behavioral_governance,
+            inject_tool_usage_grammar: tok_config.inject_tool_usage_grammar,
+            inject_browser_safety_rules: tok_config.inject_browser_safety_rules,
+            inject_coordinator_mode: tok_config.inject_coordinator_mode,
             ..ContextConfig::default()
         },
         tool_calls_per_run: Some(tool_calls_per_run),
@@ -377,6 +401,11 @@ pub async fn handle_send(
         ),
         blocking_tool_cancel_grace: Duration::from_secs(blocking_tool_cancel_grace_secs),
         workspace_trust,
+        // Subagents spawned inside this run inherit the parent's class
+        // via runtime_config. Without this, a cron (background) parent
+        // would escalate its children to interactive priority and
+        // dilute the two-class scheduler.
+        query_class,
         ..RuntimeConfig::default()
     };
 
@@ -409,6 +438,7 @@ pub async fn handle_send(
                 user_message,
                 agent_config.clone(),
                 cancel_token,
+                query_class,
             )
             .await
         {
@@ -477,6 +507,7 @@ pub async fn handle_send(
                 user_message,
                 &agent_config,
                 cancel_token,
+                query_class,
             )
             .await
     };
@@ -506,19 +537,32 @@ pub async fn handle_send(
         }
     };
 
-    // Audit workspace trust denials.
+    // Audit governance denials with structured provenance.
     for call in &run_result.tool_calls {
-        if call.deny_reason.as_deref() == Some("workspace_untrusted") {
-            let _ = state.audit.append(
-                "security",
-                "workspace_trust_denied",
-                Some(&format!(
-                    "tool '{}' blocked by workspace trust policy",
-                    call.name
-                )),
-                Some(agent_id.as_str()),
-            );
-        }
+        let Some(decision) = call.decision.as_ref() else {
+            continue;
+        };
+        // Workspace-trust denials get their own category for operator
+        // alerting; other sources share the generic governance category.
+        let (category, action) = match decision.source {
+            encmind_core::permission::DecisionSource::WorkspaceTrust => {
+                ("security", "workspace_trust_denied")
+            }
+            _ => ("security", "tool_denied"),
+        };
+        let detail = serde_json::json!({
+            "tool": call.name,
+            "source": decision.source.as_str(),
+            "rule_id": decision.rule_id,
+            "reason": decision.reason,
+            "input_fingerprint": decision.input_fingerprint,
+        });
+        let _ = state.audit.append(
+            category,
+            action,
+            Some(&detail.to_string()),
+            Some(agent_id.as_str()),
+        );
     }
 
     // Audit loop-break events for parity with rate-limit / budget audit.
@@ -561,12 +605,20 @@ pub async fn handle_send(
         .tool_calls
         .iter()
         .map(|call| {
+            // Deprecated compat view: rule_id, else source name.
+            // Kept during the structured-decision transition window.
+            let legacy_deny_reason = call.decision.as_ref().map(|d| {
+                d.rule_id
+                    .clone()
+                    .unwrap_or_else(|| d.source.as_str().to_string())
+            });
             serde_json::json!({
                 "name": call.name,
                 "input": call.input,
                 "output": call.output,
                 "is_error": call.is_error,
-                "deny_reason": call.deny_reason,
+                "decision": call.decision,
+                "deny_reason": legacy_deny_reason,
             })
         })
         .collect::<Vec<_>>();
@@ -1591,6 +1643,10 @@ mod tests {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0]["name"], "bash_exec");
                 assert_eq!(tool_calls[0]["is_error"], true);
+                let decision = &tool_calls[0]["decision"];
+                assert_eq!(decision["source"], "approval");
+                assert_eq!(decision["rule_id"], "policy_denied");
+                // Legacy compat field must still be present for existing clients.
                 assert_eq!(tool_calls[0]["deny_reason"], "policy_denied");
                 let output = tool_calls[0]["output"].as_str().unwrap_or_default();
                 assert!(
@@ -1701,6 +1757,11 @@ mod tests {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0]["name"], "bash_exec");
                 assert_eq!(tool_calls[0]["is_error"], true);
+                let decision = &tool_calls[0]["decision"];
+                assert_eq!(decision["source"], "workspace_trust");
+                // rule_id is pinned to the legacy deny_reason code.
+                assert_eq!(decision["rule_id"], "workspace_untrusted");
+                // Legacy compat field — must match the pre-structured value.
                 assert_eq!(tool_calls[0]["deny_reason"], "workspace_untrusted");
                 let output = tool_calls[0]["output"].as_str().unwrap_or_default();
                 assert!(

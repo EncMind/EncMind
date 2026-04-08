@@ -283,6 +283,15 @@ security:
     messages_per_minute: 30
     tool_calls_per_run: 50
 
+token_optimization:
+  max_tool_iterations: 20
+  max_tool_output_chars: 32768
+  sliding_window_truncation_threshold: 4096
+  # A.7 prompt governance toggles (all default to true)
+  inject_behavioral_governance: true
+  inject_tool_usage_grammar: true
+  inject_browser_safety_rules: true
+
 agents:
   list: []
 
@@ -320,6 +329,8 @@ gateway:
     bash_exec: true
     admin: false
 ```
+
+`token_optimization.inject_behavioral_governance`, `token_optimization.inject_tool_usage_grammar`, and `token_optimization.inject_browser_safety_rules` control A.7 prompt guardrails. Keep them enabled unless you are intentionally running a minimal prompt for debugging.
 
 ### Embedding modes
 

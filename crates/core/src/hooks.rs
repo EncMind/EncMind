@@ -14,6 +14,46 @@ tokio::task_local! {
     static CUSTOM_EVENT_DEPTH: Cell<u8>;
 }
 
+/// Discriminator on the outcome of a tool call.
+///
+/// Included in the `AfterToolCall` hook payload so plugins can branch on
+/// success/failure/denied without needing a separate hook point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOutcome {
+    /// The tool returned successfully.
+    Success,
+    /// The tool ran but produced an error result.
+    Failure,
+    /// The tool was blocked by governance before or after dispatch.
+    Denied,
+}
+
+impl ToolOutcome {
+    /// Classify an outcome from the dispatch result.
+    ///
+    /// - Any decision (governance denial) → `Denied`
+    /// - `is_error = true` with no decision → `Failure`
+    /// - `is_error = false` → `Success`
+    pub fn classify(is_error: bool, has_decision: bool) -> Self {
+        if has_decision {
+            Self::Denied
+        } else if is_error {
+            Self::Failure
+        } else {
+            Self::Success
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+            Self::Denied => "denied",
+        }
+    }
+}
+
 /// Hook points in the gateway lifecycle where plugins can intercept processing.
 /// Phase 1 ships this minimal set. Additional points are added in later phases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -629,6 +669,32 @@ mod tests {
         assert_eq!(ctx.session_id.unwrap().as_str(), "s1");
         assert_eq!(ctx.agent_id.unwrap().as_str(), "main");
         assert_eq!(ctx.method.unwrap(), "chat.send");
+    }
+
+    #[test]
+    fn tool_outcome_classify() {
+        assert_eq!(ToolOutcome::classify(false, false), ToolOutcome::Success);
+        assert_eq!(ToolOutcome::classify(true, false), ToolOutcome::Failure);
+        assert_eq!(ToolOutcome::classify(true, true), ToolOutcome::Denied);
+        // Decision takes precedence even if is_error is false (shouldn't
+        // happen in practice, but the classifier must be total).
+        assert_eq!(ToolOutcome::classify(false, true), ToolOutcome::Denied);
+    }
+
+    #[test]
+    fn tool_outcome_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(ToolOutcome::Success).unwrap(),
+            serde_json::json!("success")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolOutcome::Failure).unwrap(),
+            serde_json::json!("failure")
+        );
+        assert_eq!(
+            serde_json::to_value(ToolOutcome::Denied).unwrap(),
+            serde_json::json!("denied")
+        );
     }
 
     #[test]

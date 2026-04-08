@@ -420,7 +420,9 @@ pub struct SessionQueryGuard {
 - Concurrent sends to the same session are serialized in FIFO order
 - Guard acquired before agent loop, released on completion via RAII permit
 
-**Files:** `crates/gateway/src/handlers/chat.rs`, new `crates/gateway/src/query_guard.rs`
+**Two-class global scheduler:** Orthogonal to per-session FIFO, the agent pool uses a `TwoClassScheduler` (`crates/agent/src/scheduler.rs`) with `Interactive` and `Background` classes. Interactive runs (user chat from WS / channels) are served before background runs (cron, webhook triggers, timers). A `scheduler_fairness_cap` (default 4) forces one background dispatch after every N consecutive interactives so background traffic cannot starve. Classification is a parameter on `AgentPool::execute(_streaming)`; `handle_send` defaults to Interactive, and `handle_send_with_class` lets cron/webhook callers override to Background.
+
+**Files:** `crates/gateway/src/handlers/chat.rs`, `crates/gateway/src/query_guard.rs`, `crates/agent/src/scheduler.rs`, `crates/agent/src/pool.rs`
 
 ---
 
@@ -701,7 +703,15 @@ pub fn classify_bash_risk(command: &str) -> RiskLevel {
 
 This runs BEFORE hooks and permission checks — it's a pre-filter that flags obviously dangerous commands for extra scrutiny even in `bypass` mode (feeds into the immutable deny-list from 4.12).
 
-**Files:** `crates/agent/src/runtime.rs` (pipeline), new `crates/agent/src/risk_classifier.rs`, `crates/core/src/hooks.rs` (power boundary rules)
+**Structured permission decisions:**
+
+Denials carry a typed `PermissionDecision { source, rule_id, reason, input_fingerprint }` record rather than a free-form string. The `source` is one of `risk_classifier | workspace_trust | firewall | approval | hook | rate_limit | schema`, and `input_fingerprint` is a short SHA-256 prefix for log correlation. The record flows through the `AfterToolCall` hook payload (alongside a `ToolOutcome` discriminator: `success | failure | denied`) and into audit events, giving operators a single typed object to answer "why did this get denied?" without string parsing. Plugins can branch on `outcome` in a single hook point instead of needing a separate failure hook.
+
+For backward compatibility, `rule_id` for every mapped denial is pinned to the legacy flat code (`immutable_deny_list`, `workspace_untrusted`, `egress_firewall`, `policy_denied`, `approval_denied`). A deprecated flat `deny_reason` field is emitted alongside the structured record on hook payloads and in the `chat.send` response — it is derived from `rule_id` (falling back to `source` only if no rule_id is set), so existing consumers of the pre-structured contract continue to see their original values verbatim during the transition window.
+
+**Schema validation is intentionally fail-open.** LLMs routinely emit near-miss inputs (stringified numbers, extra fields). A hard schema reject would turn transient model sloppiness into tool errors; individual tool handlers remain the authoritative validators. An **optional per-tool strict mode** for high-risk tools is a future enhancement, tracked with B.8 — the global default stays fail-open.
+
+**Files:** `crates/agent/src/runtime.rs` (pipeline), `crates/agent/src/risk_classifier.rs`, `crates/core/src/permission.rs` (`PermissionDecision`, `DecisionSource`), `crates/core/src/hooks.rs` (`ToolOutcome`, power boundary rules)
 
 ---
 
@@ -1121,7 +1131,7 @@ Foundation. Nothing else ships until these are stable. Focus: prevent corruption
 |---|---------|--------|---------------------|
 | A.1 | Per-session query guard + FIFO queue | 1-2 days | Concurrent chat.send serialized per session |
 | A.2 | Message normalization pipeline | 1-2 days | No `invalid_request_error` 400s caused by tool payload schema mismatch (other 400 classes out of scope) |
-| A.3 | Tool execution governance pipeline | 2-3 days | Full chain: validate → risk classify → pre-hook → permission → execute → post-hook; failure path logged with structured context (formal failure hook in B.5) |
+| A.3 | Tool execution governance pipeline | 2-3 days | Full chain: validate → risk classify → pre-hook → permission → execute → post-hook; denials carry typed `PermissionDecision { source, rule_id, reason, input_fingerprint }`; `AfterToolCall` payload includes `ToolOutcome { Success / Failure / Denied }` discriminator; formal failure hook still deferred to B.5 |
 | A.4 | Streaming event pipeline (ChatEvent) | 5-7 days | delta/tool_start/progress/complete/done events end-to-end |
 | A.5 | Streaming tool executor (parallel safe) | 5-7 days | Read-only tools run in parallel, destructive serialize |
 | A.6 | Workspace trust + immutable deny-list | 2-3 days | Untrusted dirs cannot load plugins/skills/MCP; deny-list enforced even in bypass mode |
@@ -1151,7 +1161,7 @@ Build on Phase A's stable execution model. Focus: token cost reduction, context 
 | B.5 | Hook system: 27 events + async contract | 3-4 days | All hook events firing, async hooks with timeout |
 | B.6 | Permission modes (default/plan/readonly/bypass) | 2-3 days | Mode enforced per session |
 | B.7 | Memory type taxonomy | 1-2 days | 4 types enforced, type-aware search working |
-| B.8 | Permission decision tracing | 2 days | Rich decision objects with reason + source |
+| B.8 | Permission decision tracing (finish) | 1 day | Base `PermissionDecision` type shipped in A.3; B.8 adds: per-tool strict schema mode for high-risk tools, decision rendering in web UI timeline, structured audit filter by source/rule_id |
 | B.9 | Startup profiling + parallel prefetch | 1-2 days | Cold start profiled, parallel init working |
 | B.10 | ToolUseContext dependency injection | 2-3 days | All tools receive context, mocked in tests |
 | B.11 | Permission explainer side-query | 1-2 days | Concurrent risk explanation shown alongside permission prompt |

@@ -1266,6 +1266,11 @@ pub struct AgentPoolConfig {
     /// Independent of max_concurrent_agents (which limits concurrent sessions).
     #[serde(default = "default_max_parallel_safe_tools")]
     pub max_parallel_safe_tools: usize,
+    /// Maximum consecutive interactive runs before the two-class scheduler
+    /// forces one background run. 0 = strict priority (background may
+    /// starve under continuous interactive load). Default: 4.
+    #[serde(default = "default_scheduler_fairness_cap")]
+    pub scheduler_fairness_cap: usize,
 }
 
 fn default_max_concurrent_agents() -> u32 {
@@ -1277,6 +1282,9 @@ fn default_session_timeout() -> u64 {
 fn default_max_parallel_safe_tools() -> usize {
     4
 }
+fn default_scheduler_fairness_cap() -> usize {
+    4
+}
 
 impl Default for AgentPoolConfig {
     fn default() -> Self {
@@ -1284,6 +1292,7 @@ impl Default for AgentPoolConfig {
             max_concurrent_agents: default_max_concurrent_agents(),
             per_session_timeout_secs: default_session_timeout(),
             max_parallel_safe_tools: default_max_parallel_safe_tools(),
+            scheduler_fairness_cap: default_scheduler_fairness_cap(),
         }
     }
 }
@@ -2082,6 +2091,22 @@ pub struct TokenOptimizationConfig {
     pub screenshot_payload_mode: ScreenshotPayloadMode,
     #[serde(default)]
     pub per_tool_output_chars: HashMap<String, usize>,
+    /// Inject behavioral governance constraints into the system prompt.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub inject_behavioral_governance: bool,
+    /// Inject tool usage grammar into the system prompt.
+    /// Default: true.
+    #[serde(default = "default_true")]
+    pub inject_tool_usage_grammar: bool,
+    /// Inject browser safety rules into the system prompt when browser tools
+    /// are available. Default: true.
+    #[serde(default = "default_true")]
+    pub inject_browser_safety_rules: bool,
+    /// Inject coordinator-mode guidance into the system prompt when the
+    /// `agents_spawn` tool is available. Default: true.
+    #[serde(default = "default_true")]
+    pub inject_coordinator_mode: bool,
 }
 
 fn default_max_tool_iterations() -> u32 {
@@ -2103,6 +2128,10 @@ impl Default for TokenOptimizationConfig {
             auto_title_enabled: false,
             screenshot_payload_mode: ScreenshotPayloadMode::default(),
             per_tool_output_chars: HashMap::new(),
+            inject_behavioral_governance: true,
+            inject_tool_usage_grammar: true,
+            inject_browser_safety_rules: true,
+            inject_coordinator_mode: true,
         }
     }
 }
@@ -3188,6 +3217,10 @@ channels:
         assert_eq!(config.max_tool_output_chars, 32_768);
         assert_eq!(config.sliding_window_truncation_threshold, 4096);
         assert!(!config.auto_title_enabled);
+        assert!(config.inject_behavioral_governance);
+        assert!(config.inject_tool_usage_grammar);
+        assert!(config.inject_browser_safety_rules);
+        assert!(config.inject_coordinator_mode);
         assert_eq!(
             config.screenshot_payload_mode,
             ScreenshotPayloadMode::Metadata
@@ -3206,6 +3239,10 @@ token_optimization:
   max_tool_output_chars: 4096
   sliding_window_truncation_threshold: 2048
   auto_title_enabled: true
+  inject_behavioral_governance: false
+  inject_tool_usage_grammar: false
+  inject_browser_safety_rules: false
+  inject_coordinator_mode: false
   screenshot_payload_mode: base64_legacy
   per_tool_output_chars:
     bash_exec: 1024
@@ -3221,6 +3258,10 @@ token_optimization:
             2048
         );
         assert!(config.token_optimization.auto_title_enabled);
+        assert!(!config.token_optimization.inject_behavioral_governance);
+        assert!(!config.token_optimization.inject_tool_usage_grammar);
+        assert!(!config.token_optimization.inject_browser_safety_rules);
+        assert!(!config.token_optimization.inject_coordinator_mode);
         assert_eq!(
             config.token_optimization.screenshot_payload_mode,
             ScreenshotPayloadMode::Base64Legacy
