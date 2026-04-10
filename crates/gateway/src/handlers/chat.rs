@@ -70,6 +70,25 @@ pub async fn handle_send_with_class(
     // The computed latency is reported in the chat.send response so
     // clients (web UI, channel bots, cron run logs) get per-turn
     // economics without an extra query.
+    // Reject new runs during graceful shutdown. The drain task sets
+    // this flag before checking active_runs, so no late-started run
+    // can slip in after the drain exits and escape force-cancel.
+    // Uses ERR_SHUTTING_DOWN (not ERR_INTERNAL) so clients can
+    // distinguish graceful shutdown from generic failures and retry
+    // against a new server instance.
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return ServerMessage::Error {
+            id: Some(req_id.to_string()),
+            error: ErrorPayload::new(
+                ERR_SHUTTING_DOWN,
+                "Server is shutting down. Please retry on a new connection.",
+            ),
+        };
+    }
+
     let turn_started = std::time::Instant::now();
     // Persisted attribution timestamp for this turn (captured at entry,
     // not completion, so started_at + duration_ms are semantically aligned).
@@ -261,6 +280,21 @@ pub async fn handle_send_with_class(
                     };
                 }
             }
+            // Re-check shutdown before creating a new session. This avoids
+            // leaving behind empty sessions when shutdown flips after entry
+            // but before this creation point.
+            if state
+                .shutting_down
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return ServerMessage::Error {
+                    id: Some(req_id.to_string()),
+                    error: ErrorPayload::new(
+                        ERR_SHUTTING_DOWN,
+                        "Server is shutting down. Please retry on a new connection.",
+                    ),
+                };
+            }
             match state
                 .session_store
                 .create_session_for_agent(&channel, &agent_id)
@@ -298,6 +332,24 @@ pub async fn handle_send_with_class(
         }
     };
     let cancel_token = query_permit.cancel_token().clone();
+
+    // Second shutdown check: a request that was already waiting in
+    // query_guard.acquire() when the shutdown signal fired will
+    // eventually acquire its permit after the prior run completes.
+    // Without this check, that queued request would start a new run
+    // after the drain task has already exited — escaping force-cancel.
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return ServerMessage::Error {
+            id: Some(req_id.to_string()),
+            error: ErrorPayload::new(
+                ERR_SHUTTING_DOWN,
+                "Server is shutting down. Please retry on a new connection.",
+            ),
+        };
+    }
 
     let agent_id = match state.agent_registry.resolve_agent(&session_id).await {
         Ok(agent_id) => agent_id,
@@ -398,6 +450,7 @@ pub async fn handle_send_with_class(
         max_parallel_safe_tools,
         per_tool_interrupt_behavior,
         blocking_tool_cancel_grace_secs,
+        per_tool_timeout_secs,
     ) = {
         let config = state.config.read().await;
         let disclosure = match &config.llm.mode {
@@ -415,6 +468,7 @@ pub async fn handle_send_with_class(
             config.agent_pool.max_parallel_safe_tools,
             config.security.per_tool_interrupt_behavior.clone(),
             config.security.blocking_tool_cancel_grace_secs,
+            config.security.per_tool_timeout_secs,
         )
     };
 
@@ -474,6 +528,7 @@ pub async fn handle_send_with_class(
             &per_tool_interrupt_behavior,
         ),
         blocking_tool_cancel_grace: Duration::from_secs(blocking_tool_cancel_grace_secs),
+        per_tool_timeout: Duration::from_secs(per_tool_timeout_secs),
         workspace_trust,
         // Subagents spawned inside this run inherit the parent's class
         // via runtime_config. Without this, a cron (background) parent
@@ -1267,7 +1322,7 @@ mod tests {
         append_loop_break_audit, extract_text_blocks, handle_abort, handle_history, handle_send,
         handle_send_with_class, loop_break_audit_detail, maybe_generate_title,
     };
-    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS};
+    use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS, ERR_SHUTTING_DOWN};
     use crate::test_utils::make_test_state;
     use encmind_agent::tool_registry::{InternalToolHandler, ToolRegistry};
     use encmind_core::config::BashMode;
@@ -1369,6 +1424,96 @@ mod tests {
                 .contains_key(session.id.as_str()),
             "active_runs should be clean after permit drop"
         );
+    }
+
+    #[tokio::test]
+    async fn send_rejects_when_server_is_shutting_down() {
+        let state = make_test_state();
+        let before = state
+            .session_store
+            .list_sessions(encmind_core::types::SessionFilter::default())
+            .await
+            .expect("list sessions before")
+            .len();
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let response = handle_send(
+            &state,
+            serde_json::json!({
+                "text": "hello",
+            }),
+            "req-shutdown-entry",
+            None,
+        )
+        .await;
+
+        match response {
+            ServerMessage::Error { error, .. } => {
+                assert_eq!(error.code, ERR_SHUTTING_DOWN);
+                assert!(error.message.contains("shutting down"));
+            }
+            other => panic!("expected shutdown error, got {other:?}"),
+        }
+
+        let after = state
+            .session_store
+            .list_sessions(encmind_core::types::SessionFilter::default())
+            .await
+            .expect("list sessions after")
+            .len();
+        assert_eq!(
+            after, before,
+            "shutdown rejection should not create a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_send_rechecks_shutdown_after_query_permit_acquire() {
+        let state = make_test_state();
+        let session = state.session_store.create_session("web").await.unwrap();
+
+        // Hold the session permit so the second send is queued.
+        let permit = state
+            .query_guard
+            .acquire(session.id.as_str(), state.active_runs.clone())
+            .await
+            .expect("first permit should succeed");
+
+        let state_for_send = state.clone();
+        let sid = session.id.as_str().to_owned();
+        let queued = tokio::spawn(async move {
+            handle_send(
+                &state_for_send,
+                serde_json::json!({
+                    "text": "queued",
+                    "session_id": sid,
+                }),
+                "req-shutdown-queued",
+                None,
+            )
+            .await
+        });
+
+        // Give the spawned task a chance to reach query_guard.acquire().
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        state
+            .shutting_down
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Release the queued request, which must observe shutdown via the
+        // second check immediately after acquiring query_permit.
+        drop(permit);
+
+        let response = queued.await.expect("queued task should not panic");
+        match response {
+            ServerMessage::Error { error, .. } => {
+                assert_eq!(error.code, ERR_SHUTTING_DOWN);
+                assert!(error.message.contains("shutting down"));
+            }
+            other => panic!("expected shutdown error for queued request, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -509,6 +509,7 @@ pub async fn run_gateway(
         pairing_sessions,
         admin_bootstrap_lock,
         active_runs,
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         query_guard,
         timeline_store: Some(Arc::new(
             encmind_storage::timeline_store::SqliteTimelineStore::new(pool.clone()),
@@ -677,6 +678,66 @@ pub async fn run_gateway(
         None
     };
 
+    // Spawn the graceful drain task BEFORE starting serve, so it
+    // runs concurrently with axum's graceful shutdown. When the
+    // shutdown signal fires, axum stops accepting new connections
+    // but waits for existing ones to close. The drain task waits
+    // up to drain_timeout_secs for in-flight agent runs to finish,
+    // then force-cancels the rest — which closes the WS connections
+    // and lets axum's serve().await return.
+    //
+    // Without this concurrency, drain would run AFTER serve returns,
+    // but serve can't return while connections are open, and
+    // connections can't close while agent runs are active — deadlock.
+    let drain_handle = {
+        let drain_shutdown = shutdown.clone();
+        let drain_active_runs = state.active_runs.clone();
+        let drain_shutting_down = state.shutting_down.clone();
+        let drain_timeout = Duration::from_secs(config.server.drain_timeout_secs.max(1) as u64);
+        tokio::spawn(async move {
+            drain_shutdown.cancelled().await;
+            // Set the shutdown gate FIRST so no new chat.send runs
+            // can start on existing WS connections. Without this,
+            // a late chat.send could slip in after the drain task
+            // checks active_runs.len() == 0 and exits — those runs
+            // would never be force-cancelled.
+            drain_shutting_down.store(true, std::sync::atomic::Ordering::SeqCst);
+            let active_count = drain_active_runs.lock().unwrap().len();
+            if active_count == 0 {
+                return;
+            }
+            info!(
+                count = active_count,
+                drain_secs = drain_timeout.as_secs(),
+                "shutdown signal received; waiting for in-flight runs to drain"
+            );
+            let drain_start = std::time::Instant::now();
+            loop {
+                let remaining = drain_active_runs.lock().unwrap().len();
+                if remaining == 0 {
+                    info!(
+                        elapsed_ms = drain_start.elapsed().as_millis() as u64,
+                        "all in-flight runs drained cleanly"
+                    );
+                    return;
+                }
+                if drain_start.elapsed() >= drain_timeout {
+                    warn!(
+                        remaining,
+                        "drain timeout reached; force-cancelling remaining runs"
+                    );
+                    let active: Vec<(String, CancellationToken)> =
+                        drain_active_runs.lock().unwrap().drain().collect();
+                    for (_session_id, token) in &active {
+                        token.cancel();
+                    }
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
+
     let serve_result = if let Some(tls_manager) = tls_manager {
         if auto_tls_fingerprint.is_some() {
             info!("auto-TLS enabled (self-signed)");
@@ -701,17 +762,9 @@ pub async fn run_gateway(
 
     shutdown.cancel();
 
-    // Cancel all active agent runs so in-flight requests terminate promptly.
-    {
-        let active: Vec<(String, CancellationToken)> =
-            state.active_runs.lock().unwrap().drain().collect();
-        if !active.is_empty() {
-            info!(count = active.len(), "cancelling active runs for shutdown");
-            for (_session_id, token) in &active {
-                token.cancel();
-            }
-        }
-    }
+    // Wait for the drain task to complete (it should have already
+    // finished or be wrapping up since serve has returned).
+    let _ = tokio::time::timeout(Duration::from_secs(2), drain_handle).await;
 
     match tokio::time::timeout(shutdown_join_timeout, maintenance_handle).await {
         Ok(join_result) => {
@@ -4141,6 +4194,9 @@ pub(crate) fn initialize_tool_registry(
             ),
             blocking_tool_cancel_grace: std::time::Duration::from_secs(
                 config.security.blocking_tool_cancel_grace_secs,
+            ),
+            per_tool_timeout: std::time::Duration::from_secs(
+                config.security.per_tool_timeout_secs,
             ),
             workspace_trust: config.security.workspace_trust.clone(),
             ..RuntimeConfig::default()

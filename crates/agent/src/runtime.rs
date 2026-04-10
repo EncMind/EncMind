@@ -61,6 +61,12 @@ pub struct RuntimeConfig {
     /// How long to wait for a `Block` tool to finish after cancellation
     /// before fail-closing with an error result.
     pub blocking_tool_cancel_grace: Duration,
+    /// Per-tool execution timeout. When non-zero, each individual tool
+    /// dispatch is wrapped in `tokio::time::timeout`. If the tool
+    /// doesn't complete within this window, a synthetic error result
+    /// is produced. Independent of the per-session timeout and the
+    /// Cancel/Block interrupt behavior. Duration::ZERO disables.
+    pub per_tool_timeout: Duration,
     /// Workspace trust configuration. When set, tools are filtered based on
     /// whether `workspace_dir` is in the trusted set.
     pub workspace_trust: encmind_core::config::WorkspaceTrustConfig,
@@ -86,6 +92,7 @@ impl Default for RuntimeConfig {
             max_parallel_safe_tools: DEFAULT_MAX_PARALLEL_SAFE_TOOLS,
             per_tool_interrupt_behavior: HashMap::new(),
             blocking_tool_cancel_grace: Duration::from_secs(10),
+            per_tool_timeout: Duration::from_secs(30),
             workspace_trust: encmind_core::config::WorkspaceTrustConfig::default(),
             query_class: crate::scheduler::QueryClass::Interactive,
         }
@@ -851,6 +858,7 @@ impl AgentRuntime {
                                     &event_tx,
                                     id,
                                     name,
+                                    self.config.per_tool_timeout,
                                     async {
                                         let mut dispatch_future =
                                             Box::pin(self.tool_registry.dispatch(
@@ -1193,15 +1201,34 @@ impl AgentRuntime {
     /// The scope is tightly bound to the dispatch future: when the
     /// future completes, the sink sender is dropped, the forwarder's
     /// `recv()` returns `None`, and the forwarder task exits.
-    async fn dispatch_with_progress_scope<F, T>(
+    /// Wrap a dispatch future in a `TOOL_PROGRESS_SINK` scope,
+    /// optionally enforce a per-tool execution timeout, and forward
+    /// progress updates to the streaming channel.
+    ///
+    /// `per_tool_timeout`: when non-zero, the entire dispatch
+    /// (including cancel/block interrupt handling) is wrapped in
+    /// `tokio::time::timeout`. If the tool exceeds this cap, a
+    /// synthetic error result `("Error: tool execution timed out
+    /// after Nms", true, None)` is returned. This is independent of
+    /// the per-session timeout and the Cancel/Block interrupt
+    /// behavior.
+    async fn dispatch_with_progress_scope(
         event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
         tool_use_id: &str,
         tool_name: &str,
-        fut: F,
-    ) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
+        per_tool_timeout: Duration,
+        fut: impl std::future::Future<
+            Output = (
+                String,
+                bool,
+                Option<encmind_core::permission::PermissionDecision>,
+            ),
+        >,
+    ) -> (
+        String,
+        bool,
+        Option<encmind_core::permission::PermissionDecision>,
+    ) {
         use crate::tool_progress::{ProgressUpdate, TOOL_PROGRESS_SINK};
         const PROGRESS_BUFFER: usize = 16;
 
@@ -1212,8 +1239,6 @@ impl AgentRuntime {
             let tool_name = tool_name.to_string();
             tokio::spawn(async move {
                 while let Some(update) = progress_rx.recv().await {
-                    // Best-effort: never await here. A full channel must not
-                    // stall tool completion while waiting on client I/O.
                     Self::emit_delta_event(
                         &tx,
                         ChatEvent::ToolProgress {
@@ -1227,7 +1252,28 @@ impl AgentRuntime {
             })
         });
 
-        let result = TOOL_PROGRESS_SINK.scope(progress_tx, fut).await;
+        let scoped_fut = TOOL_PROGRESS_SINK.scope(progress_tx, fut);
+
+        let result = if per_tool_timeout.is_zero() {
+            scoped_fut.await
+        } else {
+            match tokio::time::timeout(per_tool_timeout, scoped_fut).await {
+                Ok(inner) => inner,
+                Err(_elapsed) => {
+                    let timeout_ms = per_tool_timeout.as_millis();
+                    warn!(
+                        tool = %tool_name,
+                        timeout_ms,
+                        "tool execution timed out"
+                    );
+                    (
+                        format!("Error: tool execution timed out after {timeout_ms}ms"),
+                        true,
+                        None,
+                    )
+                }
+            }
+        };
 
         if let Some(handle) = forwarder {
             let _ = handle.await;
@@ -1859,6 +1905,7 @@ impl AgentRuntime {
                         let dispatch_agent_id = agent_id.clone();
                         let dispatch_cancel = state.cancel.clone();
                         let cancel_grace = self.config.blocking_tool_cancel_grace;
+                        let per_tool_timeout = self.config.per_tool_timeout;
                         // Two copies: one keyed into the progress scope
                         // (borrowed) and one moved into the dispatch
                         // async block (owned).
@@ -1879,6 +1926,7 @@ impl AgentRuntime {
                                 &batch_event_tx,
                                 &dispatch_id,
                                 &progress_tool_name,
+                                per_tool_timeout,
                                 async move {
                                     let dispatch_future = std::panic::AssertUnwindSafe(
                                         tool_registry.dispatch(
@@ -5652,6 +5700,62 @@ mod tests {
             crate::tool_progress::report_status("done");
             Ok("ok".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn per_tool_timeout_produces_error_result() {
+        // A tool that takes 500ms with a 100ms per-tool timeout
+        // must produce a synthetic error, not hang.
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "slow_tool",
+                "slow",
+                serde_json::json!({"type": "object", "properties": {}}),
+                Arc::new(DelayedInternalTool {
+                    name: "slow_tool",
+                    delay_ms: 500,
+                    concurrent_safe: false,
+                    interrupt_behavior: ToolInterruptBehavior::Cancel,
+                }),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "slow_tool", "{}"),
+            text_response("done"),
+        ];
+        let llm: Arc<dyn LlmBackend> = Arc::new(ScriptedLlmBackend::new(responses, 128_000));
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            RuntimeConfig {
+                per_tool_timeout: Duration::from_millis(100),
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("go"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.tool_calls[0].is_error);
+        assert!(
+            result.tool_calls[0].output.contains("timed out"),
+            "expected timeout error, got: {}",
+            result.tool_calls[0].output
+        );
     }
 
     #[tokio::test]
