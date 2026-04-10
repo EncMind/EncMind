@@ -182,6 +182,9 @@ pub struct AppState {
     pub session_rate_limiter: Arc<SessionRateLimiter>,
     /// Optional daily API budget tracker.
     pub api_budget_tracker: Option<Arc<ApiBudgetTracker>>,
+    /// Per-turn API usage recorder for cost attribution.
+    /// One row per chat.send turn (completed, cancelled, or error).
+    pub api_usage_store: Option<Arc<encmind_storage::api_usage::ApiUsageStore>>,
     /// Channel account store for managing channel accounts via API.
     pub channel_account_store: Option<Arc<dyn ChannelAccountStore>>,
     /// Runtime channel adapter manager for dynamic start/stop.
@@ -357,6 +360,7 @@ mod tests {
             native_timer_replace_lock: Arc::new(AsyncMutex::new(())),
             session_rate_limiter: Arc::new(SessionRateLimiter::new(30)),
             api_budget_tracker: None,
+            api_usage_store: None,
             channel_account_store: None,
             channel_startup_intent: Arc::new(HashSet::new()),
         };

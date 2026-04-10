@@ -541,6 +541,7 @@ pub(crate) fn is_method_allowed_with_plugin(
         | "cron.delete"
         | "cron.trigger"
         | "timeline.query"
+        | "api_usage.query"
         | "keys.list"
         | "keys.set"
         | "keys.delete"

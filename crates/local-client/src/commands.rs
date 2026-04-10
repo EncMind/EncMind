@@ -1175,6 +1175,36 @@ mod tests {
         assert!(result.unwrap_err().contains("outside allowed roots"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn validate_path_symlink_to_nonexistent_file_is_blocked_by_containment() {
+        // Symlink points outside the allowed root to a path that does
+        // NOT yet exist. file.write through that link must still be
+        // rejected — canonicalization walks up to the nearest existing
+        // ancestor (the symlink target dir) and checks containment.
+        let allowed = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let link_path = allowed.path().join("escape_dir");
+        std::os::unix::fs::symlink(outside.path(), &link_path).unwrap();
+
+        let policy = LocalPolicy {
+            allowed_roots: vec![allowed.path().to_path_buf()],
+            denied_paths: Vec::new(),
+            ..Default::default()
+        };
+
+        // Path looks like it's inside `allowed` but `escape_dir` is a
+        // symlink to `outside`, and `new_file.txt` does not exist yet.
+        let write_target = link_path.join("new_file.txt");
+        let result = validate_file_path(&write_target.to_string_lossy(), &policy);
+        assert!(
+            result.is_err(),
+            "file.write through escaping symlink must be blocked, got: {result:?}"
+        );
+        assert!(result.unwrap_err().contains("outside allowed roots"));
+    }
+
     #[test]
     fn validate_path_dot_dot_traversal_blocked() {
         let allowed = TempDir::new().unwrap();

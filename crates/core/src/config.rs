@@ -136,6 +136,21 @@ impl AppConfig {
         if self.agent_pool.max_parallel_safe_tools == 0 {
             errors.push("agent_pool.max_parallel_safe_tools must be > 0".to_string());
         }
+
+        for (channel, cap) in &self.token_optimization.per_channel_max_output_tokens {
+            if channel.trim().is_empty() {
+                errors.push(
+                    "token_optimization.per_channel_max_output_tokens: channel key must not be empty"
+                        .to_string(),
+                );
+            }
+            if *cap == 0 {
+                errors.push(format!(
+                    "token_optimization.per_channel_max_output_tokens['{channel}'] must be > 0"
+                ));
+            }
+        }
+
         if self.security.blocking_tool_cancel_grace_secs == 0 {
             errors.push("security.blocking_tool_cancel_grace_secs must be > 0".to_string());
         }
@@ -187,6 +202,15 @@ impl AppConfig {
                     "security.workspace_trust.no_workspace_default must be 'trusted', 'readonly', or 'deny'; got '{no_workspace_action}'"
                 ));
             }
+            // Note: when trusted_paths is empty and untrusted_default
+            // is not "allow", the trust gate is effectively disabled
+            // for backward compatibility (workspace_trust.rs returns
+            // Trusted). A warn-once guard in evaluate_trust() fires
+            // at runtime on first evaluation (see workspace_trust.rs
+            // EMPTY_TRUSTED_PATHS_WARNED). We intentionally do NOT
+            // log here — validate() should be side-effect-free so
+            // tests, hot-reload checks, and tooling don't produce
+            // spurious warnings.
         }
 
         if self.memory.enabled {
@@ -1061,6 +1085,27 @@ pub struct SecurityConfig {
     pub workspace_trust: WorkspaceTrustConfig,
 }
 
+impl SecurityConfig {
+    /// Whether bash execution is effectively enabled for **local** tools
+    /// running on the gateway host itself.
+    ///
+    /// This is the single source of truth for the expression used by the
+    /// chat handler, server init, and local tool policy. It is the
+    /// conjunction of three gates:
+    ///   - `bash_mode != Deny` (master switch — also applies to node)
+    ///   - `local_tools.bash_mode != Disabled` (local-only toggle)
+    ///   - `local_tools.mode != IsolatedAgents` (per-agent isolation forces local bash off)
+    ///
+    /// **Scope**: this value should only be used to gate tools that run
+    /// on the gateway host. It must not be applied to node/remote bash
+    /// tools, whose enablement is governed solely by `bash_mode`.
+    pub fn local_bash_effectively_enabled(&self) -> bool {
+        !matches!(self.bash_mode, BashMode::Deny)
+            && !matches!(self.local_tools.bash_mode, LocalToolsBashMode::Disabled)
+            && !matches!(self.local_tools.mode, LocalToolsMode::IsolatedAgents)
+    }
+}
+
 /// Workspace trust configuration.
 ///
 /// When a session operates in a workspace (directory), the trust gate checks
@@ -1167,6 +1212,13 @@ pub struct LocalToolsConfig {
     pub bash_mode: LocalToolsBashMode,
     #[serde(default)]
     pub base_roots: Vec<PathBuf>,
+    /// Operator-configured paths that are always denied for local tools,
+    /// layered on top of the hardcoded defaults
+    /// (`/etc/shadow`, `/etc/sudoers`, `~/.ssh`, `~/.gnupg`, `~/.aws`,
+    /// `~/.encmind`, etc.). Defaults stay as a floor — operator entries
+    /// can only add to the deny list, not remove from it.
+    #[serde(default)]
+    pub denied_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2107,6 +2159,21 @@ pub struct TokenOptimizationConfig {
     /// `agents_spawn` tool is available. Default: true.
     #[serde(default = "default_true")]
     pub inject_coordinator_mode: bool,
+    /// Per-channel cap on output tokens (clamped to the session's
+    /// reserved_output_tokens at dispatch time). Channels absent from
+    /// this map fall through to the session default. Useful for
+    /// bulk/cron channels that should produce shorter responses than
+    /// interactive chat.
+    ///
+    /// Example:
+    /// ```yaml
+    /// token_optimization:
+    ///   per_channel_max_output_tokens:
+    ///     cron: 512
+    ///     telegram: 2048
+    /// ```
+    #[serde(default)]
+    pub per_channel_max_output_tokens: HashMap<String, u32>,
 }
 
 fn default_max_tool_iterations() -> u32 {
@@ -2132,6 +2199,7 @@ impl Default for TokenOptimizationConfig {
             inject_tool_usage_grammar: true,
             inject_browser_safety_rules: true,
             inject_coordinator_mode: true,
+            per_channel_max_output_tokens: HashMap::new(),
         }
     }
 }
@@ -2435,6 +2503,20 @@ fn expand_tilde_path(path: &Path) -> PathBuf {
 fn expand_path_fields(config: &mut AppConfig) {
     config.storage.db_path = expand_tilde_path(&config.storage.db_path);
     config.skills.wasm_dir = expand_tilde_path(&config.skills.wasm_dir);
+    config.security.local_tools.base_roots = config
+        .security
+        .local_tools
+        .base_roots
+        .iter()
+        .map(|path| expand_tilde_path(path))
+        .collect();
+    config.security.local_tools.denied_paths = config
+        .security
+        .local_tools
+        .denied_paths
+        .iter()
+        .map(|path| expand_tilde_path(path))
+        .collect();
     config.security.workspace_trust.trusted_paths = config
         .security
         .workspace_trust
@@ -3552,6 +3634,38 @@ plugin_policy:
         assert!(
             errors.iter().any(|e| e.contains("duplicate provider name")),
             "expected duplicate provider name error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_per_channel_max_output_tokens() {
+        let mut config = valid_config();
+        config
+            .token_optimization
+            .per_channel_max_output_tokens
+            .insert("cron".to_string(), 0);
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| {
+                e.contains("token_optimization.per_channel_max_output_tokens['cron'] must be > 0")
+            }),
+            "expected per-channel max_output_tokens > 0 validation error, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_per_channel_max_output_tokens_key() {
+        let mut config = valid_config();
+        config
+            .token_optimization
+            .per_channel_max_output_tokens
+            .insert("".to_string(), 512);
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("channel key must not be empty")),
+            "expected empty channel key validation error, got: {:?}",
             errors
         );
     }
@@ -4685,6 +4799,28 @@ access_policy:
         assert_eq!(
             config.security.workspace_trust.trusted_paths,
             vec![home.join("trusted-workspace")]
+        );
+    }
+
+    #[test]
+    fn expand_path_fields_expands_local_tools_paths_tilde() {
+        let Some(home) = home_dir() else {
+            return;
+        };
+
+        let mut config = AppConfig::default();
+        config.security.local_tools.base_roots = vec![PathBuf::from("~/workspace-root")];
+        config.security.local_tools.denied_paths = vec![PathBuf::from("~/.secret-dir")];
+
+        expand_path_fields(&mut config);
+
+        assert_eq!(
+            config.security.local_tools.base_roots,
+            vec![home.join("workspace-root")]
+        );
+        assert_eq!(
+            config.security.local_tools.denied_paths,
+            vec![home.join(".secret-dir")]
         );
     }
 

@@ -36,44 +36,13 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
-/// The priority class of an agent run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryClass {
-    /// User-initiated request; served first.
-    Interactive,
-    /// Automated request (cron, webhook, timer); served after
-    /// interactive drains (subject to the fairness cap).
-    Background,
-}
-
-impl QueryClass {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Interactive => "interactive",
-            Self::Background => "background",
-        }
-    }
-}
-
-tokio::task_local! {
-    /// Task-local priority class of the currently executing run.
-    ///
-    /// Set by `AgentRuntime::run_inner` at the start of each run and
-    /// read by nested tool handlers (notably `SpawnAgentHandler`) to
-    /// inherit the parent's class when acquiring the agent pool.
-    /// Flows through `buffer_unordered` and sequential awaits within
-    /// the same task, but NOT across `tokio::spawn`; new spawns that
-    /// should propagate the class must re-scope it explicitly.
-    pub static CURRENT_QUERY_CLASS: QueryClass;
-}
-
-/// Read the current task-local query class, defaulting to `Interactive`
-/// when unset (top-level calls from tests or outside of a run).
-pub fn current_query_class() -> QueryClass {
-    CURRENT_QUERY_CLASS
-        .try_with(|c| *c)
-        .unwrap_or(QueryClass::Interactive)
-}
+// Re-export the task-local scheduler primitives from core so existing
+// call sites (`encmind_agent::scheduler::QueryClass`,
+// `current_query_class()`, `CURRENT_QUERY_CLASS`) keep working while
+// the canonical definitions live in encmind-core — lower layers
+// (encmind-llm) can read the task-local without depending on this
+// crate.
+pub use encmind_core::scheduler::{current_query_class, QueryClass, CURRENT_QUERY_CLASS};
 
 #[derive(Debug)]
 pub struct SchedulerClosed;
@@ -484,10 +453,12 @@ mod tests {
         drop(initial);
 
         // A fresh acquisition should succeed promptly — no permit lost.
-        let result =
-            tokio::time::timeout(Duration::from_secs(1), scheduler.acquire(QueryClass::Interactive))
-                .await
-                .expect("acquire should not hang");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.acquire(QueryClass::Interactive),
+        )
+        .await
+        .expect("acquire should not hang");
         assert!(result.is_ok());
     }
 

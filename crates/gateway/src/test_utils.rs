@@ -125,6 +125,9 @@ pub fn make_test_state() -> AppState {
         native_timer_replace_lock: Arc::new(AsyncMutex::new(())),
         session_rate_limiter: Arc::new(SessionRateLimiter::new(30)),
         api_budget_tracker: None,
+        api_usage_store: Some(Arc::new(
+            encmind_storage::api_usage::ApiUsageStore::new(pool.clone()),
+        )),
         channel_account_store: Some(Arc::new(
             encmind_storage::channel_account_store::SqliteChannelAccountStore::new(
                 pool.clone(),

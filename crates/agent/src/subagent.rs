@@ -147,7 +147,9 @@ impl InternalToolHandler for SpawnAgentHandler {
         // Live-read prompt injection toggles, workspace trust, and bash policy
         // from current config (not the init snapshot), so operator changes take
         // effect immediately.
-        let (live_workspace_trust, live_bash_mode) = if let Some(ref cfg) = self.config {
+        let (live_workspace_trust, live_bash_mode, live_local_bash_enabled) = if let Some(ref cfg) =
+            self.config
+        {
             let guard = cfg.read().await;
             sub_runtime_config
                 .context_config
@@ -164,12 +166,19 @@ impl InternalToolHandler for SpawnAgentHandler {
                 .inject_browser_safety_rules = guard.token_optimization.inject_browser_safety_rules;
             sub_runtime_config.context_config.inject_coordinator_mode =
                 guard.token_optimization.inject_coordinator_mode;
+            // Capture the local-bash enablement alongside bash_mode so the
+            // nested runtime's approval checker matches the top-level
+            // behavior set in gateway_approval_policy(). Without this, a
+            // subagent could still see `bash_exec` in its prompt even
+            // though `local_tools.*` disabled it for the parent.
+            let local_bash_enabled = guard.security.local_bash_effectively_enabled();
             (
                 Some(guard.security.workspace_trust.clone()),
                 Some(guard.security.bash_mode.clone()),
+                Some(local_bash_enabled),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         if let Some(workspace_trust) = live_workspace_trust {
             sub_runtime_config.workspace_trust = workspace_trust;
@@ -190,9 +199,22 @@ impl InternalToolHandler for SpawnAgentHandler {
             sub_runtime = sub_runtime.with_firewall(firewall.clone());
         }
         if let Some(ref handler) = self.approval_handler {
-            // Prefer live config over static checker
+            // Prefer live config over static checker. The checker must
+            // use `with_bash_effective_mode` so that the
+            // local-tools-only disable flag is honored for nested runs
+            // — otherwise a subagent would still see `bash_exec` in its
+            // prompt even when the parent had it filtered out.
             let checker = if let Some(bash_mode) = live_bash_mode {
-                ToolApprovalChecker::new(bash_mode)
+                let mut checker = ToolApprovalChecker::with_bash_effective_mode(
+                    bash_mode,
+                    live_local_bash_enabled.unwrap_or(true),
+                );
+                if let Some(ref static_checker) = self.approval_checker {
+                    checker = checker.with_interactive_approval_available(
+                        static_checker.interactive_approval_available(),
+                    );
+                }
+                checker
             } else if let Some(ref static_checker) = self.approval_checker {
                 static_checker.clone()
             } else {

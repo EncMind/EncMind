@@ -257,12 +257,22 @@ impl LlmBackend for AnthropicBackend {
         };
 
         let url = format!("{}/v1/messages", self.base_url);
-        let response = self
+        let mut req = self
             .client
             .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        // Anthropic's API natively supports idempotency via the
+        // `Idempotency-Key` header — retried requests with the same
+        // key return the cached response rather than running again.
+        // Also send `x-request-id` for log correlation.
+        if let Some(ref id) = params.request_id {
+            req = req
+                .header("idempotency-key", id)
+                .header("x-request-id", id);
+        }
+        let response = req
             .json(&request)
             .send()
             .await

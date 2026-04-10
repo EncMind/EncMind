@@ -258,11 +258,15 @@ impl LlmBackend for OpenAiBackend {
         };
 
         let url = format!("{}/v1/chat/completions", self.base_url);
-        let response = self
+        let mut req = self
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        if let Some(ref id) = params.request_id {
+            req = req.header("x-request-id", id);
+        }
+        let response = req
             .json(&request)
             .send()
             .await

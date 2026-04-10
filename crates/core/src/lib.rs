@@ -1,3 +1,4 @@
+pub mod bash_allowlist;
 pub mod channel_credentials;
 pub mod config;
 pub mod error;
@@ -5,6 +6,7 @@ pub mod hooks;
 pub mod permission;
 pub mod plugin;
 pub mod policy;
+pub mod scheduler;
 pub mod skill_id;
 pub mod traits;
 pub mod types;

@@ -405,6 +405,18 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.definition.clone()).collect()
     }
 
+    /// Get a single tool definition by name (aliases resolved).
+    pub fn tool_definition(&self, name: &str) -> Option<ToolDefinition> {
+        let resolved = self.resolve_tool_name(name);
+        self.tools.get(resolved).map(|t| t.definition.clone())
+    }
+
+    /// Return the canonical registered tool name for a potentially-aliased
+    /// tool reference.
+    pub fn canonical_tool_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.resolve_tool_name(name)
+    }
+
     /// Check if a tool is safe for concurrent execution.
     ///
     /// Aliases are resolved transparently.

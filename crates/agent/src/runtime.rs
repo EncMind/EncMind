@@ -121,6 +121,21 @@ pub enum ChatEvent {
         tool_name: String,
         input: serde_json::Value,
     },
+    /// Progress update from a long-running tool, emitted between
+    /// `ToolStart` and `ToolComplete`. Tools opt in by sending into
+    /// the `ToolProgressSink` task-local; clients can render a
+    /// live status line (e.g. "fetching…", "parsing… 42%").
+    ToolProgress {
+        tool_use_id: String,
+        tool_name: String,
+        /// Short human-readable status message.
+        message: String,
+        /// Optional progress fraction in `[0.0, 1.0]`. `None` means
+        /// the tool has no known total and is reporting unbounded
+        /// progress (e.g. "connected… received 2.3MB…").
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fraction: Option<f32>,
+    },
     /// A tool call completed (success or error).
     ToolComplete {
         tool_use_id: String,
@@ -307,6 +322,12 @@ impl AgentRuntime {
             .tool_names()
             .into_iter()
             .filter(|tool_name| crate::workspace_trust::is_tool_allowed(tool_name, trust_level))
+            .filter(|tool_name| {
+                self.approval_checker
+                    .as_ref()
+                    .map(|checker| !checker.is_denied(tool_name))
+                    .unwrap_or(true)
+            })
             .collect()
     }
 
@@ -400,7 +421,10 @@ impl AgentRuntime {
         // therefore inherit it automatically.
         let class = self.config.query_class;
         crate::scheduler::CURRENT_QUERY_CLASS
-            .scope(class, self.run_inner_body(session_id, user_message, agent_config, cancel, event_tx))
+            .scope(
+                class,
+                self.run_inner_body(session_id, user_message, agent_config, cancel, event_tx),
+            )
             .await
     }
 
@@ -559,7 +583,10 @@ impl AgentRuntime {
             let params = CompletionParams {
                 model: agent_config.model.clone(),
                 max_tokens: max_output,
-                tools: self.tool_registry.tool_definitions(),
+                tools: available_tools
+                    .iter()
+                    .filter_map(|name| self.tool_registry.tool_definition(name))
+                    .collect(),
                 ..Default::default()
             };
 
@@ -817,28 +844,40 @@ impl AgentRuntime {
                             {
                                 ("Error: request cancelled".to_string(), true, None)
                             } else {
-                                let mut dispatch_future = Box::pin(self.tool_registry.dispatch(
+                                // Scope a ToolProgress sink around the dispatch so
+                                // long-running handlers can emit intermediate status
+                                // updates via `tool_progress::report_progress`.
+                                Self::dispatch_with_progress_scope(
+                                    &event_tx,
+                                    id,
                                     name,
-                                    input.clone(),
-                                    session_id,
-                                    &agent_config.id,
-                                ));
-                                match interrupt_behavior {
-                                    ToolInterruptBehavior::Cancel => {
-                                        tokio::select! {
-                                            _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
-                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
+                                    async {
+                                        let mut dispatch_future =
+                                            Box::pin(self.tool_registry.dispatch(
+                                                name,
+                                                input.clone(),
+                                                session_id,
+                                                &agent_config.id,
+                                            ));
+                                        match interrupt_behavior {
+                                            ToolInterruptBehavior::Cancel => {
+                                                tokio::select! {
+                                                    _ = cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
+                                                    result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
+                                                }
+                                            }
+                                            ToolInterruptBehavior::Block => {
+                                                tokio::select! {
+                                                    result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
+                                                    _ = cancel.cancelled() => {
+                                                        self.await_blocking_dispatch_with_grace(name, &input, &mut dispatch_future).await
+                                                    },
+                                                }
+                                            }
                                         }
-                                    }
-                                    ToolInterruptBehavior::Block => {
-                                        tokio::select! {
-                                            result = dispatch_future.as_mut() => Self::normalize_dispatch_outcome(name, &input, result),
-                                            _ = cancel.cancelled() => {
-                                                self.await_blocking_dispatch_with_grace(name, &input, &mut dispatch_future).await
-                                            },
-                                        }
-                                    }
-                                }
+                                    },
+                                )
+                                .await
                             };
 
                             let (output, is_error, decision) = match self
@@ -1144,6 +1183,58 @@ impl AgentRuntime {
         }
     }
 
+    /// Wrap a dispatch future in a `TOOL_PROGRESS_SINK` scope and,
+    /// when an `event_tx` is present, spawn a forwarder that turns
+    /// `ProgressUpdate`s from handlers into `ChatEvent::ToolProgress`
+    /// events on the streaming channel. When no streaming channel is
+    /// attached, progress updates are still accepted by the sink and
+    /// silently dropped (zero overhead beyond an mpsc channel create).
+    ///
+    /// The scope is tightly bound to the dispatch future: when the
+    /// future completes, the sink sender is dropped, the forwarder's
+    /// `recv()` returns `None`, and the forwarder task exits.
+    async fn dispatch_with_progress_scope<F, T>(
+        event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
+        tool_use_id: &str,
+        tool_name: &str,
+        fut: F,
+    ) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        use crate::tool_progress::{ProgressUpdate, TOOL_PROGRESS_SINK};
+        const PROGRESS_BUFFER: usize = 16;
+
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::channel::<ProgressUpdate>(PROGRESS_BUFFER);
+        let forwarder = event_tx.clone().map(|tx| {
+            let tool_use_id = tool_use_id.to_string();
+            let tool_name = tool_name.to_string();
+            tokio::spawn(async move {
+                while let Some(update) = progress_rx.recv().await {
+                    // Best-effort: never await here. A full channel must not
+                    // stall tool completion while waiting on client I/O.
+                    Self::emit_delta_event(
+                        &tx,
+                        ChatEvent::ToolProgress {
+                            tool_use_id: tool_use_id.clone(),
+                            tool_name: tool_name.clone(),
+                            message: update.message,
+                            fraction: update.fraction,
+                        },
+                    );
+                }
+            })
+        });
+
+        let result = TOOL_PROGRESS_SINK.scope(progress_tx, fut).await;
+
+        if let Some(handle) = forwarder {
+            let _ = handle.await;
+        }
+        result
+    }
+
     async fn emit_remaining_safe_batch_completions(
         event_tx: &Option<tokio::sync::mpsc::Sender<ChatEvent>>,
         prepared: &[(String, String, PreparedToolCall)],
@@ -1160,9 +1251,7 @@ impl AgentRuntime {
     /// `deny_reason` field on hook payloads and chat.send responses
     /// so existing consumers of the pre-structured contract keep
     /// working. Will be removed in a future major revision.
-    fn legacy_deny_reason(
-        decision: &encmind_core::permission::PermissionDecision,
-    ) -> String {
+    fn legacy_deny_reason(decision: &encmind_core::permission::PermissionDecision) -> String {
         decision
             .rule_id
             .clone()
@@ -1215,12 +1304,16 @@ impl AgentRuntime {
     ) -> Result<PreparedToolCall, AppError> {
         use encmind_core::permission::{DecisionSource, PermissionDecision};
         let mut input = parsed_input.clone();
+        // Resolve aliases once for governance decisions so local-vs-node and
+        // allow/deny checks use canonical tool identity.
+        let policy_tool_name = self.tool_registry.canonical_tool_name(tool_name);
 
         // Governance step 1: immutable deny-list.
-        let risk = crate::risk_classifier::classify_tool_risk(tool_name, &input, session_id);
+        let risk = crate::risk_classifier::classify_tool_risk(policy_tool_name, &input, session_id);
         if risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
             warn!(
-                tool = %tool_name,
+                tool = %policy_tool_name,
+                requested_tool = %tool_name,
                 reason = %risk.reason,
                 "tool call blocked by immutable deny-list"
             );
@@ -1338,10 +1431,11 @@ impl AgentRuntime {
 
             // Hooks must not bypass immutable deny-list.
             let post_hook_risk =
-                crate::risk_classifier::classify_tool_risk(tool_name, &input, session_id);
+                crate::risk_classifier::classify_tool_risk(policy_tool_name, &input, session_id);
             if post_hook_risk.level == crate::risk_classifier::ToolRiskLevel::Denied {
                 warn!(
-                    tool = %tool_name,
+                    tool = %policy_tool_name,
+                    requested_tool = %tool_name,
                     reason = %post_hook_risk.reason,
                     "tool call blocked after hook modified input — deny-list match"
                 );
@@ -1386,10 +1480,9 @@ impl AgentRuntime {
                         "tool call blocked by egress firewall"
                     );
                     let output = format!("Error: {e}");
-                    let decision =
-                        PermissionDecision::new(DecisionSource::Firewall, e.to_string())
-                            .with_rule_id("egress_firewall")
-                            .with_input_fingerprint(&input);
+                    let decision = PermissionDecision::new(DecisionSource::Firewall, e.to_string())
+                        .with_rule_id("egress_firewall")
+                        .with_input_fingerprint(&input);
                     self.invoke_after_tool_call_deny_hook(
                         session_id,
                         agent_id,
@@ -1414,7 +1507,7 @@ impl AgentRuntime {
 
         // Governance step 5: approval policy.
         if let Some(checker) = &self.approval_checker {
-            if checker.is_denied(tool_name) {
+            if checker.is_denied(policy_tool_name) {
                 let output = format!("Error: tool '{}' is denied by security policy", tool_name);
                 let decision = PermissionDecision::new(
                     DecisionSource::Approval,
@@ -1442,7 +1535,7 @@ impl AgentRuntime {
                 });
             }
 
-            if checker.requires_approval(tool_name, &input) {
+            if checker.requires_approval(policy_tool_name, &input) {
                 let req = ApprovalRequest {
                     tool_name: tool_name.to_owned(),
                     tool_input: input.clone(),
@@ -1702,11 +1795,17 @@ impl AgentRuntime {
         }
 
         // Dispatch only "Ready" calls in bounded parallelism.
-        let ready_dispatches: Vec<(usize, String, serde_json::Value, ToolInterruptBehavior)> =
+        let ready_dispatches: Vec<(
+            usize,
+            String,
+            String,
+            serde_json::Value,
+            ToolInterruptBehavior,
+        )> =
             prepared
                 .iter()
                 .enumerate()
-                .filter_map(|(order, (_, name, prepared_call))| match prepared_call {
+                .filter_map(|(order, (id, name, prepared_call))| match prepared_call {
                     PreparedToolCall::Ready { input } => {
                         let interrupt_behavior = interrupt_behaviors
                             .get(order)
@@ -1715,7 +1814,13 @@ impl AgentRuntime {
                         if cancel_requested && interrupt_behavior == ToolInterruptBehavior::Cancel {
                             None
                         } else {
-                            Some((order, name.clone(), input.clone(), interrupt_behavior))
+                            Some((
+                                order,
+                                id.clone(),
+                                name.clone(),
+                                input.clone(),
+                                interrupt_behavior,
+                            ))
                         }
                     }
                     PreparedToolCall::Finalized { .. } => None,
@@ -1745,82 +1850,78 @@ impl AgentRuntime {
         }
 
         if !ready_dispatches.is_empty() {
+            let event_tx_for_batch = state.event_tx.clone();
             let mut dispatch_stream =
                 futures::stream::iter(ready_dispatches.into_iter().map(
-                    |(order, name, input, interrupt_behavior)| {
+                    |(order, id, name, input, interrupt_behavior)| {
                         let tool_registry = self.tool_registry.clone();
                         let dispatch_session_id = session_id.clone();
                         let dispatch_agent_id = agent_id.clone();
                         let dispatch_cancel = state.cancel.clone();
                         let cancel_grace = self.config.blocking_tool_cancel_grace;
+                        // Two copies: one keyed into the progress scope
+                        // (borrowed) and one moved into the dispatch
+                        // async block (owned).
+                        let progress_tool_name = name.clone();
                         let dispatch_name = name.clone();
+                        let dispatch_id = id.clone();
+                        let batch_event_tx = event_tx_for_batch.clone();
                         // Retain a copy of the input so normalize can attach
                         // an input fingerprint to dispatch-level denials for
                         // audit correlation.
                         let fingerprint_input = input.clone();
                         async move {
-                            let dispatch_future = std::panic::AssertUnwindSafe(tool_registry.dispatch(
-                                &dispatch_name,
-                                input,
-                                &dispatch_session_id,
-                                &dispatch_agent_id,
-                            ))
-                            .catch_unwind();
-                            tokio::pin!(dispatch_future);
+                            // Wrap the dispatch in a per-tool ToolProgress
+                            // sink so long-running handlers running
+                            // concurrently each report against their own
+                            // tool_use_id without cross-talk.
+                            let (output, is_error, decision) = Self::dispatch_with_progress_scope(
+                                &batch_event_tx,
+                                &dispatch_id,
+                                &progress_tool_name,
+                                async move {
+                                    let dispatch_future = std::panic::AssertUnwindSafe(
+                                        tool_registry.dispatch(
+                                            &dispatch_name,
+                                            input,
+                                            &dispatch_session_id,
+                                            &dispatch_agent_id,
+                                        ),
+                                    )
+                                    .catch_unwind();
+                                    tokio::pin!(dispatch_future);
 
-                            let normalize = |dispatch_result: Result<
-                                Result<String, AppError>,
-                                Box<dyn std::any::Any + Send>,
-                            >| {
-                                let dispatch_result = match dispatch_result {
-                                    Ok(inner) => inner,
-                                    Err(_) => Err(AppError::Internal(
-                                        "parallel tool task panicked".to_string(),
-                                    )),
-                                };
-                                Self::normalize_dispatch_outcome(
-                                    &dispatch_name,
-                                    &fingerprint_input,
-                                    dispatch_result,
-                                )
-                            };
+                                    let normalize = |dispatch_result: Result<
+                                        Result<String, AppError>,
+                                        Box<dyn std::any::Any + Send>,
+                                    >| {
+                                        let dispatch_result = match dispatch_result {
+                                            Ok(inner) => inner,
+                                            Err(_) => Err(AppError::Internal(
+                                                "parallel tool task panicked".to_string(),
+                                            )),
+                                        };
+                                        Self::normalize_dispatch_outcome(
+                                            &dispatch_name,
+                                            &fingerprint_input,
+                                            dispatch_result,
+                                        )
+                                    };
 
-                            let (output, is_error, decision) = match interrupt_behavior {
-                                ToolInterruptBehavior::Cancel => {
-                                    tokio::select! {
-                                        _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
-                                        result = dispatch_future.as_mut() => normalize(result),
-                                    }
-                                }
-                                ToolInterruptBehavior::Block => {
-                                    if dispatch_cancel.is_cancelled() {
-                                        match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
-                                            Ok(result) => normalize(result),
-                                            Err(_) => {
-                                                warn!(
-                                                    tool = %name,
-                                                    grace_ms = cancel_grace.as_millis(),
-                                                    "blocking tool did not finish within cancel grace"
-                                                );
-                                                (
-                                                    format!(
-                                                        "Error: blocking tool did not finish within cancel grace ({}ms)",
-                                                        cancel_grace.as_millis()
-                                                    ),
-                                                    true,
-                                                    None,
-                                                )
+                                    match interrupt_behavior {
+                                        ToolInterruptBehavior::Cancel => {
+                                            tokio::select! {
+                                                _ = dispatch_cancel.cancelled() => ("Error: request cancelled".to_string(), true, None),
+                                                result = dispatch_future.as_mut() => normalize(result),
                                             }
                                         }
-                                    } else {
-                                        tokio::select! {
-                                            result = dispatch_future.as_mut() => normalize(result),
-                                            _ = dispatch_cancel.cancelled() => {
+                                        ToolInterruptBehavior::Block => {
+                                            if dispatch_cancel.is_cancelled() {
                                                 match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
                                                     Ok(result) => normalize(result),
                                                     Err(_) => {
                                                         warn!(
-                                                            tool = %name,
+                                                            tool = %dispatch_name,
                                                             grace_ms = cancel_grace.as_millis(),
                                                             "blocking tool did not finish within cancel grace"
                                                         );
@@ -1834,11 +1935,36 @@ impl AgentRuntime {
                                                         )
                                                     }
                                                 }
+                                            } else {
+                                                tokio::select! {
+                                                    result = dispatch_future.as_mut() => normalize(result),
+                                                    _ = dispatch_cancel.cancelled() => {
+                                                        match tokio::time::timeout(cancel_grace, dispatch_future.as_mut()).await {
+                                                            Ok(result) => normalize(result),
+                                                            Err(_) => {
+                                                                warn!(
+                                                                    tool = %dispatch_name,
+                                                                    grace_ms = cancel_grace.as_millis(),
+                                                                    "blocking tool did not finish within cancel grace"
+                                                                );
+                                                                (
+                                                                    format!(
+                                                                        "Error: blocking tool did not finish within cancel grace ({}ms)",
+                                                                        cancel_grace.as_millis()
+                                                                    ),
+                                                                    true,
+                                                                    None,
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            };
+                                },
+                            )
+                            .await;
                             (order, name, output, is_error, decision)
                         }
                     },
@@ -1865,12 +1991,7 @@ impl AgentRuntime {
                             output,
                             is_error,
                             decision,
-                        } => (
-                            input.clone(),
-                            output.clone(),
-                            *is_error,
-                            decision.clone(),
-                        ),
+                        } => (input.clone(), output.clone(), *is_error, decision.clone()),
                         PreparedToolCall::Ready { input } => {
                             let maybe_dispatch =
                                 dispatch_results_by_order.remove(&next_order_to_persist);
@@ -1904,11 +2025,7 @@ impl AgentRuntime {
                                     input.clone(),
                                     hook_output,
                                     hook_error,
-                                    if hook_error {
-                                        dispatch_decision
-                                    } else {
-                                        None
-                                    },
+                                    if hook_error { dispatch_decision } else { None },
                                 ),
                                 Err(e) => {
                                     if let Err(persist_err) = self
@@ -2078,12 +2195,7 @@ impl AgentRuntime {
                     output,
                     is_error,
                     decision,
-                } => (
-                    input.clone(),
-                    output.clone(),
-                    *is_error,
-                    decision.clone(),
-                ),
+                } => (input.clone(), output.clone(), *is_error, decision.clone()),
                 PreparedToolCall::Ready { input } => {
                     let maybe_dispatch = dispatch_results_by_order.remove(&next_order_to_persist);
                     let (dispatch_output, dispatch_error, dispatch_decision) =
@@ -2125,11 +2237,7 @@ impl AgentRuntime {
                             input.clone(),
                             hook_output,
                             hook_error,
-                            if hook_error {
-                                dispatch_decision
-                            } else {
-                                None
-                            },
+                            if hook_error { dispatch_decision } else { None },
                         ),
                         Err(e) => {
                             if let Err(persist_err) = self
@@ -3360,6 +3468,57 @@ mod tests {
                 "local_file_read".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn prompt_visible_tools_hides_denied_bash_tools() {
+        let mut registry = ToolRegistry::new();
+        register_noop_internal_tool(&mut registry, "file_read");
+        register_noop_internal_tool(&mut registry, "bash_exec");
+        register_noop_internal_tool(&mut registry, "node_bash_exec");
+
+        let runtime = AgentRuntime::new(
+            Arc::new(MockLlmBackend::new(128_000)),
+            Arc::new(InMemorySessionStore::new()) as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            RuntimeConfig::default(),
+        )
+        .with_approval(
+            Arc::new(crate::approval::NoopApprovalHandler),
+            crate::approval::ToolApprovalChecker::with_bash_effective_mode(
+                encmind_core::config::BashMode::Ask,
+                false,
+            ),
+        );
+
+        let visible = runtime.prompt_visible_tools();
+        assert_eq!(
+            visible,
+            vec!["file_read".to_string(), "node_bash_exec".to_string()]
+        );
+    }
+
+    #[test]
+    fn prompt_visible_tools_hides_bash_when_interactive_approval_unavailable() {
+        let mut registry = ToolRegistry::new();
+        register_noop_internal_tool(&mut registry, "file_read");
+        register_noop_internal_tool(&mut registry, "bash_exec");
+        register_noop_internal_tool(&mut registry, "node_bash_exec");
+
+        let runtime = AgentRuntime::new(
+            Arc::new(MockLlmBackend::new(128_000)),
+            Arc::new(InMemorySessionStore::new()) as Arc<dyn SessionStore>,
+            Arc::new(registry),
+            RuntimeConfig::default(),
+        )
+        .with_approval(
+            Arc::new(crate::approval::NoopApprovalHandler),
+            crate::approval::ToolApprovalChecker::new(encmind_core::config::BashMode::Ask)
+                .with_interactive_approval_available(false),
+        );
+
+        let visible = runtime.prompt_visible_tools();
+        assert_eq!(visible, vec!["file_read".to_string()]);
     }
 
     #[tokio::test]
@@ -5475,6 +5634,94 @@ mod tests {
         match stop_reason {
             Some(StopReason::MaxIterations) => {}
             other => panic!("expected max_iterations stop reason, got {other:?}"),
+        }
+    }
+
+    struct ProgressEmittingTool;
+
+    #[async_trait]
+    impl InternalToolHandler for ProgressEmittingTool {
+        async fn handle(
+            &self,
+            _input: serde_json::Value,
+            _session_id: &SessionId,
+            _agent_id: &AgentId,
+        ) -> Result<String, AppError> {
+            crate::tool_progress::report_status("fetching");
+            crate::tool_progress::report_progress("parsing", Some(0.42));
+            crate::tool_progress::report_status("done");
+            Ok("ok".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_emits_tool_progress_events_from_handler() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register_internal(
+                "progress_tool",
+                "tool that emits progress events",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+                Arc::new(ProgressEmittingTool),
+            )
+            .unwrap();
+
+        let responses = vec![
+            tool_use_response("t1", "progress_tool", "{}"),
+            text_response("done"),
+        ];
+        let (runtime, store) = setup_runtime(responses, registry).await;
+
+        let session = store.create_session("web").await.unwrap();
+        let (mut rx, handle) = runtime.run_streaming(
+            session.id.clone(),
+            make_user_msg("go"),
+            default_agent(),
+            CancellationToken::new(),
+        );
+
+        // Collect streaming events until the run completes.
+        let mut progress_events = Vec::new();
+        let mut saw_tool_start = false;
+        let mut saw_tool_complete = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                ChatEvent::ToolStart { .. } => saw_tool_start = true,
+                ChatEvent::ToolProgress {
+                    tool_name,
+                    message,
+                    fraction,
+                    ..
+                } => {
+                    progress_events.push((tool_name, message, fraction));
+                }
+                ChatEvent::ToolComplete { .. } => saw_tool_complete = true,
+                ChatEvent::Done { .. } => break,
+                ChatEvent::Error { message } => panic!("unexpected error: {message}"),
+                _ => {}
+            }
+        }
+
+        let result = handle.await.unwrap().unwrap();
+        assert!(!result.cancelled);
+        assert!(saw_tool_start, "ToolStart must be emitted");
+        assert!(saw_tool_complete, "ToolComplete must be emitted");
+        assert_eq!(
+            progress_events.len(),
+            3,
+            "expected 3 ToolProgress events, got: {progress_events:?}"
+        );
+        assert_eq!(progress_events[0].1, "fetching");
+        assert_eq!(progress_events[0].2, None);
+        assert_eq!(progress_events[1].1, "parsing");
+        assert_eq!(progress_events[1].2, Some(0.42));
+        assert_eq!(progress_events[2].1, "done");
+        // All progress events should carry the tool name.
+        for (name, _, _) in &progress_events {
+            assert_eq!(name, "progress_tool");
         }
     }
 

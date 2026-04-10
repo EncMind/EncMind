@@ -37,6 +37,18 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         migrate_v7(conn)?;
     }
 
+    if version < 8 {
+        migrate_v8(conn)?;
+    }
+
+    if version < 9 {
+        migrate_v9(conn)?;
+    }
+
+    if version < 10 {
+        migrate_v10(conn)?;
+    }
+
     Ok(())
 }
 
@@ -403,6 +415,93 @@ fn migrate_v7(conn: &Connection) -> Result<(), StorageError> {
         .map_err(|e| StorageError::MigrationFailed(format!("v7 transaction commit failed: {e}")))
 }
 
+fn migrate_v8(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| StorageError::MigrationFailed(format!("v8 transaction start failed: {e}")))?;
+
+    tx.execute_batch(V8_SCHEMA)
+        .map_err(|e| StorageError::MigrationFailed(format!("v8 migration failed: {e}")))?;
+
+    tx.pragma_update(None, "user_version", 8u32)
+        .map_err(|e| StorageError::MigrationFailed(format!("v8 version update failed: {e}")))?;
+
+    tx.commit()
+        .map_err(|e| StorageError::MigrationFailed(format!("v8 transaction commit failed: {e}")))
+}
+
+fn migrate_v9(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| StorageError::MigrationFailed(format!("v9 transaction start failed: {e}")))?;
+
+    tx.execute_batch(V9_SCHEMA)
+        .map_err(|e| StorageError::MigrationFailed(format!("v9 migration failed: {e}")))?;
+
+    tx.pragma_update(None, "user_version", 9u32)
+        .map_err(|e| StorageError::MigrationFailed(format!("v9 version update failed: {e}")))?;
+
+    tx.commit()
+        .map_err(|e| StorageError::MigrationFailed(format!("v9 transaction commit failed: {e}")))
+}
+
+fn migrate_v10(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| StorageError::MigrationFailed(format!("v10 transaction start failed: {e}")))?;
+
+    tx.execute_batch(V10_SCHEMA)
+        .map_err(|e| StorageError::MigrationFailed(format!("v10 migration failed: {e}")))?;
+
+    tx.pragma_update(None, "user_version", 10u32)
+        .map_err(|e| StorageError::MigrationFailed(format!("v10 version update failed: {e}")))?;
+
+    tx.commit()
+        .map_err(|e| StorageError::MigrationFailed(format!("v10 transaction commit failed: {e}")))
+}
+
+const V10_SCHEMA: &str = r#"
+-- Computed dollar cost for this turn. NULL when the model isn't in
+-- the pricing table. Computed at persist time from a static model
+-- pricing lookup in the gateway.
+ALTER TABLE api_usage ADD COLUMN cost_usd REAL;
+"#;
+
+const V9_SCHEMA: &str = r#"
+-- Add a status column to api_usage so cancelled and errored turns
+-- can be persisted alongside completed ones. Existing rows default
+-- to 'completed' (they were written by v8 which only persisted the
+-- success path).
+ALTER TABLE api_usage ADD COLUMN status TEXT NOT NULL DEFAULT 'completed';
+CREATE INDEX IF NOT EXISTS idx_api_usage_status ON api_usage(status);
+"#;
+
+const V8_SCHEMA: &str = r#"
+-- Per-turn API usage records for cost attribution. One row per
+-- completed chat.send, written at response build time. Lets
+-- operators answer "how much did Telegram cost last week" or
+-- "which cron job is the expensive one" without summing logs.
+CREATE TABLE IF NOT EXISTS api_usage (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT    NOT NULL,
+    agent_id        TEXT    NOT NULL,
+    channel         TEXT    NOT NULL,
+    model           TEXT    NOT NULL,
+    provider        TEXT    NOT NULL,
+    input_tokens    INTEGER NOT NULL,
+    output_tokens   INTEGER NOT NULL,
+    total_tokens    INTEGER NOT NULL,
+    iterations      INTEGER NOT NULL,
+    duration_ms     INTEGER NOT NULL,
+    started_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_usage_started_at ON api_usage(started_at);
+CREATE INDEX IF NOT EXISTS idx_api_usage_session ON api_usage(session_id);
+CREATE INDEX IF NOT EXISTS idx_api_usage_channel ON api_usage(channel);
+CREATE INDEX IF NOT EXISTS idx_api_usage_agent ON api_usage(agent_id);
+"#;
+
 const V6_SCHEMA: &str = r#"
 -- Channel accounts managed via API or config
 CREATE TABLE IF NOT EXISTS channel_accounts (
@@ -460,7 +559,7 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    const CURRENT_VERSION: u32 = 7;
+    const CURRENT_VERSION: u32 = 10;
 
     #[test]
     fn migration_creates_all_tables() {

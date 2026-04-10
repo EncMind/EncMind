@@ -1,4 +1,5 @@
 pub mod api_key_store;
+pub mod api_usage;
 pub mod audit;
 pub mod backup;
 pub mod channel_account_store;

@@ -549,6 +549,9 @@ pub async fn run_gateway(
             .rate_limit
             .api_budget_usd
             .map(|budget| Arc::new(ApiBudgetTracker::new(budget))),
+        api_usage_store: Some(Arc::new(encmind_storage::api_usage::ApiUsageStore::new(
+            pool.clone(),
+        ))),
         channel_account_store: Some(Arc::new(
             encmind_storage::channel_account_store::SqliteChannelAccountStore::new(
                 pool.clone(),
@@ -3969,6 +3972,8 @@ impl encmind_core::traits::InternalToolHandler for WasmSkillToolHandler {
 fn register_base_tools(
     registry: &mut ToolRegistry,
     config: &AppConfig,
+    agent_registry: Option<Arc<dyn AgentRegistry>>,
+    shared_config: Option<Arc<RwLock<AppConfig>>>,
     _browser_pool: &Option<Arc<encmind_browser::pool::BrowserPool>>,
     node_registry: Option<Arc<NodeRegistry>>,
     device_store: Option<Arc<dyn DeviceStore>>,
@@ -3980,9 +3985,11 @@ fn register_base_tools(
 
     // Always register local tools. If node tools are present, namespace local tools
     // so canonical names remain mapped to node_* for backward-compatible behavior.
-    if let Err(e) = crate::local_tool_handler::register_local_tools_with_prefix(
+    if let Err(e) = crate::local_tool_handler::register_local_tools_with_prefix_and_registry(
         registry,
         local_policy_engine,
+        agent_registry,
+        shared_config,
         60,
         local_prefix,
     ) {
@@ -3991,7 +3998,7 @@ fn register_base_tools(
         info!(
             prefix = %local_prefix,
             bash_enabled = local_policy_status.bash_effective_enabled,
-            "local tools registered (file_read, file_write, file_list, optional bash_exec)"
+            "local tools registered (file_read, file_write, file_list, bash_exec policy-gated)"
         );
     }
 
@@ -4103,6 +4110,8 @@ pub(crate) fn initialize_tool_registry(
     register_base_tools(
         &mut registry,
         config,
+        Some(agent_registry.clone()),
+        shared_config.clone(),
         &browser_pool,
         node_registry.clone(),
         device_store.clone(),
@@ -4153,12 +4162,17 @@ pub(crate) fn initialize_tool_registry(
             register_base_tools(
                 &mut base_registry,
                 config,
+                Some(agent_registry.clone()),
+                shared_config.clone(),
                 &None,
                 node_registry,
                 device_store,
             );
-            let (approval_handler, approval_checker) =
-                gateway_approval_policy(config.security.bash_mode.clone());
+            let local_bash_effectively_enabled = config.security.local_bash_effectively_enabled();
+            let (approval_handler, approval_checker) = gateway_approval_policy(
+                config.security.bash_mode.clone(),
+                local_bash_effectively_enabled,
+            );
 
             let mut spawn_handler = SpawnAgentHandler::new(
                 llm,

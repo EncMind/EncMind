@@ -129,8 +129,27 @@ impl LlmBackend for LlmDispatcher {
         cancel: CancellationToken,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CompletionDelta, LlmError>> + Send>>, LlmError>
     {
-        let policy = RetryPolicy::default();
+        // Build the retry policy from the current task-local query class.
+        // Interactive runs get the full retry budget; background runs
+        // (cron, webhook, timer) bail fast so they can't amplify an
+        // upstream cascade. Overall run is still bounded by
+        // AgentPool::per_session_timeout_secs.
+        let policy = RetryPolicy::for_current_class();
+        let query_class = encmind_core::scheduler::current_query_class();
         let mut retries = 0u32;
+
+        // Generate a stable idempotency key for this logical request.
+        // The same key is reused across retries so the provider can
+        // dedup: a retried request after a network timeout won't be
+        // processed twice (and double-billed).
+        let mut params = params;
+        if params.request_id.is_none() {
+            use rand::RngExt as _;
+            let mut bytes = [0u8; 16];
+            rand::rng().fill(&mut bytes);
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            params.request_id = Some(hex);
+        }
 
         loop {
             match self
@@ -146,6 +165,7 @@ impl LlmBackend for LlmDispatcher {
                             retry = retries + 1,
                             max = policy.max_retries,
                             delay_ms = delay.as_millis() as u64,
+                            class = %query_class.as_str(),
                             error = %err_str,
                             "retrying LLM completion after transient error"
                         );
@@ -157,6 +177,7 @@ impl LlmBackend for LlmDispatcher {
                             tracing::error!(
                                 retries = retries,
                                 class = ?class,
+                                query_class = %query_class.as_str(),
                                 "{}", class.user_message()
                             );
                         }

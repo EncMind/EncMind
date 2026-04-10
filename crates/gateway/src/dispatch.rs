@@ -49,6 +49,7 @@ pub async fn dispatch_method(
         "cron.delete" => handlers::cron::handle_delete(state, params, req_id).await,
         "cron.trigger" => handlers::cron::handle_trigger(state, params, req_id).await,
         "timeline.query" => handlers::timeline::handle_query(state, params, req_id).await,
+        "api_usage.query" => handlers::api_usage::handle_query(state, params, req_id).await,
         "keys.list" => handlers::keys::handle_list(state, params, req_id).await,
         "keys.set" => handlers::keys::handle_set(state, params, req_id).await,
         "keys.delete" => handlers::keys::handle_delete(state, params, req_id).await,

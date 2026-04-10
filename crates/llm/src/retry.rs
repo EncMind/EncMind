@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use encmind_core::scheduler::QueryClass;
+
 /// Retry policy for LLM API calls.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
@@ -17,6 +19,39 @@ impl Default for RetryPolicy {
             max_delay: Duration::from_secs(30),
             jitter_fraction: 0.25,
         }
+    }
+}
+
+impl RetryPolicy {
+    /// Build a retry policy scoped to a query class.
+    ///
+    /// - `Interactive` — user-facing traffic gets the full default
+    ///   retry budget (3 attempts, exponential backoff). When the
+    ///   upstream rate-limits or overloads, we want to give the user
+    ///   a chance before surfacing the error.
+    /// - `Background` — cron, webhook, and timer runs bail after a
+    ///   single retry. Aggressive retries on background traffic during
+    ///   an upstream cascade would amplify the outage, so fail fast
+    ///   and let the caller propagate the error.
+    ///
+    /// The overall run is still bounded by
+    /// `AgentPool::per_session_timeout_secs`, so neither class can
+    /// retry indefinitely.
+    pub fn for_class(class: QueryClass) -> Self {
+        match class {
+            QueryClass::Interactive => Self::default(),
+            QueryClass::Background => Self {
+                max_retries: 1,
+                ..Self::default()
+            },
+        }
+    }
+
+    /// Build a retry policy from the current task-local query class,
+    /// defaulting to `Interactive` when not set (tests, direct calls
+    /// from outside an agent run).
+    pub fn for_current_class() -> Self {
+        Self::for_class(encmind_core::scheduler::current_query_class())
     }
 }
 
@@ -75,11 +110,12 @@ impl RetryPolicy {
         {
             return true;
         }
-        // Retryable: server errors
+        // Retryable: server errors (including Anthropic's 529 "overloaded").
         if lower.contains("500")
             || lower.contains("502")
             || lower.contains("503")
             || lower.contains("504")
+            || lower.contains("529")
         {
             return true;
         }
@@ -87,6 +123,7 @@ impl RetryPolicy {
             || lower.contains("bad gateway")
             || lower.contains("service unavailable")
             || lower.contains("gateway timeout")
+            || lower.contains("overloaded")
         {
             return true;
         }
@@ -115,10 +152,12 @@ impl RetryPolicy {
             || lower.contains("502")
             || lower.contains("503")
             || lower.contains("504")
+            || lower.contains("529")
             || lower.contains("internal server error")
             || lower.contains("bad gateway")
             || lower.contains("service unavailable")
             || lower.contains("gateway timeout")
+            || lower.contains("overloaded")
         {
             ExhaustedErrorClass::ServerError
         } else if lower.contains("connection")
@@ -171,6 +210,55 @@ mod tests {
     #[test]
     fn not_retryable_cancelled() {
         assert!(!RetryPolicy::is_retryable("request cancelled by user"));
+    }
+
+    #[test]
+    fn is_retryable_529_overloaded() {
+        // Anthropic's overloaded status — must be retryable.
+        assert!(RetryPolicy::is_retryable("HTTP 529 Overloaded"));
+        assert!(RetryPolicy::is_retryable(
+            "upstream returned status 529 overloaded"
+        ));
+        assert!(RetryPolicy::is_retryable("API is overloaded, try later"));
+    }
+
+    #[test]
+    fn classify_529_as_server_error() {
+        assert_eq!(
+            RetryPolicy::classify_error("HTTP 529 Overloaded"),
+            ExhaustedErrorClass::ServerError
+        );
+    }
+
+    #[test]
+    fn for_class_interactive_uses_default_budget() {
+        let policy = RetryPolicy::for_class(QueryClass::Interactive);
+        assert_eq!(policy.max_retries, 3);
+    }
+
+    #[test]
+    fn for_class_background_bails_fast() {
+        let policy = RetryPolicy::for_class(QueryClass::Background);
+        assert_eq!(
+            policy.max_retries, 1,
+            "background runs must bail after a single retry to avoid \
+             amplifying upstream cascades"
+        );
+    }
+
+    #[tokio::test]
+    async fn for_current_class_reads_task_local() {
+        use encmind_core::scheduler::{QueryClass, CURRENT_QUERY_CLASS};
+        // Outside any scope, defaults to Interactive → full budget.
+        assert_eq!(RetryPolicy::for_current_class().max_retries, 3);
+
+        // Inside Background scope → fast bail.
+        let max = CURRENT_QUERY_CLASS
+            .scope(QueryClass::Background, async {
+                RetryPolicy::for_current_class().max_retries
+            })
+            .await;
+        assert_eq!(max, 1);
     }
 
     #[test]

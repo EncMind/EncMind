@@ -173,37 +173,42 @@ EncMind V1 is a 15-crate Rust workspace with:
 
 **Purpose:** Strengthen the existing `LocalToolHandler` with config-driven workspace policy, trust boundaries, and parity with Edge security controls.
 
-**Current state:** `LocalToolHandler` and `LocalToolPolicyEngine` already exist in the gateway crate, providing direct local file/bash execution without Edge. What's missing: config-driven workspace roots, denied path policy, symlink protection, and integration with the workspace trust boundary.
+**Current state (A.8 shipped):** `LocalToolHandler` and `LocalToolPolicyEngine` now integrate with the workspace trust gate, enforce `BashMode::Allowlist` patterns at the dispatch layer, and expose an operator-configurable deny list layered on top of the hardcoded defaults. Symlink containment is verified by canonicalization in `validate_file_path` and locked in by two edge-case tests (existing-target escape and missing-target escape).
 
-**Design:**
+**Configuration:**
 ```yaml
-server:
-  local_mode:
-    enabled: true
-    workspace_roots:
+security:
+  bash_mode: !allowlist
+    patterns: ["ls*", "git status", "echo*"]
+  local_tools:
+    mode: single_operator            # or isolated_agents
+    bash_mode: host                  # or disabled
+    base_roots:
       - /home/user/projects
-    denied_paths:
-      - /home/user/.ssh
-      - /home/user/.gnupg
-    bash_mode: ask   # ask | allow | deny
+    denied_paths:                    # operator additions, layered on defaults
+      - /home/user/private-notes
+  workspace_trust:
+    trusted_paths:
+      - /home/user/projects
+    untrusted_default: readonly      # readonly | deny | allow
 ```
 
-```rust
-// Enhance existing LocalToolPolicyEngine with:
-pub struct LocalToolPolicyEngine {
-    workspace_roots: Vec<PathBuf>,   // NEW: config-driven
-    denied_paths: Vec<PathBuf>,      // NEW: config-driven
-    bash_mode: BashMode,             // NEW: ask/allow/deny
-    // ... existing fields
-}
-```
+Hardcoded defaults (always denied regardless of operator config): `/etc/shadow`, `/etc/sudoers`, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`, `~/.git-credentials`, `~/.encmind`.
 
-- Path containment: all ops must resolve within `workspace_roots` after canonicalization
-- Symlink protection: canonicalize then verify still within roots
-- Coexistence: local mode for server-local ops, Edge for remote devices — both active simultaneously
-- Tool routing: `file.read`/`file.write`/`bash.exec` dispatch to appropriate executor based on target
+**LocalToolHandler governance pipeline (per call):**
 
-**Files:** `crates/core/src/config.rs`, `crates/gateway/src/local_tool_handler.rs` (modify), `crates/gateway/src/local_tool_policy.rs` (modify), `crates/gateway/src/node.rs`
+1. **Workspace trust gate** — `evaluate_trust(agent.workspace, trust_config)`:
+   - `Denied` → reject all commands with `ToolDenied { reason: "workspace_untrusted" }`
+   - `ReadOnly` → allow `file.read`, `file.list`; reject `file.write`, `bash.exec`
+   - `Trusted` / `Disabled` → proceed
+2. **Bash allowlist enforcement** — if `security.bash_mode = Allowlist { patterns }` and the command is `bash.exec`, the command must match one of the patterns (prefix-glob `"ls*"` or exact `"git status"`). This is defense in depth: the runtime governance approval checker normally enforces this, but the local handler does it directly so any path that skips governance still gets gated.
+3. **Per-agent policy** — merged from base allowed roots (`cwd`, `db_parent`, `temp_dir`, config `base_roots`), the agent's configured workspace, and the merged denied path list (defaults ∪ operator entries).
+4. **Path containment** — `validate_file_path` canonicalizes the target first (following symlinks), then checks `starts_with` against canonicalized allowed roots. Missing path segments walk up to the nearest existing ancestor before canonicalization so `file.write` on a non-existent file still gets its real parent resolved.
+5. **Dispatch** — `execute_command` via the edge-lib helper, with a configurable timeout (default 60s).
+
+**Coexistence with Edge:** Local mode is always active (registered at startup). When a paired edge device is present, local tools are re-registered under a `local_` prefix so the canonical names (`file_read`, etc.) route to the remote device, while `local_file_read` stays available for server-local ops.
+
+**Files:** `crates/core/src/config.rs`, `crates/gateway/src/local_tool_handler.rs`, `crates/gateway/src/local_tool_policy.rs`, `crates/local-client/src/commands.rs` (`validate_file_path`, symlink containment tests)
 
 ---
 
@@ -457,7 +462,7 @@ First access to untrusted workspace → prompt user to trust (interactive channe
 
 **Non-interactive fallback (cron, webhooks, channel adapters, headless):**
 - Default policy: `untrusted_default: deny` — treat as untrusted, same built-in read-only allowlist as above
-- Configurable per-workspace in config: `workspace_trust.pre_trusted: ["/home/user/projects"]` for paths that should be trusted without interactive prompt
+- Configurable per-workspace in config: `workspace_trust.trusted_paths: ["/home/user/projects"]` for paths that should be trusted without interactive prompt
 - Audit log entry emitted when trust is auto-denied in non-interactive context
 
 Trust persisted per workspace path in user settings.
@@ -1136,7 +1141,7 @@ Foundation. Nothing else ships until these are stable. Focus: prevent corruption
 | A.5 | Streaming tool executor (parallel safe) | 5-7 days | Read-only tools run in parallel, destructive serialize |
 | A.6 | Workspace trust + immutable deny-list | 2-3 days | Untrusted dirs cannot load plugins/skills/MCP; deny-list enforced even in bypass mode |
 | A.7 | Agent behavioral governance (prompt sections) | 1-2 days | Behavioral constraints + tool usage grammar + browser safety rules in system prompt |
-| A.8 | Local server mode (enhance existing) | 2-3 days | Config-driven workspace policy on LocalToolHandler |
+| A.8 | Local server mode (enhance existing) | 2-3 days | LocalToolHandler wired into workspace trust gate, operator-configurable denied_paths layered on defaults, BashMode::Allowlist patterns enforced at dispatch, symlink containment verified via canonicalization |
 | A.9 | Backpressure & graceful shutdown | 2-3 days | Bounded WS buffer, clean drain on SIGTERM |
 | A.10 | Withhold-and-recover errors | 2-3 days | Recoverable errors retried before surfacing to user |
 | A.11 | Error recovery circuit breaker | 2-3 days | Consecutive failures stop retrying, degrade gracefully |

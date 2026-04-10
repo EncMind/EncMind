@@ -10,5 +10,6 @@ pub mod risk_classifier;
 pub mod runtime;
 pub mod scheduler;
 pub mod subagent;
+pub mod tool_progress;
 pub mod tool_registry;
 pub mod workspace_trust;

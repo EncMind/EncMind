@@ -35,6 +35,13 @@ pub struct CompletionParams {
     pub stop_sequences: Vec<String>,
     pub tools: Vec<ToolDefinition>,
     pub thinking: Option<ThinkingConfig>,
+    /// Optional idempotency key for dedup at the provider. Generated
+    /// once per logical request by the dispatcher and reused across
+    /// retries, so a retried request after a network timeout isn't
+    /// processed twice. Backend implementations should attach it as
+    /// an HTTP header (e.g. `X-Request-Id` or provider-specific
+    /// idempotency header). Backends that don't support it ignore it.
+    pub request_id: Option<String>,
 }
 
 impl Default for CompletionParams {
@@ -46,6 +53,7 @@ impl Default for CompletionParams {
             stop_sequences: Vec::new(),
             tools: Vec::new(),
             thinking: None,
+            request_id: None,
         }
     }
 }

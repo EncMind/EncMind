@@ -164,10 +164,10 @@ mod tests {
     #[test]
     fn permission_decision_with_fingerprint_is_deterministic() {
         let input = serde_json::json!({"cmd": "ls", "dir": "/tmp"});
-        let d1 = PermissionDecision::new(DecisionSource::Approval, "ask")
-            .with_input_fingerprint(&input);
-        let d2 = PermissionDecision::new(DecisionSource::Approval, "ask")
-            .with_input_fingerprint(&input);
+        let d1 =
+            PermissionDecision::new(DecisionSource::Approval, "ask").with_input_fingerprint(&input);
+        let d2 =
+            PermissionDecision::new(DecisionSource::Approval, "ask").with_input_fingerprint(&input);
         assert!(d1.input_fingerprint.is_some());
         assert_eq!(d1.input_fingerprint, d2.input_fingerprint);
         assert_eq!(d1.input_fingerprint.as_ref().unwrap().len(), 12);

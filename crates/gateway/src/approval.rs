@@ -27,10 +27,12 @@ impl ApprovalHandler for DenyApprovalHandler {
 /// Build gateway approval components from security config.
 pub fn gateway_approval_policy(
     bash_mode: BashMode,
+    bash_effectively_enabled: bool,
 ) -> (Arc<dyn ApprovalHandler>, ToolApprovalChecker) {
     (
         Arc::new(DenyApprovalHandler),
-        ToolApprovalChecker::new(bash_mode),
+        ToolApprovalChecker::with_bash_effective_mode(bash_mode, bash_effectively_enabled)
+            .with_interactive_approval_available(false),
     )
 }
 
@@ -56,5 +58,12 @@ mod tests {
             }
             other => panic!("expected denied decision, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn gateway_policy_treats_ask_as_denied_without_interactive_prompts() {
+        let (_handler, checker) = gateway_approval_policy(BashMode::Ask, true);
+        assert!(checker.is_denied("bash_exec"));
+        assert!(checker.is_denied("node_bash_exec"));
     }
 }

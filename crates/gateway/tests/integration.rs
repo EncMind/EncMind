@@ -132,6 +132,7 @@ fn make_state() -> AppState {
         native_timer_replace_lock: Arc::new(AsyncMutex::new(())),
         session_rate_limiter: Arc::new(SessionRateLimiter::new(30)),
         api_budget_tracker: None,
+        api_usage_store: None,
         channel_account_store: None,
         channel_startup_intent,
     }
