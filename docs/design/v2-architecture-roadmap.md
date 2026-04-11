@@ -1142,7 +1142,7 @@ Foundation. Nothing else ships until these are stable. Focus: prevent corruption
 | A.6 | Workspace trust + immutable deny-list | 2-3 days | Untrusted dirs cannot load plugins/skills/MCP; deny-list enforced even in bypass mode |
 | A.7 | Agent behavioral governance (prompt sections) | 1-2 days | Behavioral constraints + tool usage grammar + browser safety rules in system prompt |
 | A.8 | Local server mode (enhance existing) | 2-3 days | LocalToolHandler wired into workspace trust gate, operator-configurable denied_paths layered on defaults, BashMode::Allowlist patterns enforced at dispatch, symlink containment verified via canonicalization |
-| A.9 | Backpressure & graceful shutdown | 2-3 days | Bounded WS buffer, clean drain on SIGTERM |
+| A.9 | Backpressure & graceful shutdown | 2-3 days | Bounded WS event buffer (mpsc(64)), graceful drain on SIGTERM (drain_timeout_secs wait before force-cancel), per-tool execution timeout (default 30s), client disconnect cancellation |
 | A.10 | Withhold-and-recover errors | 2-3 days | Recoverable errors retried before surfacing to user |
 | A.11 | Error recovery circuit breaker | 2-3 days | Consecutive failures stop retrying, degrade gracefully |
 | A.12 | Browser runtime guardrails | 1-2 days | Max retries, loop detection, dialog auto-dismiss, action timeout, metrics |

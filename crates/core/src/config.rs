@@ -493,6 +493,13 @@ pub struct ServerConfig {
     pub public_webhooks: PublicWebhooksConfig,
     #[serde(default = "default_shutdown_timeout_secs")]
     pub shutdown_timeout_secs: u32,
+    /// Grace period (seconds) to wait for in-flight agent runs to
+    /// complete before force-cancelling them on SIGTERM. During this
+    /// window the server stops accepting new requests but lets
+    /// active runs finish naturally. Runs still active after the
+    /// drain timeout are cancelled. Default: 10s.
+    #[serde(default = "default_drain_timeout_secs")]
+    pub drain_timeout_secs: u32,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -513,6 +520,9 @@ fn default_port() -> u16 {
 fn default_shutdown_timeout_secs() -> u32 {
     30
 }
+fn default_drain_timeout_secs() -> u32 {
+    10
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -525,6 +535,7 @@ impl Default for ServerConfig {
             auto_tls: false,
             public_webhooks: PublicWebhooksConfig::default(),
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
+            drain_timeout_secs: default_drain_timeout_secs(),
         }
     }
 }
@@ -1079,6 +1090,14 @@ pub struct SecurityConfig {
     /// After this timeout, a synthetic error result is returned.
     #[serde(default = "default_blocking_tool_cancel_grace_secs")]
     pub blocking_tool_cancel_grace_secs: u64,
+    /// Per-tool execution timeout in seconds. If a single tool call
+    /// takes longer than this, a synthetic error result is produced
+    /// and the tool future is dropped. Independent of the per-session
+    /// timeout (which caps the entire run) and the interrupt behavior
+    /// (Cancel/Block, which controls what happens on user abort).
+    /// Set to 0 to disable (tool runs until session timeout). Default: 30s.
+    #[serde(default = "default_per_tool_timeout_secs")]
+    pub per_tool_timeout_secs: u64,
     /// Workspace trust settings. Controls which tools are available based on
     /// whether the session's workspace path is in the trusted set.
     #[serde(default)]
@@ -1153,6 +1172,9 @@ impl Default for WorkspaceTrustConfig {
 fn default_audit_retention_days() -> u32 {
     7
 }
+fn default_per_tool_timeout_secs() -> u64 {
+    30
+}
 fn default_blocking_tool_cancel_grace_secs() -> u64 {
     10
 }
@@ -1172,6 +1194,7 @@ impl Default for SecurityConfig {
             external_vault: None,
             per_tool_interrupt_behavior: HashMap::new(),
             blocking_tool_cancel_grace_secs: default_blocking_tool_cancel_grace_secs(),
+            per_tool_timeout_secs: default_per_tool_timeout_secs(),
             workspace_trust: WorkspaceTrustConfig::default(),
         }
     }

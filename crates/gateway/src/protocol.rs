@@ -72,6 +72,7 @@ pub const ERR_UNKNOWN_METHOD: i32 = 4002;
 pub const ERR_LOCKDOWN: i32 = 4003;
 pub const ERR_RATE_LIMITED: i32 = 4004;
 pub const ERR_INVALID_PARAMS: i32 = 4005;
+pub const ERR_SHUTTING_DOWN: i32 = 4006;
 pub const ERR_INTERNAL: i32 = 5000;
 
 #[cfg(test)]

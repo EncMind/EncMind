@@ -93,6 +93,7 @@ fn make_state() -> AppState {
         pairing_sessions,
         admin_bootstrap_lock,
         active_runs,
+        shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         query_guard,
         timeline_store: Some(Arc::new(
             encmind_storage::timeline_store::SqliteTimelineStore::new(pool.clone()),
