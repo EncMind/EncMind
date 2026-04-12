@@ -268,9 +268,7 @@ impl LlmBackend for AnthropicBackend {
         // key return the cached response rather than running again.
         // Also send `x-request-id` for log correlation.
         if let Some(ref id) = params.request_id {
-            req = req
-                .header("idempotency-key", id)
-                .header("x-request-id", id);
+            req = req.header("idempotency-key", id).header("x-request-id", id);
         }
         let response = req
             .json(&request)
@@ -287,7 +285,7 @@ impl LlmBackend for AnthropicBackend {
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| crate::parse_retry_after(s));
+                .and_then(crate::parse_retry_after);
             let body = response.text().await.unwrap_or_default();
             if status.as_u16() == 429 {
                 return Err(LlmError::RateLimited {
