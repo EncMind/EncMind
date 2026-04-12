@@ -280,10 +280,18 @@ impl LlmBackend for AnthropicBackend {
 
         let status = response.status();
         if !status.is_success() {
+            // Extract Retry-After before consuming the body.
+            // Only numeric delta-seconds are parsed; HTTP-date format
+            // is ignored (Anthropic/OpenAI use numeric in practice).
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| crate::parse_retry_after(s));
             let body = response.text().await.unwrap_or_default();
             if status.as_u16() == 429 {
                 return Err(LlmError::RateLimited {
-                    retry_after_secs: None,
+                    retry_after_secs: retry_after,
                 });
             }
             return Err(LlmError::ApiError(format!("HTTP {status}: {body}")));
@@ -576,6 +584,59 @@ mod tests {
                 assert_eq!(delta.stop_reason.as_deref(), Some("end_turn"));
             }
             _ => panic!("expected MessageDelta"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // requires binding a local TCP port (MockServer); skip in restricted envs
+    async fn retry_after_header_populates_rate_limited_error() {
+        use encmind_core::error::LlmError;
+        use encmind_core::traits::{CompletionParams, LlmBackend};
+        use encmind_core::types::*;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "42")
+                    .set_body_string("rate limited"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let backend = AnthropicBackend::new(
+            "test-key".into(),
+            "test-model".into(),
+            Some(mock_server.uri()),
+        );
+
+        let messages = vec![Message {
+            id: MessageId::new(),
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hello".into(),
+            }],
+            created_at: chrono::Utc::now(),
+            token_count: None,
+        }];
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = backend
+            .complete(&messages, CompletionParams::default(), cancel)
+            .await;
+
+        match result {
+            Err(LlmError::RateLimited { retry_after_secs }) => {
+                assert_eq!(
+                    retry_after_secs,
+                    Some(42),
+                    "Retry-After header should be extracted"
+                );
+            }
+            Err(other) => panic!("expected RateLimited, got: {other}"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 }

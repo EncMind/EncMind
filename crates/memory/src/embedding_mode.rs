@@ -5,6 +5,7 @@ use encmind_core::error::MemoryError;
 use encmind_core::traits::Embedder;
 
 use crate::embedder::api::ApiEmbedder;
+use crate::embedder::resilient::{ResilientEmbedder, ResilientEmbedderConfig};
 
 /// Known embedding API domains that external mode may use.
 const KNOWN_EMBEDDING_DOMAINS: &[&str] = &[
@@ -62,11 +63,22 @@ impl EmbeddingModeEnforcer {
                         "missing embedding API key for provider '{provider}'; set env var {key_env}"
                     ))
                 })?;
-                Ok(Arc::new(ApiEmbedder::new(
+                let raw: Arc<dyn Embedder> = Arc::new(ApiEmbedder::new(
                     api_base_url,
                     &config.model_name,
                     config.embedding_dimensions,
                     Some(api_key),
+                ));
+                Ok(Arc::new(ResilientEmbedder::new(
+                    raw,
+                    ResilientEmbedderConfig {
+                        max_retries: config.embedding_max_retries,
+                        circuit_failure_threshold: config.embedding_circuit_threshold,
+                        circuit_reset_timeout: std::time::Duration::from_secs(
+                            config.embedding_circuit_reset_secs,
+                        ),
+                        ..Default::default()
+                    },
                 )))
             }
         }

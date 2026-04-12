@@ -523,11 +523,31 @@ impl AgentRuntime {
                 .unwrap_or(self.config.max_tool_iterations * 5),
         );
 
+        // Tracks whether we've already attempted emergency context
+        // recovery in this run. Limited to one attempt to prevent
+        // compaction thrashing — if the context is still too large
+        // after one emergency trim, the error surfaces to the user.
+        let mut context_recovery_attempted = false;
+        // Tracks output truncation continuations (FinishReason::Length).
+        // Capped at 2 to prevent infinite continuation loops.
+        let mut continuation_count = 0u32;
+        const MAX_CONTINUATIONS: u32 = 2;
+        let mut continuation_cap_hit = false;
+        // Content blocks accumulated across continuation iterations
+        // so the final response includes all segments, not just the
+        // last one. Only populated when FinishReason::Length fires.
+        let mut accumulated_content: Vec<ContentBlock> = Vec::new();
+        // Note: synthetic continuation prompts are prefixed with
+        // "[system: continue]" so history UX can filter/style them.
+        // A future `delete_message` API on SessionStore would allow
+        // cleaning them up post-run; for now they persist in history.
+
         // 2. Conversation loop
         for iteration in 0..self.config.max_tool_iterations {
             if cancel.is_cancelled() {
                 let result = Self::make_cancelled_result(
                     last_response,
+                    &accumulated_content,
                     tool_calls,
                     input_tokens,
                     output_tokens,
@@ -603,6 +623,7 @@ impl AgentRuntime {
                     if cancel.is_cancelled() || matches!(e, LlmError::Cancelled) {
                         let result = Self::make_cancelled_result(
                             last_response,
+                            &accumulated_content,
                             tool_calls,
                             input_tokens,
                             output_tokens,
@@ -611,6 +632,43 @@ impl AgentRuntime {
                         );
                         self.maybe_compact(session_id).await;
                         return Ok(result);
+                    }
+                    // Context-too-long recovery: if the LLM rejected
+                    // the prompt for exceeding context length and we
+                    // haven't tried emergency compaction yet, compact
+                    // aggressively and retry this iteration.
+                    if !context_recovery_attempted
+                        && Self::is_context_length_error(&e)
+                    {
+                        context_recovery_attempted = true;
+                        let before = context.len();
+                        info!(
+                            before_messages = before,
+                            "context-too-long error; attempting emergency compaction"
+                        );
+                        // Emergency compact: keep only the last few
+                        // messages so the next build_context produces
+                        // a smaller prompt. This modifies the SESSION
+                        // STORE, not just the in-memory context.
+                        if let Err(compact_err) = self
+                            .emergency_compact(session_id)
+                            .await
+                        {
+                            warn!(
+                                error = %compact_err,
+                                "emergency compaction failed; surfacing original error"
+                            );
+                            return Err(e.into());
+                        }
+                        info!("emergency compaction succeeded; retrying LLM call");
+                        // `continue` advances to the NEXT iteration
+                        // index, consuming one iteration from the
+                        // budget. This is acceptable: the alternative
+                        // (resetting the counter) risks infinite
+                        // compaction loops. The next iteration
+                        // rebuilds context from the now-compacted
+                        // session store.
+                        continue;
                     }
                     return Err(e.into());
                 }
@@ -644,6 +702,7 @@ impl AgentRuntime {
                             total_tokens = total_tokens.saturating_add(partial_tokens);
                             let result = Self::make_cancelled_result(
                                 last_response,
+                                &accumulated_content,
                                 tool_calls,
                                 input_tokens,
                                 output_tokens,
@@ -771,6 +830,7 @@ impl AgentRuntime {
                             Err(e) if Self::is_cancelled_app_error(&e) || cancel.is_cancelled() => {
                                 let result = Self::make_cancelled_result(
                                     last_response,
+                                    &accumulated_content,
                                     tool_calls,
                                     input_tokens,
                                     output_tokens,
@@ -996,6 +1056,7 @@ impl AgentRuntime {
                         Err(e) if Self::is_cancelled_app_error(&e) || cancel.is_cancelled() => {
                             let result = Self::make_cancelled_result(
                                 last_response,
+                                &accumulated_content,
                                 tool_calls,
                                 input_tokens,
                                 output_tokens,
@@ -1027,6 +1088,66 @@ impl AgentRuntime {
 
                 debug!(iteration, "tool use round complete, continuing loop");
                 continue;
+            }
+
+            // Output truncation continuation: if the model stopped
+            // because it hit the output token limit, persist the
+            // partial response and inject a continuation prompt so
+            // the model can resume in the next iteration. Capped at
+            // MAX_CONTINUATIONS to prevent infinite loops.
+            if matches!(finish_reason, Some(FinishReason::Length)) {
+                if continuation_count >= MAX_CONTINUATIONS {
+                    // Cap reached — accumulate this final segment +
+                    // truncation marker. The generic merge at
+                    // finalization will prepend accumulated_content
+                    // to the persisted message's content. We do NOT
+                    // merge into assistant_msg here because the
+                    // persist at finalization must store only THIS
+                    // segment (earlier segments are already in the
+                    // session store from prior continuation rounds).
+                    warn!(
+                        iteration,
+                        max = MAX_CONTINUATIONS,
+                        "output truncation continuation cap reached; response may be incomplete"
+                    );
+                    continuation_cap_hit = true;
+                    // Fall through to normal finalization — the
+                    // generic merge will combine accumulated +
+                    // assistant_msg.content. The truncation marker
+                    // is appended post-merge so it appears at the
+                    // end, not in the middle.
+                } else {
+                info!(
+                    iteration,
+                    continuation = continuation_count + 1,
+                    max = MAX_CONTINUATIONS,
+                    "output truncated (FinishReason::Length); continuing"
+                );
+                // Accumulate this segment's content blocks so the
+                // final response includes all continuations, not just
+                // the last one. Non-streaming callers would otherwise
+                // lose the first part of a truncated answer.
+                accumulated_content.extend(assistant_msg.content.clone());
+                self.session_store
+                    .append_message(session_id, &assistant_msg)
+                    .await?;
+                let continuation_msg = Message {
+                    id: MessageId::new(),
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "[system: continue] Continue your response from where you left off."
+                            .to_owned(),
+                    }],
+                    created_at: Utc::now(),
+                    token_count: None,
+                };
+                self.session_store
+                    .append_message(session_id, &continuation_msg)
+                    .await?;
+                last_response = Some(assistant_msg);
+                continuation_count += 1;
+                continue;
+                }
             }
 
             // If model asked for tool use but did not provide calls, bail out explicitly.
@@ -1066,6 +1187,20 @@ impl AgentRuntime {
             self.session_store
                 .append_message(session_id, &assistant_msg)
                 .await?;
+
+            // If there were continuation iterations
+            // (FinishReason::Length), merge all accumulated content
+            // blocks into the final response so non-streaming callers
+            // see the complete answer, not just the last segment.
+            if !accumulated_content.is_empty() {
+                accumulated_content.extend(assistant_msg.content);
+                if continuation_cap_hit {
+                    accumulated_content.push(ContentBlock::Text {
+                        text: "\n\n[Response truncated due to length limits]".to_owned(),
+                    });
+                }
+                assistant_msg.content = accumulated_content;
+            }
 
             last_response = Some(assistant_msg);
             let result = RunResult {
@@ -2552,15 +2687,51 @@ impl AgentRuntime {
         matches!(err, AppError::Llm(LlmError::Cancelled))
     }
 
+    /// Detect context-length / prompt-too-long errors from the LLM.
+    /// These are recoverable via emergency compaction.
+    ///
+    /// Patterns are intentionally specific to avoid false positives —
+    /// a false positive triggers emergency_compact which mutates
+    /// persisted session history (destructive). The max-1-per-run
+    /// guard limits blast radius, but tight patterns are still the
+    /// first line of defense.
+    fn is_context_length_error(err: &LlmError) -> bool {
+        let msg = err.to_string().to_lowercase();
+        // Anthropic: "prompt is too long: N tokens > M maximum context length"
+        // OpenAI: "maximum context length is M tokens. However, your messages resulted in N tokens"
+        msg.contains("maximum context length")
+            || msg.contains("prompt is too long")
+            || (msg.contains("context length") && msg.contains("token"))
+    }
+
+    /// Emergency compaction: aggressively trim the session's stored
+    /// messages to recover from a context-length error mid-run.
+    /// Keeps only the last `EMERGENCY_KEEP` messages (much fewer
+    /// than the normal `compaction_keep_last` setting). Uses the
+    /// existing `compact_session` API on the session store.
+    async fn emergency_compact(&self, session_id: &SessionId) -> Result<(), AppError> {
+        const EMERGENCY_KEEP: usize = 10;
+        info!(
+            session = %session_id,
+            keeping = EMERGENCY_KEEP,
+            "emergency compaction: trimming session to last {EMERGENCY_KEEP} messages"
+        );
+        self.session_store
+            .compact_session(session_id, EMERGENCY_KEEP)
+            .await?;
+        Ok(())
+    }
+
     fn make_cancelled_result(
         last_response: Option<Message>,
+        accumulated_content: &[ContentBlock],
         tool_calls: Vec<ToolCallRecord>,
         input_tokens: u32,
         output_tokens: u32,
         total_tokens: u32,
         iterations: u32,
     ) -> RunResult {
-        let response = last_response.unwrap_or_else(|| Message {
+        let mut response = last_response.unwrap_or_else(|| Message {
             id: MessageId::new(),
             role: Role::Assistant,
             content: vec![ContentBlock::Text {
@@ -2569,6 +2740,14 @@ impl AgentRuntime {
             created_at: Utc::now(),
             token_count: None,
         });
+        // If there are accumulated continuation segments (from
+        // FinishReason::Length recovery), USE them as the response
+        // content rather than prepending. The last_response only
+        // holds the latest segment which is already IN
+        // accumulated_content — prepending would duplicate the tail.
+        if !accumulated_content.is_empty() {
+            response.content = accumulated_content.to_vec();
+        }
         RunResult {
             response,
             tool_calls,
@@ -3885,15 +4064,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finish_reason_length_stops_loop() {
+    async fn finish_reason_length_triggers_continuation() {
         use encmind_core::traits::CompletionDelta;
 
-        let responses = vec![vec![CompletionDelta {
-            text: Some("truncated...".into()),
-            thinking: None,
-            tool_use: None,
-            finish_reason: Some(FinishReason::Length),
-        }]];
+        // First response: truncated (Length). Runtime should
+        // inject a continuation prompt and call the LLM again.
+        // Second response: normal completion (Stop).
+        let responses = vec![
+            vec![CompletionDelta {
+                text: Some("truncated...".into()),
+                thinking: None,
+                tool_use: None,
+                finish_reason: Some(FinishReason::Length),
+            }],
+            vec![CompletionDelta {
+                text: Some(" and the rest.".into()),
+                thinking: None,
+                tool_use: None,
+                finish_reason: Some(FinishReason::Stop),
+            }],
+        ];
 
         let (runtime, store) = setup_runtime(responses, ToolRegistry::new()).await;
         let session = store.create_session("web").await.unwrap();
@@ -3904,7 +4094,48 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.iterations, 1);
+        // Should have run 2 iterations: original + 1 continuation.
+        assert_eq!(result.iterations, 2);
+        // The response must contain BOTH segments — the truncated
+        // first part and the continuation. Non-streaming callers
+        // rely on this to see the complete answer.
+        let all_text: String = result
+            .response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            all_text.contains("truncated"),
+            "first segment should be in response, got: {all_text}"
+        );
+        assert!(
+            all_text.contains("rest"),
+            "second segment should be in response, got: {all_text}"
+        );
+
+        // The session store should contain the synthetic continuation
+        // prompt, marked with [system: continue] prefix so history UX
+        // can filter or style it distinctly from real user messages.
+        let messages = store
+            .get_messages(&session.id, Pagination { offset: 0, limit: 100 })
+            .await
+            .unwrap();
+        let has_continuation = messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.iter().any(|b| match b {
+                    ContentBlock::Text { text } => text.starts_with("[system: continue]"),
+                    _ => false,
+                })
+        });
+        assert!(
+            has_continuation,
+            "session should contain the [system: continue] prompt"
+        );
     }
 
     // ── Approval integration tests ─────────────────────────────────
@@ -5700,6 +5931,222 @@ mod tests {
             crate::tool_progress::report_status("done");
             Ok("ok".to_string())
         }
+    }
+
+    #[tokio::test]
+    async fn continuation_cap_appends_truncation_marker_without_duplication() {
+        use encmind_core::traits::CompletionDelta;
+
+        // 3 consecutive Length responses + 1 Stop. MAX_CONTINUATIONS=2,
+        // so the 3rd Length hits the cap and should produce a truncation
+        // marker without duplicating earlier content blocks.
+        let responses = vec![
+            vec![CompletionDelta {
+                text: Some("part1".into()),
+                thinking: None,
+                tool_use: None,
+                finish_reason: Some(FinishReason::Length),
+            }],
+            vec![CompletionDelta {
+                text: Some("part2".into()),
+                thinking: None,
+                tool_use: None,
+                finish_reason: Some(FinishReason::Length),
+            }],
+            vec![CompletionDelta {
+                text: Some("part3".into()),
+                thinking: None,
+                tool_use: None,
+                finish_reason: Some(FinishReason::Length),
+            }],
+        ];
+
+        let (runtime, store) = setup_runtime(responses, ToolRegistry::new()).await;
+        let session = store.create_session("web").await.unwrap();
+
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("long"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // 3 iterations: original + 2 continuations (cap reached on 3rd Length).
+        assert_eq!(result.iterations, 3);
+
+        let all_text: Vec<String> = result
+            .response
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+
+        // All three parts should appear exactly once.
+        let joined = all_text.join("|");
+        assert!(joined.contains("part1"), "part1 missing: {joined}");
+        assert!(joined.contains("part2"), "part2 missing: {joined}");
+        assert!(joined.contains("part3"), "part3 missing: {joined}");
+
+        // Truncation marker must be present AND must be the last
+        // text block — not interleaved between content segments.
+        assert!(
+            joined.contains("[Response truncated"),
+            "truncation marker missing: {joined}"
+        );
+        let last_text = all_text.last().expect("should have text blocks");
+        assert!(
+            last_text.contains("[Response truncated"),
+            "truncation marker must be the last text block, got last: {last_text}"
+        );
+
+        // No duplication: count occurrences of each part.
+        assert_eq!(
+            joined.matches("part1").count(),
+            1,
+            "part1 duplicated: {joined}"
+        );
+        assert_eq!(
+            joined.matches("part2").count(),
+            1,
+            "part2 duplicated: {joined}"
+        );
+        assert_eq!(
+            joined.matches("part3").count(),
+            1,
+            "part3 duplicated: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_too_long_triggers_emergency_compaction_and_retries() {
+        // Simulate: first LLM call fails with "context length exceeded",
+        // runtime should compact and retry, second call succeeds.
+        use std::pin::Pin;
+        use std::sync::atomic::AtomicU32;
+        use tokio_stream::Stream;
+        struct ContextLengthFailOnFirstCallLlm {
+            calls: Arc<AtomicU32>,
+        }
+
+        #[async_trait]
+        impl LlmBackend for ContextLengthFailOnFirstCallLlm {
+            async fn complete(
+                &self,
+                _messages: &[Message],
+                _params: CompletionParams,
+                _cancel: CancellationToken,
+            ) -> Result<
+                Pin<Box<dyn Stream<Item = Result<CompletionDelta, LlmError>> + Send>>,
+                LlmError,
+            > {
+                let call_num = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call_num == 0 {
+                    return Err(LlmError::ApiError(
+                        "prompt is too long: 200000 tokens exceeds maximum context length of 128000"
+                            .to_string(),
+                    ));
+                }
+                let deltas = vec![
+                    Ok(CompletionDelta {
+                        text: Some("recovered".to_string()),
+                        thinking: None,
+                        tool_use: None,
+                        finish_reason: None,
+                    }),
+                    Ok(CompletionDelta {
+                        text: None,
+                        thinking: None,
+                        tool_use: None,
+                        finish_reason: Some(FinishReason::Stop),
+                    }),
+                ];
+                Ok(Box::pin(futures::stream::iter(deltas)))
+            }
+
+            async fn count_tokens(&self, _messages: &[Message]) -> Result<u32, LlmError> {
+                Ok(100)
+            }
+
+            fn model_info(&self) -> encmind_core::traits::ModelInfo {
+                encmind_core::traits::ModelInfo {
+                    id: "test".into(),
+                    name: "test".into(),
+                    context_window: 128_000,
+                    provider: "test".into(),
+                    supports_tools: false,
+                    supports_streaming: true,
+                    supports_thinking: false,
+                }
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let llm: Arc<dyn LlmBackend> = Arc::new(ContextLengthFailOnFirstCallLlm {
+            calls: calls.clone(),
+        });
+        let store = Arc::new(InMemorySessionStore::new());
+        let runtime = AgentRuntime::new(
+            llm,
+            store.clone() as Arc<dyn SessionStore>,
+            Arc::new(ToolRegistry::new()),
+            RuntimeConfig {
+                compaction_threshold: None,
+                ..Default::default()
+            },
+        );
+
+        let session = store.create_session("web").await.unwrap();
+        // Seed some messages so emergency compact has something to trim.
+        for i in 0..20 {
+            store
+                .append_message(
+                    &session.id,
+                    &Message {
+                        id: MessageId::new(),
+                        role: if i % 2 == 0 { Role::User } else { Role::Assistant },
+                        content: vec![ContentBlock::Text {
+                            text: format!("message {i}"),
+                        }],
+                        created_at: chrono::Utc::now(),
+                        token_count: None,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let result = runtime
+            .run(
+                &session.id,
+                make_user_msg("trigger"),
+                &default_agent(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        // The runtime should have retried after compaction and succeeded.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(!result.cancelled);
+        let text = result
+            .response
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert!(
+            text.contains("recovered"),
+            "expected recovered output, got: {text}"
+        );
     }
 
     #[tokio::test]

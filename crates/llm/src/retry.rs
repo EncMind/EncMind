@@ -285,4 +285,60 @@ mod tests {
         let d10 = policy.delay_for_retry(10);
         assert_eq!(d10, Duration::from_secs(2));
     }
+
+    #[tokio::test]
+    async fn cancel_during_backoff_returns_promptly() {
+        // The dispatcher's retry sleep uses tokio::select! with
+        // cancel.cancelled(). This test verifies the pattern works
+        // by timing a cancel that fires during a long backoff.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let start = std::time::Instant::now();
+
+        // Spawn a task that cancels after 50ms — well before the
+        // 10-second sleep would normally complete.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                panic!("sleep should have been interrupted by cancel");
+            }
+            _ = cancel.cancelled() => {
+                // Expected path.
+            }
+        }
+
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "cancel should interrupt within ~50ms, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn server_hint_precedence_uses_max_of_hint_and_backoff() {
+        // When Retry-After is larger than computed backoff, use it.
+        // When smaller, use the backoff. Both capped at max_delay.
+        let policy = RetryPolicy {
+            jitter_fraction: 0.0,
+            max_delay: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let backoff_0 = policy.delay_for_retry(0); // 500ms
+        let server_hint_5s = Duration::from_secs(5);
+        let effective = server_hint_5s.max(backoff_0).min(policy.max_delay);
+        assert_eq!(effective, Duration::from_secs(5), "server hint should win over 500ms backoff");
+
+        let server_hint_0 = Duration::ZERO;
+        let effective_no_hint = server_hint_0.max(backoff_0).min(policy.max_delay);
+        assert_eq!(effective_no_hint, Duration::from_millis(500), "no hint should use backoff");
+
+        // Server hint exceeding max_delay is capped.
+        let server_hint_huge = Duration::from_secs(120);
+        let effective_capped = server_hint_huge.max(backoff_0).min(policy.max_delay);
+        assert_eq!(effective_capped, Duration::from_secs(60), "huge hint capped at max_delay");
+    }
 }

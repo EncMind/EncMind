@@ -1,5 +1,6 @@
 pub mod bash_allowlist;
 pub mod channel_credentials;
+pub mod circuit_breaker;
 pub mod config;
 pub mod error;
 pub mod hooks;
