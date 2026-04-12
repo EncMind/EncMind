@@ -274,10 +274,16 @@ impl LlmBackend for OpenAiBackend {
 
         let status = response.status();
         if !status.is_success() {
+            // Only numeric delta-seconds; HTTP-date format ignored.
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::parse_retry_after);
             let body = response.text().await.unwrap_or_default();
             if status.as_u16() == 429 {
                 return Err(LlmError::RateLimited {
-                    retry_after_secs: None,
+                    retry_after_secs: retry_after,
                 });
             }
             return Err(LlmError::ApiError(format!("HTTP {status}: {body}")));

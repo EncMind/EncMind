@@ -208,35 +208,47 @@ impl MemoryStoreImpl {
         let normalized_limit = limit.clamp(1, 200);
         let candidate_limit = normalized_limit.saturating_mul(2);
 
-        // 1. Vector search
-        let query_vec = self.embed_with_chunking(query, "memory search").await?;
-        let vector_results = self
-            .vector_store
-            .search(&query_vec, candidate_limit)
-            .await?;
+        // 1. Vector search — fallback to FTS-only if embedding fails.
+        let mut fts_only = false;
+        let (vector_scored, entry_map) =
+            match self.embed_with_chunking(query, "memory search").await {
+                Ok(query_vec) => {
+                    let vector_results = self
+                        .vector_store
+                        .search(&query_vec, candidate_limit)
+                        .await?;
 
-        // Map vector results to (memory_id, score)
-        let vector_point_ids: Vec<String> =
-            vector_results.iter().map(|r| r.point_id.clone()).collect();
-        let vector_entries = self
-            .metadata_store
-            .get_entries_by_vector_ids(&vector_point_ids)
-            .await?;
+                    let vector_point_ids: Vec<String> =
+                        vector_results.iter().map(|r| r.point_id.clone()).collect();
+                    let vector_entries = self
+                        .metadata_store
+                        .get_entries_by_vector_ids(&vector_point_ids)
+                        .await?;
 
-        // Build lookup for point_id -> entry
-        let entry_map: std::collections::HashMap<String, MemoryEntry> = vector_entries
-            .into_iter()
-            .map(|e| (e.vector_point_id.clone(), e))
-            .collect();
+                    let map: std::collections::HashMap<String, MemoryEntry> = vector_entries
+                        .into_iter()
+                        .map(|e| (e.vector_point_id.clone(), e))
+                        .collect();
 
-        let vector_scored: Vec<(String, f32)> = vector_results
-            .iter()
-            .filter_map(|r| {
-                entry_map
-                    .get(&r.point_id)
-                    .map(|e| (e.id.as_str().to_owned(), r.score))
-            })
-            .collect();
+                    let scored: Vec<(String, f32)> = vector_results
+                        .iter()
+                        .filter_map(|r| {
+                            map.get(&r.point_id)
+                                .map(|e| (e.id.as_str().to_owned(), r.score))
+                        })
+                        .collect();
+
+                    (scored, map)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "embedding failed; falling back to FTS-only search"
+                    );
+                    fts_only = true;
+                    (Vec::new(), std::collections::HashMap::new())
+                }
+            };
 
         // 2. FTS search
         let fts_results = self
@@ -265,8 +277,11 @@ impl MemoryStoreImpl {
             };
 
             if let Some(entry) = entry {
-                // Determine source
-                let source = MemorySource::Hybrid;
+                let source = if fts_only {
+                    MemorySource::FullText
+                } else {
+                    MemorySource::Hybrid
+                };
                 results.push(MemoryResult {
                     entry,
                     score: *score,
@@ -1177,5 +1192,71 @@ mod tests {
             seen.len() >= 2,
             "expected multiple embed calls for large insert; seen={seen:?}"
         );
+    }
+
+    /// When embedding fails during search, the store should fall back to
+    /// FTS-only results instead of returning an error.
+    #[tokio::test]
+    async fn search_falls_back_to_fts_when_embedding_fails() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FailAfterInsertEmbedder {
+            inner: MockEmbedder,
+            should_fail: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl Embedder for FailAfterInsertEmbedder {
+            async fn embed(&self, text: &str) -> Result<Vec<f32>, MemoryError> {
+                if self.should_fail.load(Ordering::SeqCst) {
+                    return Err(MemoryError::EmbeddingFailed(
+                        "simulated embedding failure".into(),
+                    ));
+                }
+                self.inner.embed(text).await
+            }
+            fn dimensions(&self) -> usize {
+                self.inner.dimensions()
+            }
+            fn model_name(&self) -> &str {
+                self.inner.model_name()
+            }
+        }
+
+        let pool = create_test_pool();
+        {
+            let conn = pool.get().unwrap();
+            encmind_storage::migrations::run_migrations(&conn).unwrap();
+        }
+
+        let embedder = Arc::new(FailAfterInsertEmbedder {
+            inner: MockEmbedder::new(128),
+            should_fail: AtomicBool::new(false),
+        });
+        let vector_store = Arc::new(InMemoryVectorStore::new());
+        let metadata_store = Arc::new(SqliteMemoryMetadataStore::new(pool));
+        let store = MemoryStoreImpl::new(
+            embedder.clone() as Arc<dyn Embedder>,
+            vector_store,
+            metadata_store,
+        );
+
+        // Insert a memory while embedding still works.
+        store
+            .insert("xyzzy unique keyword fallback test", None, None, None)
+            .await
+            .unwrap();
+
+        // Make embedding fail for subsequent calls (search).
+        embedder.should_fail.store(true, Ordering::SeqCst);
+
+        // Search should still succeed via FTS fallback.
+        let results = store.search("xyzzy", 5, None).await.unwrap();
+        assert!(
+            !results.is_empty(),
+            "expected FTS fallback to find results when embedding fails"
+        );
+        // Results should be tagged as FullText, not Hybrid.
+        assert_eq!(results[0].source, MemorySource::FullText);
     }
 }

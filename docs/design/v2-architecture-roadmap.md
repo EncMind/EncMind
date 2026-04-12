@@ -1143,8 +1143,8 @@ Foundation. Nothing else ships until these are stable. Focus: prevent corruption
 | A.7 | Agent behavioral governance (prompt sections) | 1-2 days | Behavioral constraints + tool usage grammar + browser safety rules in system prompt |
 | A.8 | Local server mode (enhance existing) | 2-3 days | LocalToolHandler wired into workspace trust gate, operator-configurable denied_paths layered on defaults, BashMode::Allowlist patterns enforced at dispatch, symlink containment verified via canonicalization |
 | A.9 | Backpressure & graceful shutdown | 2-3 days | Bounded WS event buffer (mpsc(64)), graceful drain on SIGTERM (drain_timeout_secs wait before force-cancel), per-tool execution timeout (default 30s), client disconnect cancellation |
-| A.10 | Withhold-and-recover errors | 2-3 days | Recoverable errors retried before surfacing to user |
-| A.11 | Error recovery circuit breaker | 2-3 days | Consecutive failures stop retrying, degrade gracefully |
+| A.10 | Withhold-and-recover errors | 2-3 days | Context-too-long: emergency compact (keep last 10) + retry once. Output truncation: FinishReason::Length auto-continues (max 2). Retry-After header honored from 429 responses (max of server hint and backoff, capped at max_delay). |
+| A.11 | Error recovery circuit breaker | 2-3 days | Generic CircuitBreaker (Closed/Open/HalfOpen) in encmind-core. Wired into Telegram/Slack/Gmail adapters (10-failure threshold, 2-5min reset). ResilientEmbedder wrapper with retry (3x, exponential backoff) + circuit. LLM already had ProviderHealthTracker (equivalent). |
 | A.12 | Browser runtime guardrails | 1-2 days | Max retries, loop detection, dialog auto-dismiss, action timeout, metrics |
 
 **Phase A done when:** Session-level query serialization enforced, message normalization catches malformed payloads, tool governance pipeline operational, streaming event protocol stable, untrusted workspaces restricted, browser runtime guardrails active (loop detection, dialog dismiss, retry cap, action timeout, metrics).

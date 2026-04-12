@@ -563,14 +563,39 @@ impl TelegramAdapter {
         cancel: CancellationToken,
         runtime_shutdown: Option<CancellationToken>,
     ) {
+        use encmind_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
         let runtime_shutdown = runtime_shutdown.unwrap_or_default();
         let mut offset: i64 = 0;
         let mut backoff_secs: u64 = 1;
         const MAX_BACKOFF_SECS: u64 = 30;
 
+        let circuit = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 10,
+            reset_timeout: std::time::Duration::from_secs(120),
+            name: "telegram_poll".into(),
+        });
+
         loop {
             if cancel.is_cancelled() || runtime_shutdown.is_cancelled() {
                 break;
+            }
+
+            // Circuit breaker gate: if the circuit is open, sleep for
+            // the full reset timeout rather than burning retry budget.
+            if !circuit.is_call_permitted() {
+                tracing::warn!(
+                    circuit = circuit.name(),
+                    state = %circuit.state().as_str(),
+                    failures = circuit.consecutive_failures(),
+                    "telegram circuit open; pausing polling"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = runtime_shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(circuit.reset_timeout()) => {},
+                }
+                continue;
             }
 
             let params = serde_json::json!({
@@ -586,7 +611,8 @@ impl TelegramAdapter {
 
             match result {
                 Ok(body) => {
-                    backoff_secs = 1; // reset on success
+                    circuit.record_success();
+                    backoff_secs = 1;
                     if let Some(updates) = body.get("result").and_then(|v| v.as_array()) {
                         for update in updates {
                             if let Some(uid) = update.get("update_id").and_then(|v| v.as_i64()) {
@@ -599,7 +625,13 @@ impl TelegramAdapter {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("Telegram poll error: {e}");
+                    circuit.record_failure();
+                    tracing::warn!(
+                        circuit = circuit.name(),
+                        state = %circuit.state().as_str(),
+                        failures = circuit.consecutive_failures(),
+                        "Telegram poll error: {e}"
+                    );
                     // Jitter: 50-100% of backoff
                     let jitter_ms = (backoff_secs * 500)
                         + (std::time::SystemTime::now()

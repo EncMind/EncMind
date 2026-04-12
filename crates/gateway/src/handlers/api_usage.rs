@@ -7,8 +7,8 @@
 //! aggregate roll-up across every matching row (not just the
 //! returned page).
 
-use encmind_storage::api_usage::ApiUsageFilter;
 use chrono::{DateTime, SecondsFormat, Utc};
+use encmind_storage::api_usage::ApiUsageFilter;
 
 use crate::protocol::*;
 use crate::state::AppState;
@@ -86,10 +86,7 @@ pub async fn handle_query(
                         id: Some(req_id.to_string()),
                         error: ErrorPayload::new(
                             ERR_INVALID_PARAMS,
-                            format!(
-                                "status must be one of {}; got '{s}'",
-                                valid.join(", ")
-                            ),
+                            format!("status must be one of {}; got '{s}'", valid.join(", ")),
                         ),
                     };
                 }
@@ -213,15 +210,15 @@ mod tests {
         let params = serde_json::json!({
             "since": "not-a-timestamp"
         });
-        let err = parse_optional_rfc3339(&params, "since")
-            .expect_err("invalid timestamp must fail");
+        let err =
+            parse_optional_rfc3339(&params, "since").expect_err("invalid timestamp must fail");
         assert!(err.contains("invalid since RFC3339 timestamp"));
     }
 
     #[tokio::test]
     async fn handle_query_rejects_invalid_status_filter() {
-        use crate::test_utils::make_test_state;
         use crate::protocol::ServerMessage;
+        use crate::test_utils::make_test_state;
 
         let state = make_test_state();
         let response = super::handle_query(
@@ -249,8 +246,8 @@ mod tests {
         // When state.api_usage_store is None, the handler must fail
         // loud rather than silently return an empty result. An empty
         // success would mask backend misconfiguration as "no data".
-        use crate::test_utils::make_test_state;
         use crate::protocol::ServerMessage;
+        use crate::test_utils::make_test_state;
 
         let mut state = make_test_state();
         // make_test_state attaches a store; explicitly clear it to
@@ -258,12 +255,7 @@ mod tests {
         // attribution.
         state.api_usage_store = None;
 
-        let response = super::handle_query(
-            &state,
-            serde_json::json!({}),
-            "req-no-store",
-        )
-        .await;
+        let response = super::handle_query(&state, serde_json::json!({}), "req-no-store").await;
 
         match response {
             ServerMessage::Error { error, .. } => {

@@ -217,6 +217,18 @@ impl AppConfig {
             if self.memory.embedding_dimensions == 0 {
                 errors.push("memory.embedding_dimensions must be > 0".to_string());
             }
+            if self.memory.embedding_max_retries > 10 {
+                errors.push(
+                    "memory.embedding_max_retries must be <= 10 (bounded to prevent excessive backoff latency)"
+                        .to_string(),
+                );
+            }
+            if self.memory.embedding_circuit_threshold == 0 {
+                errors.push("memory.embedding_circuit_threshold must be > 0".to_string());
+            }
+            if self.memory.embedding_circuit_reset_secs == 0 {
+                errors.push("memory.embedding_circuit_reset_secs must be > 0".to_string());
+            }
             match &self.memory.embedding_mode {
                 EmbeddingMode::Private => {
                     if let Some(path) = &self.memory.local_model_path {
@@ -2363,6 +2375,12 @@ pub struct MemoryConfig {
     pub default_search_limit: usize,
     pub max_context_memories: usize,
     pub vector_backend: VectorBackendConfig,
+    /// Max retries for resilient embedding wrapper (default 3).
+    pub embedding_max_retries: u32,
+    /// Circuit breaker failure threshold for embedding API (default 5).
+    pub embedding_circuit_threshold: u32,
+    /// Circuit breaker reset timeout in seconds (default 60).
+    pub embedding_circuit_reset_secs: u64,
 }
 
 fn default_embedding_model() -> String {
@@ -2395,6 +2413,9 @@ impl Default for MemoryConfig {
             default_search_limit: default_search_limit(),
             max_context_memories: default_max_context_memories(),
             vector_backend: VectorBackendConfig::default(),
+            embedding_max_retries: 3,
+            embedding_circuit_threshold: 5,
+            embedding_circuit_reset_secs: 60,
         }
     }
 }
@@ -2417,6 +2438,9 @@ impl<'de> Deserialize<'de> for MemoryConfig {
             max_context_memories: Option<usize>,
             #[serde(default)]
             vector_backend: VectorBackendConfig,
+            embedding_max_retries: Option<u32>,
+            embedding_circuit_threshold: Option<u32>,
+            embedding_circuit_reset_secs: Option<u64>,
         }
 
         let raw = RawMemoryConfig::deserialize(deserializer)?;
@@ -2442,6 +2466,9 @@ impl<'de> Deserialize<'de> for MemoryConfig {
                 .max_context_memories
                 .unwrap_or_else(default_max_context_memories),
             vector_backend: raw.vector_backend,
+            embedding_max_retries: raw.embedding_max_retries.unwrap_or(3),
+            embedding_circuit_threshold: raw.embedding_circuit_threshold.unwrap_or(5),
+            embedding_circuit_reset_secs: raw.embedding_circuit_reset_secs.unwrap_or(60),
         })
     }
 }
@@ -3230,6 +3257,42 @@ memory:
     }
 
     #[test]
+    fn validate_rejects_degenerate_embedding_resilience_config() {
+        let mut config = AppConfig::default();
+        config.memory.enabled = true;
+
+        // max_retries > 10 → overflow risk
+        config.memory.embedding_max_retries = 32;
+        let errors = config.validate();
+        assert!(
+            errors.iter().any(|e| e.contains("embedding_max_retries")),
+            "errors={errors:?}"
+        );
+
+        // circuit_threshold == 0 → immediate-open
+        config.memory.embedding_max_retries = 3;
+        config.memory.embedding_circuit_threshold = 0;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("embedding_circuit_threshold")),
+            "errors={errors:?}"
+        );
+
+        // circuit_reset_secs == 0 → instant-reset
+        config.memory.embedding_circuit_threshold = 5;
+        config.memory.embedding_circuit_reset_secs = 0;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("embedding_circuit_reset_secs")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
     fn access_action_default_is_reject() {
         let action = AccessAction::default();
         assert_eq!(action, AccessAction::Reject);
@@ -3687,7 +3750,9 @@ plugin_policy:
             .insert("".to_string(), 512);
         let errors = config.validate();
         assert!(
-            errors.iter().any(|e| e.contains("channel key must not be empty")),
+            errors
+                .iter()
+                .any(|e| e.contains("channel key must not be empty")),
             "expected empty channel key validation error, got: {:?}",
             errors
         );

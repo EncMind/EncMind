@@ -759,8 +759,15 @@ impl ChannelAdapter for GmailAdapter {
         }
 
         let handle = tokio::spawn(async move {
+            use encmind_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
+
             let _task_running_guard = RunningFlagGuard::new(running.clone());
             let mut backoff_multiplier = 1u64;
+            let circuit = CircuitBreaker::new(CircuitBreakerConfig {
+                failure_threshold: 10,
+                reset_timeout: std::time::Duration::from_secs(300), // 5 min for Gmail (API quota)
+                name: "gmail_poll".into(),
+            });
             let poll_params = GmailPollParams {
                 access_token: &access_token,
                 client_id: &client_id,
@@ -776,6 +783,7 @@ impl ChannelAdapter for GmailAdapter {
                 max_file_bytes,
             };
             if let Err(e) = poll_gmail_with_lock(&client, &poll_params, &poll_lock).await {
+                circuit.record_failure();
                 tracing::warn!("Gmail initial poll error: {e}");
                 if is_scope_insufficient_message(&e.to_string()) {
                     scope_insufficient.store(true, Ordering::SeqCst);
@@ -815,15 +823,26 @@ impl ChannelAdapter for GmailAdapter {
                             max_attachments_per_message,
                             max_file_bytes,
                         };
+                        // Circuit breaker gate: skip poll if circuit is open.
+                        if !circuit.is_call_permitted() {
+                            tracing::debug!(
+                                circuit = circuit.name(),
+                                failures = circuit.consecutive_failures(),
+                                "gmail circuit open; skipping poll cycle"
+                            );
+                            continue;
+                        }
                         match poll_gmail_with_lock(&client, &poll_params, &poll_lock)
                         .await {
                             Ok(()) => {
+                                circuit.record_success();
                                 if backoff_multiplier > 1 {
                                     tracing::info!("gmail polling recovered; resetting backoff");
                                 }
                                 backoff_multiplier = 1;
                             }
                             Err(e) => {
+                                circuit.record_failure();
                                 tracing::warn!("Gmail poll error: {e}");
                                 if is_scope_insufficient_message(&e.to_string()) {
                                     scope_insufficient.store(true, Ordering::SeqCst);

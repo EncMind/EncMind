@@ -184,7 +184,10 @@ mod tests {
 
     #[test]
     fn strip_date_suffix_only_strips_8_digit_dates() {
-        assert_eq!(strip_date_suffix("claude-sonnet-4-5-20250929"), "claude-sonnet-4-5");
+        assert_eq!(
+            strip_date_suffix("claude-sonnet-4-5-20250929"),
+            "claude-sonnet-4-5"
+        );
         assert_eq!(strip_date_suffix("claude-sonnet-4-5"), "claude-sonnet-4-5"); // no suffix
         assert_eq!(strip_date_suffix("gpt-4o"), "gpt-4o"); // too short
         assert_eq!(strip_date_suffix("model-abc"), "model-abc"); // non-digit suffix

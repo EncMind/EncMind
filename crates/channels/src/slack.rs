@@ -572,20 +572,43 @@ impl SlackAdapter {
         cancel: CancellationToken,
         runtime_shutdown: Option<CancellationToken>,
     ) {
+        use encmind_core::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         let runtime_shutdown = runtime_shutdown.unwrap_or_default();
         let mut backoff_secs: u64 = 1;
+
+        let circuit = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 10,
+            reset_timeout: std::time::Duration::from_secs(120),
+            name: "slack_ws".into(),
+        });
 
         loop {
             if cancel.is_cancelled() || runtime_shutdown.is_cancelled() {
                 break;
             }
 
+            // Circuit breaker gate.
+            if !circuit.is_call_permitted() {
+                tracing::warn!(
+                    circuit = circuit.name(),
+                    failures = circuit.consecutive_failures(),
+                    "slack circuit open; pausing reconnect"
+                );
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = runtime_shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(circuit.reset_timeout()) => {},
+                }
+                continue;
+            }
+
             // Request a WebSocket URL via apps.connections.open
             let ws_url = match Self::request_ws_url(&client, &app_token).await {
                 Ok(url) => url,
                 Err(e) => {
+                    circuit.record_failure();
                     tracing::warn!("Slack apps.connections.open failed: {e}");
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -601,6 +624,7 @@ impl SlackAdapter {
             let ws_stream = match tokio_tungstenite::connect_async(&ws_url).await {
                 Ok((stream, _)) => stream,
                 Err(e) => {
+                    circuit.record_failure();
                     tracing::warn!("Slack WS connect failed: {e}");
                     tokio::select! {
                         _ = cancel.cancelled() => break,
@@ -612,6 +636,7 @@ impl SlackAdapter {
                 }
             };
 
+            circuit.record_success();
             tracing::info!("Slack Socket Mode connected");
             let (mut ws_sink, mut ws_stream_rx) = futures::StreamExt::split(ws_stream);
             let connected_at = std::time::Instant::now();
@@ -658,6 +683,9 @@ impl SlackAdapter {
                     }
                 }
             }
+
+            // WS disconnected after a successful connection — count as failure.
+            circuit.record_failure();
 
             let connected_for = connected_at.elapsed();
             let previous_backoff = backoff_secs;

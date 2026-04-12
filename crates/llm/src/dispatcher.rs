@@ -1,5 +1,6 @@
 use std::pin::Pin;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use encmind_core::error::LlmError;
@@ -160,16 +161,38 @@ impl LlmBackend for LlmDispatcher {
                 Err(e) => {
                     let err_str = e.to_string();
                     if RetryPolicy::is_retryable(&err_str) && retries < policy.max_retries {
-                        let delay = policy.delay_for_retry(retries);
+                        // Honor server-requested Retry-After delay
+                        // when the error carries one. Use the larger
+                        // of (server hint, policy backoff), capped at
+                        // policy.max_delay, so we respect the server
+                        // without over-sleeping on high retry counts.
+                        let server_hint = match &e {
+                            LlmError::RateLimited {
+                                retry_after_secs: Some(secs),
+                            } => Duration::from_secs(*secs),
+                            _ => Duration::ZERO,
+                        };
+                        let backoff = policy.delay_for_retry(retries);
+                        let delay = server_hint.max(backoff).min(policy.max_delay);
                         tracing::warn!(
                             retry = retries + 1,
                             max = policy.max_retries,
                             delay_ms = delay.as_millis() as u64,
+                            retry_after_secs = ?server_hint.as_secs(),
                             class = %query_class.as_str(),
                             error = %err_str,
                             "retrying LLM completion after transient error"
                         );
-                        tokio::time::sleep(delay).await;
+                        // Cancel-aware sleep: if the user aborts or
+                        // the server shuts down during retry backoff,
+                        // bail immediately rather than sleeping up to
+                        // max_delay (30s).
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {}
+                            _ = cancel.cancelled() => {
+                                return Err(LlmError::Cancelled);
+                            }
+                        }
                         retries += 1;
                     } else {
                         if retries > 0 {
