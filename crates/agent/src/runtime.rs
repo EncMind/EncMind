@@ -637,7 +637,9 @@ impl AgentRuntime {
                     // the prompt for exceeding context length and we
                     // haven't tried emergency compaction yet, compact
                     // aggressively and retry this iteration.
-                    if !context_recovery_attempted && Self::is_context_length_error(&e) {
+                    if !context_recovery_attempted
+                        && Self::is_context_length_error(&e)
+                    {
                         context_recovery_attempted = true;
                         let before = context.len();
                         info!(
@@ -648,7 +650,10 @@ impl AgentRuntime {
                         // messages so the next build_context produces
                         // a smaller prompt. This modifies the SESSION
                         // STORE, not just the in-memory context.
-                        if let Err(compact_err) = self.emergency_compact(session_id).await {
+                        if let Err(compact_err) = self
+                            .emergency_compact(session_id)
+                            .await
+                        {
                             warn!(
                                 error = %compact_err,
                                 "emergency compaction failed; surfacing original error"
@@ -1112,37 +1117,36 @@ impl AgentRuntime {
                     // is appended post-merge so it appears at the
                     // end, not in the middle.
                 } else {
-                    info!(
-                        iteration,
-                        continuation = continuation_count + 1,
-                        max = MAX_CONTINUATIONS,
-                        "output truncated (FinishReason::Length); continuing"
-                    );
-                    // Accumulate this segment's content blocks so the
-                    // final response includes all continuations, not just
-                    // the last one. Non-streaming callers would otherwise
-                    // lose the first part of a truncated answer.
-                    accumulated_content.extend(assistant_msg.content.clone());
-                    self.session_store
-                        .append_message(session_id, &assistant_msg)
-                        .await?;
-                    let continuation_msg = Message {
-                        id: MessageId::new(),
-                        role: Role::User,
-                        content: vec![ContentBlock::Text {
-                            text:
-                                "[system: continue] Continue your response from where you left off."
-                                    .to_owned(),
-                        }],
-                        created_at: Utc::now(),
-                        token_count: None,
-                    };
-                    self.session_store
-                        .append_message(session_id, &continuation_msg)
-                        .await?;
-                    last_response = Some(assistant_msg);
-                    continuation_count += 1;
-                    continue;
+                info!(
+                    iteration,
+                    continuation = continuation_count + 1,
+                    max = MAX_CONTINUATIONS,
+                    "output truncated (FinishReason::Length); continuing"
+                );
+                // Accumulate this segment's content blocks so the
+                // final response includes all continuations, not just
+                // the last one. Non-streaming callers would otherwise
+                // lose the first part of a truncated answer.
+                accumulated_content.extend(assistant_msg.content.clone());
+                self.session_store
+                    .append_message(session_id, &assistant_msg)
+                    .await?;
+                let continuation_msg = Message {
+                    id: MessageId::new(),
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "[system: continue] Continue your response from where you left off."
+                            .to_owned(),
+                    }],
+                    created_at: Utc::now(),
+                    token_count: None,
+                };
+                self.session_store
+                    .append_message(session_id, &continuation_msg)
+                    .await?;
+                last_response = Some(assistant_msg);
+                continuation_count += 1;
+                continue;
                 }
             }
 
@@ -1978,30 +1982,31 @@ impl AgentRuntime {
             String,
             serde_json::Value,
             ToolInterruptBehavior,
-        )> = prepared
-            .iter()
-            .enumerate()
-            .filter_map(|(order, (id, name, prepared_call))| match prepared_call {
-                PreparedToolCall::Ready { input } => {
-                    let interrupt_behavior = interrupt_behaviors
-                        .get(order)
-                        .copied()
-                        .unwrap_or(ToolInterruptBehavior::Cancel);
-                    if cancel_requested && interrupt_behavior == ToolInterruptBehavior::Cancel {
-                        None
-                    } else {
-                        Some((
-                            order,
-                            id.clone(),
-                            name.clone(),
-                            input.clone(),
-                            interrupt_behavior,
-                        ))
+        )> =
+            prepared
+                .iter()
+                .enumerate()
+                .filter_map(|(order, (id, name, prepared_call))| match prepared_call {
+                    PreparedToolCall::Ready { input } => {
+                        let interrupt_behavior = interrupt_behaviors
+                            .get(order)
+                            .copied()
+                            .unwrap_or(ToolInterruptBehavior::Cancel);
+                        if cancel_requested && interrupt_behavior == ToolInterruptBehavior::Cancel {
+                            None
+                        } else {
+                            Some((
+                                order,
+                                id.clone(),
+                                name.clone(),
+                                input.clone(),
+                                interrupt_behavior,
+                            ))
+                        }
                     }
-                }
-                PreparedToolCall::Finalized { .. } => None,
-            })
-            .collect();
+                    PreparedToolCall::Finalized { .. } => None,
+                })
+                .collect();
 
         // Dispatch ready tools in bounded parallelism and keep only out-of-order
         // results in memory. As soon as a contiguous prefix is ready, persist it.
@@ -4117,13 +4122,7 @@ mod tests {
         // prompt, marked with [system: continue] prefix so history UX
         // can filter or style it distinctly from real user messages.
         let messages = store
-            .get_messages(
-                &session.id,
-                Pagination {
-                    offset: 0,
-                    limit: 100,
-                },
-            )
+            .get_messages(&session.id, Pagination { offset: 0, limit: 100 })
             .await
             .unwrap();
         let has_continuation = messages.iter().any(|m| {
@@ -6110,11 +6109,7 @@ mod tests {
                     &session.id,
                     &Message {
                         id: MessageId::new(),
-                        role: if i % 2 == 0 {
-                            Role::User
-                        } else {
-                            Role::Assistant
-                        },
+                        role: if i % 2 == 0 { Role::User } else { Role::Assistant },
                         content: vec![ContentBlock::Text {
                             text: format!("message {i}"),
                         }],

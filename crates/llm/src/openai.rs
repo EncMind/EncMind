@@ -279,7 +279,7 @@ impl LlmBackend for OpenAiBackend {
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .and_then(crate::parse_retry_after);
+                .and_then(|s| crate::parse_retry_after(s));
             let body = response.text().await.unwrap_or_default();
             if status.as_u16() == 429 {
                 return Err(LlmError::RateLimited {

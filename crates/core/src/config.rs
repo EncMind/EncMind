@@ -224,10 +224,14 @@ impl AppConfig {
                 );
             }
             if self.memory.embedding_circuit_threshold == 0 {
-                errors.push("memory.embedding_circuit_threshold must be > 0".to_string());
+                errors.push(
+                    "memory.embedding_circuit_threshold must be > 0".to_string(),
+                );
             }
             if self.memory.embedding_circuit_reset_secs == 0 {
-                errors.push("memory.embedding_circuit_reset_secs must be > 0".to_string());
+                errors.push(
+                    "memory.embedding_circuit_reset_secs must be > 0".to_string(),
+                );
             }
             match &self.memory.embedding_mode {
                 EmbeddingMode::Private => {
@@ -3750,9 +3754,7 @@ plugin_policy:
             .insert("".to_string(), 512);
         let errors = config.validate();
         assert!(
-            errors
-                .iter()
-                .any(|e| e.contains("channel key must not be empty")),
+            errors.iter().any(|e| e.contains("channel key must not be empty")),
             "expected empty channel key validation error, got: {:?}",
             errors
         );
