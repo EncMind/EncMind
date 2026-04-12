@@ -330,15 +330,27 @@ mod tests {
         let backoff_0 = policy.delay_for_retry(0); // 500ms
         let server_hint_5s = Duration::from_secs(5);
         let effective = server_hint_5s.max(backoff_0).min(policy.max_delay);
-        assert_eq!(effective, Duration::from_secs(5), "server hint should win over 500ms backoff");
+        assert_eq!(
+            effective,
+            Duration::from_secs(5),
+            "server hint should win over 500ms backoff"
+        );
 
         let server_hint_0 = Duration::ZERO;
         let effective_no_hint = server_hint_0.max(backoff_0).min(policy.max_delay);
-        assert_eq!(effective_no_hint, Duration::from_millis(500), "no hint should use backoff");
+        assert_eq!(
+            effective_no_hint,
+            Duration::from_millis(500),
+            "no hint should use backoff"
+        );
 
         // Server hint exceeding max_delay is capped.
         let server_hint_huge = Duration::from_secs(120);
         let effective_capped = server_hint_huge.max(backoff_0).min(policy.max_delay);
-        assert_eq!(effective_capped, Duration::from_secs(60), "huge hint capped at max_delay");
+        assert_eq!(
+            effective_capped,
+            Duration::from_secs(60),
+            "huge hint capped at max_delay"
+        );
     }
 }

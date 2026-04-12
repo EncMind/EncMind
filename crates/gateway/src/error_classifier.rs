@@ -46,8 +46,8 @@ pub fn classify(error: &AppError) -> ClassifiedError {
         // ---- Everything else ----
         _ => ClassifiedError {
             category: "internal_error",
-            user_message:
-                "An internal error occurred. If this persists, check the server logs.".to_string(),
+            user_message: "An internal error occurred. If this persists, check the server logs."
+                .to_string(),
             raw_detail: raw,
         },
     }
@@ -100,9 +100,8 @@ fn classify_llm_error(err: &LlmError, raw: &str) -> ClassifiedError {
 
         LlmError::TokenizationError(_) => ClassifiedError {
             category: "tokenization_error",
-            user_message:
-                "Failed to count tokens for your message. Try sending a shorter message."
-                    .to_string(),
+            user_message: "Failed to count tokens for your message. Try sending a shorter message."
+                .to_string(),
             raw_detail: raw.to_string(),
         },
     }
@@ -115,8 +114,8 @@ fn classify_llm_message(msg: &str, raw: &str) -> ClassifiedError {
     if lower.contains("529") || lower.contains("overloaded") {
         return ClassifiedError {
             category: "overloaded",
-            user_message:
-                "The AI service is temporarily overloaded. Please retry shortly.".to_string(),
+            user_message: "The AI service is temporarily overloaded. Please retry shortly."
+                .to_string(),
             raw_detail: raw.to_string(),
         };
     }
@@ -211,9 +210,7 @@ mod tests {
 
     #[test]
     fn overloaded_529() {
-        let err = AppError::Llm(LlmError::InferenceError(
-            "HTTP 529 Overloaded".to_string(),
-        ));
+        let err = AppError::Llm(LlmError::InferenceError("HTTP 529 Overloaded".to_string()));
         let c = classify(&err);
         assert_eq!(c.category, "overloaded");
         assert!(c.user_message.contains("retry shortly"));

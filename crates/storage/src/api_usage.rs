@@ -368,7 +368,11 @@ mod tests {
     #[test]
     fn filter_by_since_until_selects_window() {
         let store = store();
-        for ts in ["2026-03-01T00:00:00Z", "2026-03-05T00:00:00Z", "2026-03-10T00:00:00Z"] {
+        for ts in [
+            "2026-03-01T00:00:00Z",
+            "2026-03-05T00:00:00Z",
+            "2026-03-10T00:00:00Z",
+        ] {
             store
                 .append(&ApiUsageInsert {
                     session_id: "s",

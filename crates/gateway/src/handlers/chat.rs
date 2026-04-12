@@ -123,19 +123,13 @@ pub async fn handle_send_with_class(
             let Ok(parsed) = u32::try_from(raw) else {
                 return ServerMessage::Error {
                     id: Some(req_id.to_string()),
-                    error: ErrorPayload::new(
-                        ERR_INVALID_PARAMS,
-                        "max_output_tokens is too large",
-                    ),
+                    error: ErrorPayload::new(ERR_INVALID_PARAMS, "max_output_tokens is too large"),
                 };
             };
             if parsed == 0 {
                 return ServerMessage::Error {
                     id: Some(req_id.to_string()),
-                    error: ErrorPayload::new(
-                        ERR_INVALID_PARAMS,
-                        "max_output_tokens must be > 0",
-                    ),
+                    error: ErrorPayload::new(ERR_INVALID_PARAMS, "max_output_tokens must be > 0"),
                 };
             }
             Some(parsed)
@@ -1323,6 +1317,7 @@ mod tests {
         handle_send_with_class, loop_break_audit_detail, maybe_generate_title,
     };
     use crate::protocol::{ServerMessage, ERR_INVALID_PARAMS, ERR_SHUTTING_DOWN};
+    use crate::state::AppState;
     use crate::test_utils::make_test_state;
     use encmind_agent::tool_registry::{InternalToolHandler, ToolRegistry};
     use encmind_core::config::BashMode;
@@ -1331,7 +1326,6 @@ mod tests {
         CompletionDelta, CompletionParams, FinishReason, LlmBackend, ModelInfo,
     };
     use encmind_core::types::{AgentConfig, AgentId, ContentBlock, SessionId};
-    use crate::state::AppState;
     use futures::Stream;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1678,7 +1672,9 @@ mod tests {
 
         match response {
             ServerMessage::Error { error, .. } => {
-                assert!(error.message.contains("max_output_tokens must be a positive integer"));
+                assert!(error
+                    .message
+                    .contains("max_output_tokens must be a positive integer"));
             }
             _ => panic!("expected max_output_tokens type validation error"),
         }
@@ -2382,7 +2378,11 @@ mod tests {
         let (rows, agg) = store
             .query(&encmind_storage::api_usage::ApiUsageFilter::default(), 100)
             .expect("query should succeed");
-        assert_eq!(rows.len(), 1, "expected exactly one usage row, got: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "expected exactly one usage row, got: {rows:?}"
+        );
         let row = &rows[0];
         assert_eq!(row.model, "title-mock");
         assert_eq!(row.provider, "test");
@@ -2632,9 +2632,7 @@ mod tests {
         )
         .await;
         let session_id = match &response {
-            ServerMessage::Res { result, .. } => {
-                result["session_id"].as_str().unwrap().to_string()
-            }
+            ServerMessage::Res { result, .. } => result["session_id"].as_str().unwrap().to_string(),
             other => panic!("expected success, got: {other:?}"),
         };
 
@@ -3225,13 +3223,13 @@ mod tests {
 
         if tok_config.auto_title_enabled {
             maybe_generate_title(
-            &state,
-            &session.id,
-            "hello",
-            "hi",
-            &cancel,
-            encmind_agent::scheduler::QueryClass::Interactive,
-        );
+                &state,
+                &session.id,
+                "hello",
+                "hi",
+                &cancel,
+                encmind_agent::scheduler::QueryClass::Interactive,
+            );
         }
         // else: no title generation call
 
@@ -3261,13 +3259,13 @@ mod tests {
 
         if tok_config.auto_title_enabled {
             maybe_generate_title(
-            &state,
-            &session.id,
-            "hello",
-            "hi",
-            &cancel,
-            encmind_agent::scheduler::QueryClass::Interactive,
-        );
+                &state,
+                &session.id,
+                "hello",
+                "hi",
+                &cancel,
+                encmind_agent::scheduler::QueryClass::Interactive,
+            );
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -3470,17 +3468,11 @@ mod tests {
                     "total_tokens should be present in cancelled metrics"
                 );
                 assert!(
-                    metrics
-                        .get("iterations")
-                        .and_then(|v| v.as_u64())
-                        .is_some(),
+                    metrics.get("iterations").and_then(|v| v.as_u64()).is_some(),
                     "iterations should be present in cancelled metrics"
                 );
                 assert!(
-                    metrics
-                        .get("provider")
-                        .and_then(|v| v.as_str())
-                        .is_some(),
+                    metrics.get("provider").and_then(|v| v.as_str()).is_some(),
                     "provider should be present in cancelled metrics"
                 );
             }
