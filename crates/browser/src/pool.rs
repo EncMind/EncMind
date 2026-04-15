@@ -1,18 +1,26 @@
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chromiumoxide::browser::{Browser, BrowserConfig};
+use chromiumoxide::cdp::browser_protocol::page::{
+    EventJavascriptDialogOpening, HandleJavaScriptDialogParams,
+};
 use chromiumoxide::page::Page;
 use futures::StreamExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tracing::{info, warn};
+
+use crate::guardrails::{BrowserMetrics, LoopDetector};
 
 /// A pool of headless Chrome pages controlled by a semaphore.
 pub struct BrowserPool {
     browser: Arc<Browser>,
     permits: Arc<Semaphore>,
     idle_timeout: Duration,
+    metrics: Arc<BrowserMetrics>,
+    auto_dismiss_dialogs: bool,
     _handler_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -20,6 +28,7 @@ pub struct BrowserPool {
 pub struct BrowserLease {
     pub page: Page,
     _permit: OwnedSemaphorePermit,
+    _dialog_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl BrowserPool {
@@ -28,6 +37,8 @@ impl BrowserPool {
         pool_size: usize,
         idle_timeout_secs: u64,
         no_sandbox: bool,
+        metrics: Arc<BrowserMetrics>,
+        auto_dismiss_dialogs: bool,
     ) -> Result<Self, BrowserPoolError> {
         let mut builder = BrowserConfig::builder();
         if no_sandbox {
@@ -59,6 +70,8 @@ impl BrowserPool {
             browser: Arc::new(browser),
             permits: Arc::new(Semaphore::new(pool_size)),
             idle_timeout: Duration::from_secs(idle_timeout_secs),
+            metrics,
+            auto_dismiss_dialogs,
             _handler_handle: handler_handle,
         })
     }
@@ -76,9 +89,16 @@ impl BrowserPool {
             .await
             .map_err(|e| BrowserPoolError::PageCreationFailed(e.to_string()))?;
 
+        let dialog_handle = if self.auto_dismiss_dialogs {
+            Some(spawn_dialog_auto_dismiss(&page, self.metrics.clone()).await)
+        } else {
+            None
+        };
+
         Ok(BrowserLease {
             page,
             _permit: permit,
+            _dialog_handle: dialog_handle,
         })
     }
 
@@ -86,12 +106,50 @@ impl BrowserPool {
     pub fn available(&self) -> usize {
         self.permits.available_permits()
     }
+
+    /// Get the shared metrics handle.
+    pub fn metrics(&self) -> &Arc<BrowserMetrics> {
+        &self.metrics
+    }
+}
+
+/// Spawn a background task that auto-dismisses JavaScript dialogs (alert/confirm/prompt).
+async fn spawn_dialog_auto_dismiss(
+    page: &Page,
+    metrics: Arc<BrowserMetrics>,
+) -> tokio::task::JoinHandle<()> {
+    // event_listener can fail if the CDP connection is already closed.
+    let listener = page.event_listener::<EventJavascriptDialogOpening>().await;
+    let page_clone = page.clone();
+    tokio::spawn(async move {
+        let Ok(mut events) = listener else {
+            return;
+        };
+        while let Some(_event) = events.next().await {
+            tracing::warn!("auto-dismissing JavaScript dialog");
+            let _ = page_clone
+                .execute(HandleJavaScriptDialogParams::new(false))
+                .await;
+            metrics
+                .dialog_dismissed_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    })
+}
+
+impl Drop for BrowserLease {
+    fn drop(&mut self) {
+        if let Some(handle) = self._dialog_handle.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// A session-scoped browser page that persists across tool calls within a session.
 struct SessionPage {
     lease: BrowserLease,
     last_used: Instant,
+    loop_detector: LoopDetector,
 }
 
 type SessionHandle = Arc<Mutex<SessionPage>>;
@@ -157,6 +215,8 @@ pub struct SessionBrowserManager {
     pool: Arc<BrowserPool>,
     sessions: Arc<Mutex<SessionMap>>,
     idle_timeout: Duration,
+    loop_window: usize,
+    loop_threshold: usize,
     cleanup_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -164,6 +224,16 @@ impl SessionBrowserManager {
     /// Create a new SessionBrowserManager with the given pool and idle timeout.
     /// Starts a background cleanup task that runs every 30 seconds.
     pub fn new(pool: Arc<BrowserPool>, idle_timeout: Duration) -> Arc<Self> {
+        Self::with_loop_config(pool, idle_timeout, 4, 3)
+    }
+
+    /// Create with explicit loop detection parameters.
+    pub fn with_loop_config(
+        pool: Arc<BrowserPool>,
+        idle_timeout: Duration,
+        loop_window: usize,
+        loop_threshold: usize,
+    ) -> Arc<Self> {
         let sessions: Arc<Mutex<SessionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let sessions_clone = sessions.clone();
         let cleanup_handle = tokio::spawn(async move {
@@ -212,6 +282,8 @@ impl SessionBrowserManager {
             pool,
             sessions,
             idle_timeout,
+            loop_window,
+            loop_threshold,
             cleanup_handle,
         })
     }
@@ -237,6 +309,7 @@ impl SessionBrowserManager {
         let new_handle = Arc::new(Mutex::new(SessionPage {
             lease,
             last_used: Instant::now(),
+            loop_detector: LoopDetector::new(self.loop_window, self.loop_threshold),
         }));
 
         // Insert if still absent; otherwise reuse the winner and drop the extra lease.
@@ -284,6 +357,11 @@ impl SessionPageGuard {
     pub fn page(&self) -> &Page {
         &self.page.lease.page
     }
+
+    /// Get a mutable reference to the session's loop detector.
+    pub fn loop_detector(&mut self) -> &mut LoopDetector {
+        &mut self.page.loop_detector
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -316,7 +394,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn pool_acquire_and_release() {
-        let pool = BrowserPool::new(2, 30, false).await.unwrap();
+        let pool = BrowserPool::new(2, 30, false, Arc::new(BrowserMetrics::new()), true)
+            .await
+            .unwrap();
         assert_eq!(pool.available(), 2);
 
         let lease = pool.acquire().await.unwrap();
@@ -330,7 +410,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn pool_blocks_when_exhausted() {
-        let pool = Arc::new(BrowserPool::new(1, 2, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(1, 2, false, Arc::new(BrowserMetrics::new()), true)
+                .await
+                .unwrap(),
+        );
 
         let _lease1 = pool.acquire().await.unwrap();
         assert_eq!(pool.available(), 0);
@@ -345,7 +429,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn navigate_loads_page() {
-        let pool = BrowserPool::new(1, 30, false).await.unwrap();
+        let pool = BrowserPool::new(1, 30, false, Arc::new(BrowserMetrics::new()), true)
+            .await
+            .unwrap();
         let lease = pool.acquire().await.unwrap();
 
         lease
@@ -361,7 +447,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn screenshot_returns_bytes() {
-        let pool = BrowserPool::new(1, 30, false).await.unwrap();
+        let pool = BrowserPool::new(1, 30, false, Arc::new(BrowserMetrics::new()), true)
+            .await
+            .unwrap();
         let lease = pool.acquire().await.unwrap();
 
         lease
@@ -421,24 +509,31 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn try_evict_session_guards() {
-        let pool = Arc::new(BrowserPool::new(3, 30, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(3, 30, false, Arc::new(BrowserMetrics::new()), true)
+                .await
+                .unwrap(),
+        );
 
         // Build two session handles with different ages.
         let fresh_lease = pool.acquire().await.unwrap();
         let fresh: SessionHandle = Arc::new(Mutex::new(SessionPage {
             lease: fresh_lease,
             last_used: Instant::now(),
+            loop_detector: LoopDetector::default(),
         }));
 
         let old_lease = pool.acquire().await.unwrap();
         let old: SessionHandle = Arc::new(Mutex::new(SessionPage {
             lease: old_lease,
             last_used: Instant::now() - Duration::from_secs(120),
+            loop_detector: LoopDetector::default(),
         }));
 
         let wrong_ptr: SessionHandle = Arc::new(Mutex::new(SessionPage {
             lease: pool.acquire().await.unwrap(),
             last_used: Instant::now() - Duration::from_secs(120),
+            loop_detector: LoopDetector::default(),
         }));
 
         let idle = Duration::from_secs(60);
@@ -473,7 +568,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn session_manager_same_session_reuses_page() {
-        let pool = Arc::new(BrowserPool::new(2, 30, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(2, 30, false, Arc::new(BrowserMetrics::new()), true)
+                .await
+                .unwrap(),
+        );
         let manager = SessionBrowserManager::new(pool.clone(), Duration::from_secs(60));
 
         // First acquire creates a new page
@@ -499,7 +598,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn session_manager_release_frees_slot() {
-        let pool = Arc::new(BrowserPool::new(1, 30, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(1, 30, false, Arc::new(BrowserMetrics::new()), true)
+                .await
+                .unwrap(),
+        );
         let manager = SessionBrowserManager::new(pool.clone(), Duration::from_secs(60));
 
         {
@@ -515,7 +618,11 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn session_manager_different_sessions_get_different_pages() {
-        let pool = Arc::new(BrowserPool::new(2, 30, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(2, 30, false, Arc::new(BrowserMetrics::new()), true)
+                .await
+                .unwrap(),
+        );
         let manager = SessionBrowserManager::new(pool.clone(), Duration::from_secs(60));
 
         {
@@ -552,7 +659,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn get_text_extracts_body() {
-        let pool = BrowserPool::new(1, 30, false).await.unwrap();
+        let pool = BrowserPool::new(1, 30, false, Arc::new(BrowserMetrics::new()), true)
+            .await
+            .unwrap();
         let lease = pool.acquire().await.unwrap();
 
         lease

@@ -136,5 +136,6 @@ pub fn make_test_state() -> AppState {
             ),
         )),
         channel_startup_intent,
+        browser_metrics: None,
     }
 }

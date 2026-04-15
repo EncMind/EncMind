@@ -310,6 +310,31 @@ impl AppConfig {
                     .to_string(),
             );
         }
+        if self.browser.action_timeout_secs > 120 {
+            errors.push("browser.action_timeout_secs must be <= 120".to_string());
+        }
+        if self.browser.page_load_timeout_secs > 120 {
+            errors.push("browser.page_load_timeout_secs must be <= 120".to_string());
+        }
+        if self.browser.max_action_retries > 10 {
+            errors.push("browser.max_action_retries must be <= 10".to_string());
+        }
+        if self.browser.loop_detection_window == 0 {
+            errors.push("browser.loop_detection_window must be > 0".to_string());
+        }
+        if self.browser.loop_detection_threshold < 2 {
+            errors.push(
+                "browser.loop_detection_threshold must be >= 2 (1 would abort on every action)"
+                    .to_string(),
+            );
+        }
+        if self.browser.loop_detection_threshold > self.browser.loop_detection_window {
+            errors.push(format!(
+                "browser.loop_detection_threshold ({}) must be <= loop_detection_window ({}); \
+                 otherwise loop detection is effectively disabled",
+                self.browser.loop_detection_threshold, self.browser.loop_detection_window
+            ));
+        }
 
         if self.server.public_webhooks.enabled {
             match self.server.public_webhooks.auth_mode {
@@ -1650,6 +1675,29 @@ pub struct BrowserConfig {
     /// are rejected. None = upload action disabled entirely.
     #[serde(default)]
     pub upload_root: Option<String>,
+    /// Per-action timeout in seconds (default 10). 0 = no timeout.
+    #[serde(default = "default_action_timeout_secs")]
+    pub action_timeout_secs: u64,
+    /// Page navigation timeout in seconds (default 30). 0 = no timeout.
+    #[serde(default = "default_page_load_timeout_secs")]
+    pub page_load_timeout_secs: u64,
+    /// Max retries for transient CDP connection failures in browser_act
+    /// read-only actions (navigate/screenshot/get_text). Timeout errors are
+    /// not retried (they release the session). Mutating actions (click/type/
+    /// press/select/upload/eval/wait) are never retried. Stateless tools
+    /// (browser_navigate, browser_screenshot, browser_get_text) rely on
+    /// LLM-level retry. Default 2. 0 = no retries.
+    #[serde(default = "default_max_action_retries")]
+    pub max_action_retries: usize,
+    /// Auto-dismiss JavaScript alert/confirm/prompt dialogs (default true).
+    #[serde(default = "default_true")]
+    pub auto_dismiss_dialogs: bool,
+    /// Loop detection sliding window size (default 4).
+    #[serde(default = "default_loop_window")]
+    pub loop_detection_window: usize,
+    /// Consecutive identical actions within window before abort (default 3).
+    #[serde(default = "default_loop_threshold")]
+    pub loop_detection_threshold: usize,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1670,6 +1718,26 @@ fn default_browser_idle_timeout() -> u64 {
 
 fn default_max_actions_per_call() -> usize {
     1
+}
+
+fn default_action_timeout_secs() -> u64 {
+    10
+}
+
+fn default_page_load_timeout_secs() -> u64 {
+    30
+}
+
+fn default_max_action_retries() -> usize {
+    2
+}
+
+fn default_loop_window() -> usize {
+    4
+}
+
+fn default_loop_threshold() -> usize {
+    3
 }
 
 impl BrowserConfig {
@@ -1716,6 +1784,12 @@ impl Default for BrowserConfig {
             eval_enabled: false,
             max_actions_per_call: default_max_actions_per_call(),
             upload_root: None,
+            action_timeout_secs: default_action_timeout_secs(),
+            page_load_timeout_secs: default_page_load_timeout_secs(),
+            max_action_retries: default_max_action_retries(),
+            auto_dismiss_dialogs: true,
+            loop_detection_window: default_loop_window(),
+            loop_detection_threshold: default_loop_threshold(),
         }
     }
 }
@@ -4396,6 +4470,12 @@ access_policy:
             eval_enabled: true,
             max_actions_per_call: 1,
             upload_root: None,
+            action_timeout_secs: 15,
+            page_load_timeout_secs: 45,
+            max_action_retries: 3,
+            auto_dismiss_dialogs: false,
+            loop_detection_window: 6,
+            loop_detection_threshold: 4,
         };
         let json = serde_json::to_string(&config).unwrap();
         let back: BrowserConfig = serde_json::from_str(&json).unwrap();
@@ -4403,6 +4483,75 @@ access_policy:
         assert_eq!(back.domain_allowlist, vec!["example.com"]);
         assert!(back.eval_enabled);
         assert_eq!(back.max_actions_per_call, 1);
+        assert_eq!(back.action_timeout_secs, 15);
+        assert_eq!(back.page_load_timeout_secs, 45);
+        assert_eq!(back.max_action_retries, 3);
+        assert!(!back.auto_dismiss_dialogs);
+        assert_eq!(back.loop_detection_window, 6);
+        assert_eq!(back.loop_detection_threshold, 4);
+    }
+
+    #[test]
+    fn browser_config_guardrail_defaults() {
+        let config = BrowserConfig::default();
+        assert_eq!(config.action_timeout_secs, 10);
+        assert_eq!(config.page_load_timeout_secs, 30);
+        assert_eq!(config.max_action_retries, 2);
+        assert!(config.auto_dismiss_dialogs);
+        assert_eq!(config.loop_detection_window, 4);
+        assert_eq!(config.loop_detection_threshold, 3);
+    }
+
+    #[test]
+    fn validate_rejects_excessive_browser_guardrail_values() {
+        let mut config = valid_config();
+        config.browser.action_timeout_secs = 200;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("action_timeout_secs")));
+
+        config.browser.action_timeout_secs = 10;
+        config.browser.page_load_timeout_secs = 200;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("page_load_timeout_secs")));
+
+        config.browser.page_load_timeout_secs = 30;
+        config.browser.max_action_retries = 15;
+        let errors = config.validate();
+        assert!(errors.iter().any(|e| e.contains("max_action_retries")));
+
+        // loop_detection_window = 0 → rejected
+        config.browser.max_action_retries = 2;
+        config.browser.loop_detection_window = 0;
+        config.browser.loop_detection_threshold = 3;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("loop_detection_window must be > 0")),
+            "errors={errors:?}"
+        );
+
+        // loop_detection_threshold < 2 → aborts on every action
+        config.browser.loop_detection_window = 4;
+        config.browser.loop_detection_threshold = 1;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("loop_detection_threshold must be >= 2")),
+            "errors={errors:?}"
+        );
+
+        // threshold > window → effectively disabled
+        config.browser.loop_detection_threshold = 10;
+        config.browser.loop_detection_window = 4;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("loop_detection_threshold") && e.contains("<=")),
+            "errors={errors:?}"
+        );
     }
 
     #[test]

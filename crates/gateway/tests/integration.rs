@@ -136,6 +136,7 @@ fn make_state() -> AppState {
         api_usage_store: None,
         channel_account_store: None,
         channel_startup_intent,
+        browser_metrics: None,
     }
 }
 
