@@ -809,7 +809,10 @@ impl InternalToolHandler for BrowserActHandler {
                             return fail_close_on_timeout(
                                 self.metrics.as_ref(),
                                 || self.session_manager.release(session_id.as_str()),
-                                format!("page navigation timed out after {}s", nav_timeout.as_secs()),
+                                format!(
+                                    "page navigation timed out after {}s",
+                                    nav_timeout.as_secs()
+                                ),
                             )
                             .await;
                         }
@@ -1330,7 +1333,10 @@ impl InternalToolHandler for BrowserActHandler {
                             return fail_close_on_timeout(
                                 self.metrics.as_ref(),
                                 || self.session_manager.release(session_id.as_str()),
-                                format!("action '{action}' timed out after {}s", action_timeout.as_secs()),
+                                format!(
+                                    "action '{action}' timed out after {}s",
+                                    action_timeout.as_secs()
+                                ),
                             )
                             .await;
                         }
@@ -1770,7 +1776,10 @@ mod tests {
         .await
         .expect_err("timeout should fail-close with an error");
 
-        assert!(called.load(Ordering::SeqCst), "release callback must be called");
+        assert!(
+            called.load(Ordering::SeqCst),
+            "release callback must be called"
+        );
         assert!(
             err.to_string().contains("timed out"),
             "unexpected error: {err}"
