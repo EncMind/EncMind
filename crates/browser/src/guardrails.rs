@@ -185,12 +185,17 @@ impl RetryPolicy {
         }
 
         // Retry only transport-flavored transient failures.
+        // "timed out"/"timeout" cover Chrome-level ERR_TIMED_OUT and timeout
+        // exceeded variants that are NOT our guardrail timeouts (already excluded above).
         let has_transport_marker = msg.contains("connection")
             || msg.contains("cdp")
             || msg.contains("socket")
             || msg.contains("websocket")
             || msg.contains("network")
-            || msg.contains("connect");
+            || msg.contains("connect")
+            || msg.contains("timed out")
+            || msg.contains("timeout")
+            || msg.contains("err_timed_out");
         if has_transport_marker {
             return true;
         }
@@ -453,6 +458,23 @@ mod tests {
         assert!(
             RetryPolicy::is_retryable(&transport_timeout),
             "transport timeout should be retried"
+        );
+
+        // Chrome-style ERR_TIMED_OUT is a transport timeout, not our guardrail.
+        let chrome_timeout = AppError::Internal(
+            "navigation failed: ERR_TIMED_OUT at https://slow.example.com".into(),
+        );
+        assert!(
+            RetryPolicy::is_retryable(&chrome_timeout),
+            "Chrome ERR_TIMED_OUT should be retried"
+        );
+
+        // Some stacks use "timeout exceeded" wording without "timed out".
+        let timeout_exceeded =
+            AppError::Internal("navigation failed: timeout exceeded while loading page".into());
+        assert!(
+            RetryPolicy::is_retryable(&timeout_exceeded),
+            "transport timeout exceeded should be retried"
         );
 
         let guardrail_timeout = AppError::Internal("action 'click' timed out after 10s".into());
