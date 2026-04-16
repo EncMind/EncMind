@@ -207,11 +207,14 @@ pub async fn run_gateway(
         encmind_storage::api_key_store::SqliteApiKeyStore::new(pool.clone(), encryption.clone()),
     );
     // Browser pool
+    let browser_metrics = std::sync::Arc::new(encmind_browser::BrowserMetrics::new());
     let browser_pool = if config.browser.enabled {
         match encmind_browser::pool::BrowserPool::new(
             config.browser.pool_size.max(1),
             config.browser.idle_timeout_secs,
             config.browser.no_sandbox,
+            browser_metrics.clone(),
+            config.browser.auto_dismiss_dialogs,
         )
         .await
         {
@@ -525,6 +528,11 @@ pub async fn run_gateway(
         channel_startup_intent,
         backup_manager,
         browser_pool,
+        browser_metrics: if config.browser.enabled {
+            Some(browser_metrics)
+        } else {
+            None
+        },
         hook_registry,
         plugin_manager: Arc::new(RwLock::new(plugin_manager)),
         loaded_skills: Arc::new(RwLock::new(loaded_wasm.summaries)),
@@ -2307,14 +2315,21 @@ pub(crate) fn build_native_plugins(
             BrowserStartupPolicy::Required
         );
         let idle_timeout = std::time::Duration::from_secs(config.browser.idle_timeout_secs);
-        let session_manager =
-            encmind_browser::SessionBrowserManager::new(pool.clone(), idle_timeout);
+        let gc = encmind_browser::guardrails::GuardrailConfig::from_browser_config(&config.browser);
+        let session_manager = encmind_browser::pool::SessionBrowserManager::with_loop_config(
+            pool.clone(),
+            idle_timeout,
+            gc.loop_window,
+            gc.loop_threshold,
+        );
+        let metrics = pool.metrics().clone();
         plugins.push(Box::new(encmind_browser::plugin::BrowserPlugin::new(
             pool,
             session_manager,
             firewall.clone(),
             config.token_optimization.screenshot_payload_mode,
             config.browser.clone(),
+            metrics,
             required,
         )));
     }

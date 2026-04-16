@@ -199,6 +199,8 @@ pub struct AppState {
     /// For multi-field credentials (Slack, Gmail), this includes partial env
     /// presence so readiness can surface degraded startup/misconfiguration.
     pub channel_startup_intent: Arc<HashSet<String>>,
+    /// Browser runtime guardrail metrics (loop aborts, dialog dismissals, timeouts, retries).
+    pub browser_metrics: Option<Arc<encmind_browser::BrowserMetrics>>,
 }
 
 pub fn compute_channel_startup_intent(config: &AppConfig) -> HashSet<String> {
@@ -368,6 +370,7 @@ mod tests {
             api_usage_store: None,
             channel_account_store: None,
             channel_startup_intent: Arc::new(HashSet::new()),
+            browser_metrics: None,
         };
     }
 

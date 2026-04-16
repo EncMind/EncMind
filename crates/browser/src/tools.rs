@@ -49,6 +49,8 @@ pub struct BrowserNavigateHandler {
     pool: Arc<BrowserPool>,
     firewall: Arc<EgressFirewall>,
     config: encmind_core::config::BrowserConfig,
+    metrics: Arc<crate::guardrails::BrowserMetrics>,
+    page_load_timeout: Duration,
 }
 
 impl BrowserNavigateHandler {
@@ -56,11 +58,15 @@ impl BrowserNavigateHandler {
         pool: Arc<BrowserPool>,
         firewall: Arc<EgressFirewall>,
         config: encmind_core::config::BrowserConfig,
+        metrics: Arc<crate::guardrails::BrowserMetrics>,
     ) -> Self {
+        let page_load_timeout = Duration::from_secs(config.page_load_timeout_secs);
         Self {
             pool,
             firewall,
             config,
+            metrics,
+            page_load_timeout,
         }
     }
 }
@@ -73,6 +79,9 @@ impl InternalToolHandler for BrowserNavigateHandler {
         _session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<String, AppError> {
+        self.metrics
+            .total_actions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         enforce_action_allowed(&self.config, "navigate")?;
         let raw_url = input
             .get("url")
@@ -88,15 +97,32 @@ impl InternalToolHandler for BrowserNavigateHandler {
             .await
             .map_err(|e| AppError::Internal(format!("browser acquire failed: {e:?}")))?;
 
-        navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
-        enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
-
-        let title = lease
-            .page
-            .get_title()
-            .await
-            .map_err(|e| AppError::Internal(format!("get_title failed: {e}")))?
-            .unwrap_or_default();
+        let nav_fut = async {
+            navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
+            enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
+            let title = lease
+                .page
+                .get_title()
+                .await
+                .map_err(|e| AppError::Internal(format!("get_title failed: {e}")))?
+                .unwrap_or_default();
+            Ok::<_, AppError>(title)
+        };
+        let title = if self.page_load_timeout.is_zero() {
+            nav_fut.await?
+        } else {
+            tokio::time::timeout(self.page_load_timeout, nav_fut)
+                .await
+                .map_err(|_| {
+                    self.metrics
+                        .timeout_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AppError::Internal(format!(
+                        "navigation timed out after {}s",
+                        self.page_load_timeout.as_secs()
+                    ))
+                })??
+        };
 
         Ok(serde_json::json!({
             "url": url.as_str(),
@@ -112,6 +138,8 @@ pub struct BrowserScreenshotHandler {
     firewall: Arc<EgressFirewall>,
     config: encmind_core::config::BrowserConfig,
     screenshot_mode: encmind_core::config::ScreenshotPayloadMode,
+    metrics: Arc<crate::guardrails::BrowserMetrics>,
+    page_load_timeout: Duration,
 }
 
 impl BrowserScreenshotHandler {
@@ -120,12 +148,16 @@ impl BrowserScreenshotHandler {
         firewall: Arc<EgressFirewall>,
         config: encmind_core::config::BrowserConfig,
         screenshot_mode: encmind_core::config::ScreenshotPayloadMode,
+        metrics: Arc<crate::guardrails::BrowserMetrics>,
     ) -> Self {
+        let page_load_timeout = Duration::from_secs(config.page_load_timeout_secs);
         Self {
             pool,
             firewall,
             config,
             screenshot_mode,
+            metrics,
+            page_load_timeout,
         }
     }
 }
@@ -138,6 +170,9 @@ impl InternalToolHandler for BrowserScreenshotHandler {
         _session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<String, AppError> {
+        self.metrics
+            .total_actions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         enforce_action_allowed(&self.config, "screenshot")?;
         let raw_url = input
             .get("url")
@@ -153,8 +188,26 @@ impl InternalToolHandler for BrowserScreenshotHandler {
             .await
             .map_err(|e| AppError::Internal(format!("browser acquire failed: {e:?}")))?;
 
-        navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
-        enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
+        let op_fut = async {
+            navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
+            enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
+            Ok::<_, AppError>(())
+        };
+        if self.page_load_timeout.is_zero() {
+            op_fut.await?;
+        } else {
+            tokio::time::timeout(self.page_load_timeout, op_fut)
+                .await
+                .map_err(|_| {
+                    self.metrics
+                        .timeout_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AppError::Internal(format!(
+                        "screenshot navigation timed out after {}s",
+                        self.page_load_timeout.as_secs()
+                    ))
+                })??;
+        }
 
         let screenshot_bytes = lease
             .page
@@ -208,6 +261,8 @@ pub struct BrowserGetTextHandler {
     pool: Arc<BrowserPool>,
     firewall: Arc<EgressFirewall>,
     config: encmind_core::config::BrowserConfig,
+    metrics: Arc<crate::guardrails::BrowserMetrics>,
+    page_load_timeout: Duration,
 }
 
 impl BrowserGetTextHandler {
@@ -215,11 +270,15 @@ impl BrowserGetTextHandler {
         pool: Arc<BrowserPool>,
         firewall: Arc<EgressFirewall>,
         config: encmind_core::config::BrowserConfig,
+        metrics: Arc<crate::guardrails::BrowserMetrics>,
     ) -> Self {
+        let page_load_timeout = Duration::from_secs(config.page_load_timeout_secs);
         Self {
             pool,
             firewall,
             config,
+            metrics,
+            page_load_timeout,
         }
     }
 }
@@ -232,6 +291,9 @@ impl InternalToolHandler for BrowserGetTextHandler {
         _session_id: &SessionId,
         agent_id: &AgentId,
     ) -> Result<String, AppError> {
+        self.metrics
+            .total_actions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         enforce_action_allowed(&self.config, "get_text")?;
         let raw_url = input
             .get("url")
@@ -247,8 +309,26 @@ impl InternalToolHandler for BrowserGetTextHandler {
             .await
             .map_err(|e| AppError::Internal(format!("browser acquire failed: {e:?}")))?;
 
-        navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
-        enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
+        let nav_fut = async {
+            navigate_with_request_firewall(&lease.page, &url, &self.firewall, agent_id).await?;
+            enforce_final_page_url_allowed(&self.firewall, &lease.page, agent_id).await?;
+            Ok::<_, AppError>(())
+        };
+        if self.page_load_timeout.is_zero() {
+            nav_fut.await?;
+        } else {
+            tokio::time::timeout(self.page_load_timeout, nav_fut)
+                .await
+                .map_err(|_| {
+                    self.metrics
+                        .timeout_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    AppError::Internal(format!(
+                        "get_text navigation timed out after {}s",
+                        self.page_load_timeout.as_secs()
+                    ))
+                })??;
+        }
 
         let text: String = lease
             .page
@@ -494,12 +574,30 @@ fn truncate_text(input: String, max_chars: usize) -> (String, bool, usize) {
     (truncated, true, total_chars)
 }
 
+async fn fail_close_on_timeout<T, F, Fut>(
+    metrics: &crate::guardrails::BrowserMetrics,
+    release_session: F,
+    error_message: String,
+) -> Result<T, AppError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ()>,
+{
+    metrics
+        .timeout_count
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    release_session().await;
+    Err(AppError::Internal(error_message))
+}
+
 /// Browser act tool — performs interactive browser actions on session-scoped pages.
 pub struct BrowserActHandler {
     session_manager: Arc<SessionBrowserManager>,
     firewall: Arc<EgressFirewall>,
     config: encmind_core::config::BrowserConfig,
     screenshot_mode: encmind_core::config::ScreenshotPayloadMode,
+    metrics: Arc<crate::guardrails::BrowserMetrics>,
+    guardrail_config: crate::guardrails::GuardrailConfig,
 }
 
 impl BrowserActHandler {
@@ -508,12 +606,16 @@ impl BrowserActHandler {
         firewall: Arc<EgressFirewall>,
         config: encmind_core::config::BrowserConfig,
         screenshot_mode: encmind_core::config::ScreenshotPayloadMode,
+        metrics: Arc<crate::guardrails::BrowserMetrics>,
     ) -> Self {
+        let guardrail_config = crate::guardrails::GuardrailConfig::from_browser_config(&config);
         Self {
             session_manager,
             firewall,
             config,
             screenshot_mode,
+            metrics,
+            guardrail_config,
         }
     }
 }
@@ -615,6 +717,11 @@ impl InternalToolHandler for BrowserActHandler {
             ));
         }
 
+        // Track action for metrics (before close early-return so all actions count).
+        self.metrics
+            .total_actions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         // Handle close separately — just release the session
         if action == "close" {
             self.session_manager.release(session_id.as_str()).await;
@@ -642,24 +749,108 @@ impl InternalToolHandler for BrowserActHandler {
         }
 
         // Acquire or reuse session page
-        let guard = self
+        let mut guard = self
             .session_manager
             .acquire_session(session_id.as_str())
             .await
             .map_err(|e| AppError::Internal(format!("browser session acquire failed: {e:?}")))?;
+
+        // Loop detection: fingerprint the action and check for repeated patterns.
+        // For navigate, use the target URL so repeated failed navigations to the
+        // same destination are detected even when the current page hasn't changed.
+        let selector = action_input.get("selector").and_then(|v| v.as_str());
+        {
+            let fp_url = if action == "navigate" {
+                parsed_url
+                    .as_ref()
+                    .map(|u| u.as_str().to_string())
+                    .unwrap_or_default()
+            } else {
+                guard.page().url().await.ok().flatten().unwrap_or_default()
+            };
+            let fp = crate::guardrails::ActionFingerprint {
+                action: action.to_string(),
+                page_url: fp_url,
+                selector: selector.map(|s| s.to_string()),
+            };
+            if let Err(abort) = guard.loop_detector().record_and_check(fp) {
+                self.metrics
+                    .loop_abort_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(AppError::Internal(format!(
+                    "loop detected: action '{}' repeated {} consecutive times on the same page/selector; \
+                     try a different approach",
+                    abort.action, abort.count
+                )));
+            }
+        }
+
         let page = guard.page();
 
-        // Navigate if URL provided
+        // Navigate if URL provided (with page-load timeout + retry).
         if let Some(url) = parsed_url.as_ref() {
-            navigate_with_request_firewall(page, url, &self.firewall, agent_id).await?;
+            let nav_timeout = self.guardrail_config.page_load_timeout;
+            let max_retries = self.guardrail_config.max_retries;
+            let mut attempt = 0usize;
+            loop {
+                let nav_result = if nav_timeout.is_zero() {
+                    navigate_with_request_firewall(page, url, &self.firewall, agent_id).await
+                } else {
+                    match tokio::time::timeout(
+                        nav_timeout,
+                        navigate_with_request_firewall(page, url, &self.firewall, agent_id),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            // Release tainted session — page may be in undefined state.
+                            drop(guard);
+                            return fail_close_on_timeout(
+                                self.metrics.as_ref(),
+                                || self.session_manager.release(session_id.as_str()),
+                                format!(
+                                    "page navigation timed out after {}s",
+                                    nav_timeout.as_secs()
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                };
+                match nav_result {
+                    Ok(()) => break,
+                    Err(e)
+                        if attempt < max_retries
+                            && crate::guardrails::RetryPolicy::is_retryable(&e) =>
+                    {
+                        self.metrics
+                            .retry_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            max = max_retries,
+                            error = %e,
+                            "browser_act navigate failed; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
             enforce_final_page_url_allowed(&self.firewall, page, agent_id).await?;
         }
 
         // Enforce current page policy even when reusing an existing session without navigation.
         enforce_current_page_policy(&self.firewall, page, agent_id, &self.config).await?;
+        // Determine timeout for this action.
+        let action_timeout = if action == "navigate" || action == "wait" {
+            self.guardrail_config.page_load_timeout
+        } else {
+            self.guardrail_config.action_timeout
+        };
 
-        // Execute the action
-        let selector = action_input.get("selector").and_then(|v| v.as_str());
         let immediate_response = if action == "navigate" {
             None
         } else {
@@ -671,293 +862,359 @@ impl InternalToolHandler for BrowserActHandler {
             } else {
                 PostOpDrainPolicy::IfPausedRequestsSeenMs(FIREWALL_DRAIN_TIMEOUT_MS)
             };
-            run_with_request_firewall(
-                page,
-                &self.firewall,
-                agent_id,
-                post_op_drain_policy,
-                async {
-                match action {
-            "click" => {
-                let sel = selector.ok_or_else(|| {
-                    AppError::Internal("'selector' required for click action".into())
-                })?;
-                // Find element and click at its center
-                let js = format!(
-                    r#"(() => {{
+            let max_retries = self.guardrail_config.max_retries;
+            let mut attempt = 0usize;
+            loop {
+                let firewall_wrapped = run_with_request_firewall(
+                    page,
+                    &self.firewall,
+                    agent_id,
+                    post_op_drain_policy,
+                    async {
+                        match action {
+                            "click" => {
+                                let sel = selector.ok_or_else(|| {
+                                    AppError::Internal(
+                                        "'selector' required for click action".into(),
+                                    )
+                                })?;
+                                // Find element and click at its center
+                                let js = format!(
+                                    r#"(() => {{
                         const el = document.querySelector({sel});
                         if (!el) return null;
                         const rect = el.getBoundingClientRect();
                         return {{ x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }};
                     }})()"#,
-                    sel = serde_json::to_string(sel)
-                        .map_err(|e| AppError::Internal(format!("selector encode failed: {e}")))?
-                );
-                let coords: serde_json::Value = page
-                    .evaluate(js)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("element lookup failed: {e}")))?
-                    .into_value()
-                    .map_err(|e| AppError::Internal(format!("value conversion failed: {e}")))?;
+                                    sel = serde_json::to_string(sel).map_err(|e| {
+                                        AppError::Internal(format!("selector encode failed: {e}"))
+                                    })?
+                                );
+                                let coords: serde_json::Value = page
+                                    .evaluate(js)
+                                    .await
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("element lookup failed: {e}"))
+                                    })?
+                                    .into_value()
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("value conversion failed: {e}"))
+                                    })?;
 
-                if coords.is_null() {
-                    return Err(AppError::Internal(format!(
-                        "element not found: {sel}"
-                    )));
-                }
+                                if coords.is_null() {
+                                    return Err(AppError::Internal(format!(
+                                        "element not found: {sel}"
+                                    )));
+                                }
 
-                let x = coords["x"]
-                    .as_f64()
-                    .ok_or_else(|| AppError::Internal("invalid element coordinates".into()))?;
-                let y = coords["y"]
-                    .as_f64()
-                    .ok_or_else(|| AppError::Internal("invalid element coordinates".into()))?;
+                                let x = coords["x"].as_f64().ok_or_else(|| {
+                                    AppError::Internal("invalid element coordinates".into())
+                                })?;
+                                let y = coords["y"].as_f64().ok_or_else(|| {
+                                    AppError::Internal("invalid element coordinates".into())
+                                })?;
 
-                // Use CDP to dispatch mouse events
-                use chromiumoxide::cdp::browser_protocol::input::{
-                    DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
-                };
-                page.execute(
-                    DispatchMouseEventParams::builder()
-                        .r#type(DispatchMouseEventType::MousePressed)
-                        .x(x)
-                        .y(y)
-                        .button(MouseButton::Left)
-                        .click_count(1)
-                        .build()
-                        .map_err(|e| AppError::Internal(format!("mouse event build failed: {e}")))?,
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("mouse press failed: {e}")))?;
+                                // Use CDP to dispatch mouse events
+                                use chromiumoxide::cdp::browser_protocol::input::{
+                                    DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+                                };
+                                page.execute(
+                                    DispatchMouseEventParams::builder()
+                                        .r#type(DispatchMouseEventType::MousePressed)
+                                        .x(x)
+                                        .y(y)
+                                        .button(MouseButton::Left)
+                                        .click_count(1)
+                                        .build()
+                                        .map_err(|e| {
+                                            AppError::Internal(format!(
+                                                "mouse event build failed: {e}"
+                                            ))
+                                        })?,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    AppError::Internal(format!("mouse press failed: {e}"))
+                                })?;
 
-                page.execute(
-                    DispatchMouseEventParams::builder()
-                        .r#type(DispatchMouseEventType::MouseReleased)
-                        .x(x)
-                        .y(y)
-                        .button(MouseButton::Left)
-                        .click_count(1)
-                        .build()
-                        .map_err(|e| AppError::Internal(format!("mouse event build failed: {e}")))?,
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("mouse release failed: {e}")))?;
-                Ok(None)
-            }
-            "type" => {
-                let sel = selector.ok_or_else(|| {
-                    AppError::Internal("'selector' required for type action".into())
-                })?;
-                let text = action_input
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| AppError::Internal("'text' required for type action".into()))?;
+                                page.execute(
+                                    DispatchMouseEventParams::builder()
+                                        .r#type(DispatchMouseEventType::MouseReleased)
+                                        .x(x)
+                                        .y(y)
+                                        .button(MouseButton::Left)
+                                        .click_count(1)
+                                        .build()
+                                        .map_err(|e| {
+                                            AppError::Internal(format!(
+                                                "mouse event build failed: {e}"
+                                            ))
+                                        })?,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    AppError::Internal(format!("mouse release failed: {e}"))
+                                })?;
+                                Ok(None)
+                            }
+                            "type" => {
+                                let sel = selector.ok_or_else(|| {
+                                    AppError::Internal("'selector' required for type action".into())
+                                })?;
+                                let text = action_input
+                                    .get("text")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        AppError::Internal("'text' required for type action".into())
+                                    })?;
 
-                // Focus the element via JS
-                let focus_js = format!(
-                    r#"(() => {{
+                                // Focus the element via JS
+                                let focus_js = format!(
+                                    r#"(() => {{
                         const el = document.querySelector({sel});
                         if (!el) return false;
                         el.focus();
                         return true;
                     }})()"#,
-                    sel = serde_json::to_string(sel)
-                        .map_err(|e| AppError::Internal(format!("selector encode failed: {e}")))?
-                );
-                let focused: bool = page
-                    .evaluate(focus_js)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("focus failed: {e}")))?
-                    .into_value()
-                    .map_err(|e| AppError::Internal(format!("value conversion failed: {e}")))?;
-                if !focused {
-                    return Err(AppError::Internal(format!(
-                        "element not found: {sel}"
-                    )));
-                }
+                                    sel = serde_json::to_string(sel).map_err(|e| {
+                                        AppError::Internal(format!("selector encode failed: {e}"))
+                                    })?
+                                );
+                                let focused: bool = page
+                                    .evaluate(focus_js)
+                                    .await
+                                    .map_err(|e| AppError::Internal(format!("focus failed: {e}")))?
+                                    .into_value()
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("value conversion failed: {e}"))
+                                    })?;
+                                if !focused {
+                                    return Err(AppError::Internal(format!(
+                                        "element not found: {sel}"
+                                    )));
+                                }
 
-                // Type each character via CDP
-                use chromiumoxide::cdp::browser_protocol::input::{
-                    DispatchKeyEventParams, DispatchKeyEventType,
-                };
-                for ch in text.chars() {
-                    page.execute(
-                        DispatchKeyEventParams::builder()
-                            .r#type(DispatchKeyEventType::Char)
-                            .text(ch.to_string())
-                            .build()
-                            .map_err(|e| AppError::Internal(format!("key event build failed: {e}")))?,
-                    )
-                    .await
-                    .map_err(|e| AppError::Internal(format!("char dispatch failed: {e}")))?;
-                }
-                Ok(None)
-            }
-            "press" => {
-                let key_name = action_input
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| AppError::Internal("'key' required for press action".into()))?;
+                                // Type each character via CDP
+                                use chromiumoxide::cdp::browser_protocol::input::{
+                                    DispatchKeyEventParams, DispatchKeyEventType,
+                                };
+                                for ch in text.chars() {
+                                    page.execute(
+                                        DispatchKeyEventParams::builder()
+                                            .r#type(DispatchKeyEventType::Char)
+                                            .text(ch.to_string())
+                                            .build()
+                                            .map_err(|e| {
+                                                AppError::Internal(format!(
+                                                    "key event build failed: {e}"
+                                                ))
+                                            })?,
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("char dispatch failed: {e}"))
+                                    })?;
+                                }
+                                Ok(None)
+                            }
+                            "press" => {
+                                let key_name = action_input
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        AppError::Internal("'key' required for press action".into())
+                                    })?;
 
-                let (key, code, _key_code) = key_definition(key_name).ok_or_else(|| {
-                    AppError::Internal(format!("unknown key: '{key_name}'"))
-                })?;
+                                let (key, code, _key_code) =
+                                    key_definition(key_name).ok_or_else(|| {
+                                        AppError::Internal(format!("unknown key: '{key_name}'"))
+                                    })?;
 
-                use chromiumoxide::cdp::browser_protocol::input::{
-                    DispatchKeyEventParams, DispatchKeyEventType,
-                };
-                page.execute(
-                    DispatchKeyEventParams::builder()
-                        .r#type(DispatchKeyEventType::KeyDown)
-                        .key(key)
-                        .code(code)
-                        .build()
-                        .map_err(|e| AppError::Internal(format!("key event build failed: {e}")))?,
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("key down failed: {e}")))?;
+                                use chromiumoxide::cdp::browser_protocol::input::{
+                                    DispatchKeyEventParams, DispatchKeyEventType,
+                                };
+                                page.execute(
+                                    DispatchKeyEventParams::builder()
+                                        .r#type(DispatchKeyEventType::KeyDown)
+                                        .key(key)
+                                        .code(code)
+                                        .build()
+                                        .map_err(|e| {
+                                            AppError::Internal(format!(
+                                                "key event build failed: {e}"
+                                            ))
+                                        })?,
+                                )
+                                .await
+                                .map_err(|e| AppError::Internal(format!("key down failed: {e}")))?;
 
-                page.execute(
-                    DispatchKeyEventParams::builder()
-                        .r#type(DispatchKeyEventType::KeyUp)
-                        .key(key)
-                        .code(code)
-                        .build()
-                        .map_err(|e| AppError::Internal(format!("key event build failed: {e}")))?,
-                )
-                .await
-                .map_err(|e| AppError::Internal(format!("key up failed: {e}")))?;
-                Ok(None)
-            }
-            "select" => {
-                let sel = selector.ok_or_else(|| {
-                    AppError::Internal("'selector' required for select action".into())
-                })?;
-                let value = action_input
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        AppError::Internal("'value' required for select action".into())
-                    })?;
+                                page.execute(
+                                    DispatchKeyEventParams::builder()
+                                        .r#type(DispatchKeyEventType::KeyUp)
+                                        .key(key)
+                                        .code(code)
+                                        .build()
+                                        .map_err(|e| {
+                                            AppError::Internal(format!(
+                                                "key event build failed: {e}"
+                                            ))
+                                        })?,
+                                )
+                                .await
+                                .map_err(|e| AppError::Internal(format!("key up failed: {e}")))?;
+                                Ok(None)
+                            }
+                            "select" => {
+                                let sel = selector.ok_or_else(|| {
+                                    AppError::Internal(
+                                        "'selector' required for select action".into(),
+                                    )
+                                })?;
+                                let value = action_input
+                                    .get("value")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        AppError::Internal(
+                                            "'value' required for select action".into(),
+                                        )
+                                    })?;
 
-                let select_js = format!(
-                    r#"(() => {{
+                                let select_js = format!(
+                                    r#"(() => {{
                         const el = document.querySelector({sel});
                         if (!el) return false;
                         el.value = {val};
                         el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         return true;
                     }})()"#,
-                    sel = serde_json::to_string(sel)
-                        .map_err(|e| AppError::Internal(format!("selector encode failed: {e}")))?,
-                    val = serde_json::to_string(value)
-                        .map_err(|e| AppError::Internal(format!("value encode failed: {e}")))?
-                );
-                let success: bool = page
-                    .evaluate(select_js)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("select failed: {e}")))?
-                    .into_value()
-                    .map_err(|e| AppError::Internal(format!("value conversion failed: {e}")))?;
-                if !success {
-                    return Err(AppError::Internal(format!(
-                        "element not found: {sel}"
-                    )));
-                }
-                Ok(None)
-            }
-            "upload" => {
-                let upload_root = self.config.upload_root.as_deref().ok_or_else(|| {
-                    AppError::Internal(
-                        "upload action disabled; set browser.upload_root in config".into(),
-                    )
-                })?;
-                let sel = selector.ok_or_else(|| {
-                    AppError::Internal("'selector' required for upload action".into())
-                })?;
-                let files_val = action_input.get("files").ok_or_else(|| {
-                    AppError::Internal("'files' required for upload action".into())
-                })?;
-                let files_arr = files_val.as_array().ok_or_else(|| {
-                    AppError::Internal("'files' must be an array of file path strings".into())
-                })?;
-                if files_arr.is_empty() {
-                    return Err(AppError::Internal("'files' array must not be empty".into()));
-                }
+                                    sel = serde_json::to_string(sel).map_err(|e| {
+                                        AppError::Internal(format!("selector encode failed: {e}"))
+                                    })?,
+                                    val = serde_json::to_string(value).map_err(|e| {
+                                        AppError::Internal(format!("value encode failed: {e}"))
+                                    })?
+                                );
+                                let success: bool = page
+                                    .evaluate(select_js)
+                                    .await
+                                    .map_err(|e| AppError::Internal(format!("select failed: {e}")))?
+                                    .into_value()
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("value conversion failed: {e}"))
+                                    })?;
+                                if !success {
+                                    return Err(AppError::Internal(format!(
+                                        "element not found: {sel}"
+                                    )));
+                                }
+                                Ok(None)
+                            }
+                            "upload" => {
+                                let upload_root =
+                                    self.config.upload_root.as_deref().ok_or_else(|| {
+                                        AppError::Internal(
+                                        "upload action disabled; set browser.upload_root in config"
+                                            .into(),
+                                    )
+                                    })?;
+                                let sel = selector.ok_or_else(|| {
+                                    AppError::Internal(
+                                        "'selector' required for upload action".into(),
+                                    )
+                                })?;
+                                let files_val = action_input.get("files").ok_or_else(|| {
+                                    AppError::Internal("'files' required for upload action".into())
+                                })?;
+                                let files_arr = files_val.as_array().ok_or_else(|| {
+                                    AppError::Internal(
+                                        "'files' must be an array of file path strings".into(),
+                                    )
+                                })?;
+                                if files_arr.is_empty() {
+                                    return Err(AppError::Internal(
+                                        "'files' array must not be empty".into(),
+                                    ));
+                                }
 
-                // Validate upload_root exists and canonicalize it.
-                let root_canonical = std::fs::canonicalize(upload_root).map_err(|e| {
-                    AppError::Internal(format!(
-                        "upload_root '{upload_root}' is not accessible: {e}"
-                    ))
-                })?;
+                                // Validate upload_root exists and canonicalize it.
+                                let root_canonical =
+                                    std::fs::canonicalize(upload_root).map_err(|e| {
+                                        AppError::Internal(format!(
+                                            "upload_root '{upload_root}' is not accessible: {e}"
+                                        ))
+                                    })?;
 
-                let mut validated_paths = Vec::with_capacity(files_arr.len());
-                for f in files_arr {
-                    let path_str = f.as_str().ok_or_else(|| {
-                        AppError::Internal("each element in 'files' must be a string".into())
-                    })?;
-                    let canonical = std::fs::canonicalize(path_str).map_err(|e| {
-                        AppError::Internal(format!("file not accessible: {path_str}: {e}"))
-                    })?;
-                    if !canonical.starts_with(&root_canonical) {
-                        return Err(AppError::Internal(format!(
-                            "file path '{}' is outside upload_root '{}'",
-                            path_str, upload_root
-                        )));
-                    }
-                    if !canonical.is_file() {
-                        return Err(AppError::Internal(format!(
-                            "path is not a regular file: {path_str}"
-                        )));
-                    }
-                    validated_paths.push(canonical.to_string_lossy().into_owned());
-                }
+                                let mut validated_paths = Vec::with_capacity(files_arr.len());
+                                for f in files_arr {
+                                    let path_str = f.as_str().ok_or_else(|| {
+                                        AppError::Internal(
+                                            "each element in 'files' must be a string".into(),
+                                        )
+                                    })?;
+                                    let canonical =
+                                        std::fs::canonicalize(path_str).map_err(|e| {
+                                            AppError::Internal(format!(
+                                                "file not accessible: {path_str}: {e}"
+                                            ))
+                                        })?;
+                                    if !canonical.starts_with(&root_canonical) {
+                                        return Err(AppError::Internal(format!(
+                                            "file path '{}' is outside upload_root '{}'",
+                                            path_str, upload_root
+                                        )));
+                                    }
+                                    if !canonical.is_file() {
+                                        return Err(AppError::Internal(format!(
+                                            "path is not a regular file: {path_str}"
+                                        )));
+                                    }
+                                    validated_paths.push(canonical.to_string_lossy().into_owned());
+                                }
 
-                // Resolve the file input element via JS to get its RemoteObjectId.
-                let find_js = format!(
-                    r#"document.querySelector({sel})"#,
-                    sel = serde_json::to_string(sel)
-                        .map_err(|e| AppError::Internal(format!("selector encode failed: {e}")))?
-                );
-                use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
-                let eval_cmd = EvaluateParams::new(find_js);
-                let eval_resp = page
-                    .execute(eval_cmd)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("element lookup failed: {e}")))?;
-                let remote_obj = &eval_resp.result.result;
-                let obj_id = remote_obj.object_id.as_ref().ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "file input element not found for selector: {sel}"
-                    ))
-                })?;
+                                // Resolve the file input element via JS to get its RemoteObjectId.
+                                let find_js = format!(
+                                    r#"document.querySelector({sel})"#,
+                                    sel = serde_json::to_string(sel).map_err(|e| {
+                                        AppError::Internal(format!("selector encode failed: {e}"))
+                                    })?
+                                );
+                                use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
+                                let eval_cmd = EvaluateParams::new(find_js);
+                                let eval_resp = page.execute(eval_cmd).await.map_err(|e| {
+                                    AppError::Internal(format!("element lookup failed: {e}"))
+                                })?;
+                                let remote_obj = &eval_resp.result.result;
+                                let obj_id = remote_obj.object_id.as_ref().ok_or_else(|| {
+                                    AppError::Internal(format!(
+                                        "file input element not found for selector: {sel}"
+                                    ))
+                                })?;
 
-                // Send SetFileInputFiles CDP command.
-                use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
-                let mut cmd = SetFileInputFilesParams::new(validated_paths.clone());
-                cmd.object_id = Some(obj_id.clone());
-                page.execute(cmd)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("file upload failed: {e}")))?;
+                                // Send SetFileInputFiles CDP command.
+                                use chromiumoxide::cdp::browser_protocol::dom::SetFileInputFilesParams;
+                                let mut cmd = SetFileInputFilesParams::new(validated_paths.clone());
+                                cmd.object_id = Some(obj_id.clone());
+                                page.execute(cmd).await.map_err(|e| {
+                                    AppError::Internal(format!("file upload failed: {e}"))
+                                })?;
 
-                Ok(Some(serde_json::json!({
-                    "action": "upload",
-                    "success": true,
-                    "file_count": validated_paths.len(),
-                })))
-            }
-            "wait" => {
-                let timeout_ms = action_input
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(1000)
-                    .min(10_000);
-                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-                Ok(None)
-            }
-            "screenshot" => {
-                let screenshot_bytes = page
+                                Ok(Some(serde_json::json!({
+                                    "action": "upload",
+                                    "success": true,
+                                    "file_count": validated_paths.len(),
+                                })))
+                            }
+                            "wait" => {
+                                let timeout_ms = action_input
+                                    .get("timeout_ms")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(1000)
+                                    .min(10_000);
+                                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                                Ok(None)
+                            }
+                            "screenshot" => {
+                                let screenshot_bytes = page
                     .screenshot(
                         chromiumoxide::page::ScreenshotParams::builder()
                             .format(
@@ -968,112 +1225,148 @@ impl InternalToolHandler for BrowserActHandler {
                     .await
                     .map_err(|e| AppError::Internal(format!("screenshot failed: {e}")))?;
 
-                if screenshot_bytes.len() > MAX_SCREENSHOT_BYTES {
-                    return Err(AppError::Internal(format!(
-                        "screenshot too large: {} bytes (max {})",
-                        screenshot_bytes.len(),
-                        MAX_SCREENSHOT_BYTES
-                    )));
-                }
+                                if screenshot_bytes.len() > MAX_SCREENSHOT_BYTES {
+                                    return Err(AppError::Internal(format!(
+                                        "screenshot too large: {} bytes (max {})",
+                                        screenshot_bytes.len(),
+                                        MAX_SCREENSHOT_BYTES
+                                    )));
+                                }
 
-                let page_url = page
-                    .url()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                let page_title = page
-                    .get_title()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
+                                let page_url = page.url().await.ok().flatten().unwrap_or_default();
+                                let page_title =
+                                    page.get_title().await.ok().flatten().unwrap_or_default();
 
-                use encmind_core::config::ScreenshotPayloadMode;
-                let response = match self.screenshot_mode {
-                    ScreenshotPayloadMode::Metadata => serde_json::json!({
-                        "action": "screenshot",
-                        "success": true,
-                        "page_url": page_url,
-                        "page_title": page_title,
-                        "format": "png",
-                        "size_bytes": screenshot_bytes.len(),
-                        "note": "Screenshot captured successfully. The raw image data is not \
-                                 included in the conversation context to save tokens.",
-                    }),
-                    ScreenshotPayloadMode::Base64Legacy => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&screenshot_bytes);
-                        serde_json::json!({
-                            "action": "screenshot",
-                            "success": true,
-                            "page_url": page_url,
-                            "page_title": page_title,
-                            "format": "png",
-                            "base64": b64,
-                            "size_bytes": screenshot_bytes.len(),
-                        })
+                                use encmind_core::config::ScreenshotPayloadMode;
+                                let response = match self.screenshot_mode {
+                                    ScreenshotPayloadMode::Metadata => serde_json::json!({
+                                        "action": "screenshot",
+                                        "success": true,
+                                        "page_url": page_url,
+                                        "page_title": page_title,
+                                        "format": "png",
+                                        "size_bytes": screenshot_bytes.len(),
+                                        "note": "Screenshot captured successfully. The raw image data is not \
+                                                 included in the conversation context to save tokens.",
+                                    }),
+                                    ScreenshotPayloadMode::Base64Legacy => {
+                                        use base64::Engine;
+                                        let b64 = base64::engine::general_purpose::STANDARD
+                                            .encode(&screenshot_bytes);
+                                        serde_json::json!({
+                                            "action": "screenshot",
+                                            "success": true,
+                                            "page_url": page_url,
+                                            "page_title": page_title,
+                                            "format": "png",
+                                            "base64": b64,
+                                            "size_bytes": screenshot_bytes.len(),
+                                        })
+                                    }
+                                };
+                                Ok(Some(response))
+                            }
+                            "get_text" => {
+                                let text: String = page
+                                    .evaluate("document.body.innerText")
+                                    .await
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("evaluate failed: {e}"))
+                                    })?
+                                    .into_value()
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("value conversion failed: {e}"))
+                                    })?;
+                                let (text, truncated, original_chars) =
+                                    truncate_text(text, MAX_GET_TEXT_CHARS);
+
+                                let page_url = page.url().await.ok().flatten().unwrap_or_default();
+
+                                Ok(Some(serde_json::json!({
+                                    "action": "get_text",
+                                    "success": true,
+                                    "page_url": page_url,
+                                    "text": text,
+                                    "truncated": truncated,
+                                    "original_chars": original_chars,
+                                })))
+                            }
+                            "eval" => {
+                                let script = action_input
+                                    .get("script")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        AppError::Internal(
+                                            "'script' required for eval action".into(),
+                                        )
+                                    })?;
+                                let result: serde_json::Value = page
+                                    .evaluate(script)
+                                    .await
+                                    .map_err(|e| AppError::Internal(format!("eval failed: {e}")))?
+                                    .into_value()
+                                    .map_err(|e| {
+                                        AppError::Internal(format!("value conversion failed: {e}"))
+                                    })?;
+
+                                let page_url = page.url().await.ok().flatten().unwrap_or_default();
+                                Ok(Some(serde_json::json!({
+                                    "action": "eval",
+                                    "success": true,
+                                    "page_url": page_url,
+                                    "result": result,
+                                })))
+                            }
+                            _ => Err(AppError::Internal(format!("unhandled action: {action}"))),
+                        }
+                    },
+                );
+                // Apply per-action timeout.
+                let result = if action_timeout.is_zero() {
+                    firewall_wrapped.await
+                } else {
+                    match tokio::time::timeout(action_timeout, firewall_wrapped).await {
+                        Ok(r) => r,
+                        Err(_elapsed) => {
+                            // Release tainted session — page may be in undefined state.
+                            drop(guard);
+                            return fail_close_on_timeout(
+                                self.metrics.as_ref(),
+                                || self.session_manager.release(session_id.as_str()),
+                                format!(
+                                    "action '{action}' timed out after {}s",
+                                    action_timeout.as_secs()
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 };
-                Ok(Some(response))
-            }
-            "get_text" => {
-                let text: String = page
-                    .evaluate("document.body.innerText")
-                    .await
-                    .map_err(|e| AppError::Internal(format!("evaluate failed: {e}")))?
-                    .into_value()
-                    .map_err(|e| AppError::Internal(format!("value conversion failed: {e}")))?;
-                let (text, truncated, original_chars) = truncate_text(text, MAX_GET_TEXT_CHARS);
-
-                let page_url = page
-                    .url()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-
-                Ok(Some(serde_json::json!({
-                    "action": "get_text",
-                    "success": true,
-                    "page_url": page_url,
-                    "text": text,
-                    "truncated": truncated,
-                    "original_chars": original_chars,
-                })))
-            }
-            "eval" => {
-                let script = action_input
-                    .get("script")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| AppError::Internal("'script' required for eval action".into()))?;
-                let result: serde_json::Value = page
-                    .evaluate(script)
-                    .await
-                    .map_err(|e| AppError::Internal(format!("eval failed: {e}")))?
-                    .into_value()
-                    .map_err(|e| AppError::Internal(format!("value conversion failed: {e}")))?;
-
-                let page_url = page
-                    .url()
-                    .await
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-                Ok(Some(serde_json::json!({
-                    "action": "eval",
-                    "success": true,
-                    "page_url": page_url,
-                    "result": result,
-                })))
-            }
-            _ => {
-                Err(AppError::Internal(format!("unhandled action: {action}")))
-            }
-        }
-            },
-            )
-            .await?
+                match result {
+                    Ok(val) => break val,
+                    Err(e)
+                        if attempt < max_retries
+                            && crate::guardrails::is_action_retryable(action)
+                            && crate::guardrails::RetryPolicy::is_retryable(&e) =>
+                    {
+                        self.metrics
+                            .retry_count
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(
+                            attempt = attempt + 1,
+                            max = max_retries,
+                            action,
+                            error = %e,
+                            "browser action failed; retrying"
+                        );
+                        // Brief backoff to avoid hammering a flaky CDP connection.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        attempt += 1;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            } // end retry loop
         };
 
         // Re-validate current page after action execution to catch click/press/eval-triggered navigation.
@@ -1137,6 +1430,7 @@ pub fn register_browser_tools(
     firewall: Arc<EgressFirewall>,
     screenshot_mode: encmind_core::config::ScreenshotPayloadMode,
 ) -> Result<(), AppError> {
+    let metrics = pool.metrics().clone();
     registry.register_internal(
         "browser_navigate",
         "Navigate to a URL and return the page title",
@@ -1154,6 +1448,7 @@ pub fn register_browser_tools(
             pool.clone(),
             firewall.clone(),
             encmind_core::config::BrowserConfig::default(),
+            metrics.clone(),
         )),
     )?;
 
@@ -1175,6 +1470,7 @@ pub fn register_browser_tools(
             firewall.clone(),
             encmind_core::config::BrowserConfig::default(),
             screenshot_mode,
+            metrics.clone(),
         )),
     )?;
 
@@ -1195,6 +1491,7 @@ pub fn register_browser_tools(
             pool,
             firewall,
             encmind_core::config::BrowserConfig::default(),
+            metrics,
         )),
     )?;
 
@@ -1457,6 +1754,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fail_close_on_timeout_calls_release_and_increments_metric() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let metrics = crate::guardrails::BrowserMetrics::new();
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let err = fail_close_on_timeout::<(), _, _>(
+            &metrics,
+            move || {
+                let called = called_clone.clone();
+                async move {
+                    called.store(true, Ordering::SeqCst);
+                }
+            },
+            "action 'click' timed out after 10s".to_string(),
+        )
+        .await
+        .expect_err("timeout should fail-close with an error");
+
+        assert!(
+            called.load(Ordering::SeqCst),
+            "release callback must be called"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            metrics
+                .timeout_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
     #[test]
     fn key_definition_maps_common_keys() {
         assert!(key_definition("Enter").is_some());
@@ -1474,7 +1809,17 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn browser_act_eval_blocks_network_request_via_firewall() {
-        let pool = Arc::new(BrowserPool::new(1, 30, false).await.unwrap());
+        let pool = Arc::new(
+            BrowserPool::new(
+                1,
+                30,
+                false,
+                Arc::new(crate::guardrails::BrowserMetrics::new()),
+                true,
+            )
+            .await
+            .unwrap(),
+        );
         let manager = SessionBrowserManager::new(pool, Duration::from_secs(60));
         let firewall = Arc::new(EgressFirewall::new(
             &encmind_core::config::EgressFirewallConfig::default(),
@@ -1489,6 +1834,7 @@ mod tests {
             firewall,
             config,
             encmind_core::config::ScreenshotPayloadMode::Metadata,
+            Arc::new(crate::guardrails::BrowserMetrics::new()),
         );
 
         let input = serde_json::json!({
@@ -1508,7 +1854,15 @@ mod tests {
     }
 
     async fn behavior_test_pool() -> Option<Arc<BrowserPool>> {
-        match BrowserPool::new(1, 30, false).await {
+        match BrowserPool::new(
+            1,
+            30,
+            false,
+            Arc::new(crate::guardrails::BrowserMetrics::new()),
+            true,
+        )
+        .await
+        {
             Ok(pool) => Some(Arc::new(pool)),
             Err(err) => {
                 eprintln!("skipping browser behavior test; browser unavailable: {err:?}");

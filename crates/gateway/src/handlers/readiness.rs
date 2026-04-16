@@ -279,9 +279,20 @@ pub async fn collect_readiness(state: &AppState) -> ReadinessReport {
             detail: None,
         }
     } else if state.browser_pool.is_some() {
+        let detail = state.browser_metrics.as_ref().map(|m| {
+            let s = m.snapshot();
+            format!(
+                "actions={}, timeouts={}, retries={}, loops={}, dialogs={}",
+                s.total_actions,
+                s.timeout_count,
+                s.retry_count,
+                s.loop_abort_count,
+                s.dialog_dismissed_count
+            )
+        });
         SubsystemStatus {
             status: ReadinessStatus::Ready,
-            detail: None,
+            detail,
         }
     } else {
         SubsystemStatus {
@@ -506,6 +517,7 @@ mod tests {
             api_usage_store: None,
             channel_account_store: None,
             channel_startup_intent,
+            browser_metrics: None,
         }
     }
 

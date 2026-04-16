@@ -19,6 +19,7 @@ pub struct BrowserPlugin {
     firewall: Arc<EgressFirewall>,
     screenshot_mode: ScreenshotPayloadMode,
     browser_config: encmind_core::config::BrowserConfig,
+    metrics: Arc<crate::guardrails::BrowserMetrics>,
     required: bool,
 }
 
@@ -29,6 +30,7 @@ impl BrowserPlugin {
         firewall: Arc<EgressFirewall>,
         screenshot_mode: ScreenshotPayloadMode,
         browser_config: encmind_core::config::BrowserConfig,
+        metrics: Arc<crate::guardrails::BrowserMetrics>,
         required: bool,
     ) -> Self {
         Self {
@@ -37,6 +39,7 @@ impl BrowserPlugin {
             firewall,
             screenshot_mode,
             browser_config,
+            metrics,
             required,
         }
     }
@@ -78,6 +81,7 @@ impl NativePlugin for BrowserPlugin {
                 self.pool.clone(),
                 self.firewall.clone(),
                 self.browser_config.clone(),
+                self.metrics.clone(),
             )),
         )?;
 
@@ -99,6 +103,7 @@ impl NativePlugin for BrowserPlugin {
                 self.firewall.clone(),
                 self.browser_config.clone(),
                 self.screenshot_mode,
+                self.metrics.clone(),
             )),
         )?;
 
@@ -119,6 +124,7 @@ impl NativePlugin for BrowserPlugin {
                 self.pool.clone(),
                 self.firewall.clone(),
                 self.browser_config.clone(),
+                self.metrics.clone(),
             )),
         )?;
 
@@ -201,6 +207,7 @@ impl NativePlugin for BrowserPlugin {
                 self.firewall.clone(),
                 self.browser_config.clone(),
                 self.screenshot_mode,
+                self.metrics.clone(),
             )),
         )?;
 
