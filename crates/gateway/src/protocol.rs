@@ -73,6 +73,8 @@ pub const ERR_LOCKDOWN: i32 = 4003;
 pub const ERR_RATE_LIMITED: i32 = 4004;
 pub const ERR_INVALID_PARAMS: i32 = 4005;
 pub const ERR_SHUTTING_DOWN: i32 = 4006;
+pub const ERR_NOT_FOUND: i32 = 4404;
+pub const ERR_NOT_IMPLEMENTED: i32 = 4501;
 pub const ERR_INTERNAL: i32 = 5000;
 
 #[cfg(test)]

@@ -518,8 +518,19 @@ pub(crate) fn is_method_allowed_with_plugin(
                 permissions.chat
             }
         }
-        "chat.history" | "chat.abort" | "sessions.list" | "sessions.create" | "sessions.delete"
-        | "sessions.rename" | "models.list" | "nodes.list" | "memory.status" | "memory.search"
+        "chat.history"
+        | "chat.abort"
+        | "sessions.list"
+        | "sessions.create"
+        | "sessions.delete"
+        | "sessions.rename"
+        | "sessions.tag_add"
+        | "sessions.tag_remove"
+        | "sessions.tags"
+        | "models.list"
+        | "nodes.list"
+        | "memory.status"
+        | "memory.search"
         | "channels.list" => permissions.chat,
         "nodes.invoke" => params
             .get("command")
@@ -563,7 +574,10 @@ pub(crate) fn is_method_allowed_with_plugin(
         | "channels.add"
         | "channels.remove"
         | "channels.login"
-        | "channels.logout" => is_admin(permissions),
+        | "channels.logout"
+        | "sessions.archive"
+        | "sessions.unarchive"
+        | "sessions.export" => is_admin(permissions),
         _ => plugin_manager
             .map(|pm| pm.has_method(method) && is_admin(permissions))
             .unwrap_or(false),
@@ -1301,5 +1315,45 @@ mod tests {
         assert!(is_method_allowed("channels.login", &params, &admin_user));
         assert!(!is_method_allowed("channels.logout", &params, &chat_user));
         assert!(is_method_allowed("channels.logout", &params, &admin_user));
+    }
+
+    #[test]
+    fn session_lifecycle_permissions() {
+        let chat_user = DevicePermissions {
+            chat: true,
+            admin: false,
+            ..Default::default()
+        };
+        let admin_user = DevicePermissions {
+            chat: true,
+            admin: true,
+            ..Default::default()
+        };
+        let params = serde_json::json!({});
+
+        // chat-level: tag operations
+        assert!(is_method_allowed("sessions.tag_add", &params, &chat_user));
+        assert!(is_method_allowed(
+            "sessions.tag_remove",
+            &params,
+            &chat_user
+        ));
+        assert!(is_method_allowed("sessions.tags", &params, &chat_user));
+
+        // admin-only: archive, unarchive, export
+        assert!(!is_method_allowed("sessions.archive", &params, &chat_user));
+        assert!(is_method_allowed("sessions.archive", &params, &admin_user));
+        assert!(!is_method_allowed(
+            "sessions.unarchive",
+            &params,
+            &chat_user
+        ));
+        assert!(is_method_allowed(
+            "sessions.unarchive",
+            &params,
+            &admin_user
+        ));
+        assert!(!is_method_allowed("sessions.export", &params, &chat_user));
+        assert!(is_method_allowed("sessions.export", &params, &admin_user));
     }
 }

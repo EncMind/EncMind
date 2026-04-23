@@ -352,6 +352,29 @@ pub struct Session {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub archived: bool,
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+/// Full session export including decrypted messages.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionExport {
+    pub session: Session,
+    pub messages: Vec<ExportedMessage>,
+    /// True if the export was truncated due to message count limits.
+    pub truncated: bool,
+    /// Total message count in the session (may exceed messages.len() if truncated).
+    pub total_messages: u64,
+}
+
+/// A single message in an exported session.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExportedMessage {
+    pub id: String,
+    pub role: Role,
+    pub content: Vec<ContentBlock>,
+    pub created_at: DateTime<Utc>,
+    pub token_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
