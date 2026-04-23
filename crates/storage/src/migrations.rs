@@ -49,6 +49,10 @@ pub fn run_migrations(conn: &Connection) -> Result<(), StorageError> {
         migrate_v10(conn)?;
     }
 
+    if version < 11 {
+        migrate_v11(conn)?;
+    }
+
     Ok(())
 }
 
@@ -460,6 +464,31 @@ fn migrate_v10(conn: &Connection) -> Result<(), StorageError> {
         .map_err(|e| StorageError::MigrationFailed(format!("v10 transaction commit failed: {e}")))
 }
 
+fn migrate_v11(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| StorageError::MigrationFailed(format!("v11 transaction start failed: {e}")))?;
+
+    tx.execute_batch(V11_SCHEMA)
+        .map_err(|e| StorageError::MigrationFailed(format!("v11 migration failed: {e}")))?;
+
+    tx.pragma_update(None, "user_version", 11u32)
+        .map_err(|e| StorageError::MigrationFailed(format!("v11 version update failed: {e}")))?;
+
+    tx.commit()
+        .map_err(|e| StorageError::MigrationFailed(format!("v11 transaction commit failed: {e}")))
+}
+
+const V11_SCHEMA: &str = r#"
+-- Session tags: junction table for per-session tagging.
+CREATE TABLE IF NOT EXISTS session_tags (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    tag        TEXT NOT NULL,
+    PRIMARY KEY (session_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_session_tags_tag ON session_tags(tag);
+"#;
+
 const V10_SCHEMA: &str = r#"
 -- Computed dollar cost for this turn. NULL when the model isn't in
 -- the pricing table. Computed at persist time from a static model
@@ -559,7 +588,7 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    const CURRENT_VERSION: u32 = 10;
+    const CURRENT_VERSION: u32 = 11;
 
     #[test]
     fn migration_creates_all_tables() {
@@ -582,6 +611,7 @@ mod tests {
             "key_versions",
             "workflow_runs",
             "timeline_events",
+            "session_tags",
             "skill_kv",
             "skill_timers",
             "skill_toggle_state",

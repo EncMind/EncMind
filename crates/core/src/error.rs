@@ -66,6 +66,12 @@ pub enum StorageError {
 
     #[error("environment variable error: {0}")]
     EnvVar(#[from] std::env::VarError),
+
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
+    #[error("validation failed: {0}")]
+    ValidationFailed(String),
 }
 
 /// TEE-related errors.

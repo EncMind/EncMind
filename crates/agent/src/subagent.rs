@@ -166,6 +166,11 @@ impl InternalToolHandler for SpawnAgentHandler {
                 .inject_browser_safety_rules = guard.token_optimization.inject_browser_safety_rules;
             sub_runtime_config.context_config.inject_coordinator_mode =
                 guard.token_optimization.inject_coordinator_mode;
+            // Brief mode: read from live config. Per-channel and per-request
+            // overrides cannot propagate to subagents because the subagent
+            // runs on its own session (channel="subagent"). The global
+            // brief_mode setting is the only knob that applies here.
+            sub_runtime_config.context_config.brief_mode = guard.token_optimization.brief_mode;
             // Capture the local-bash enablement alongside bash_mode so the
             // nested runtime's approval checker matches the top-level
             // behavior set in gateway_approval_policy(). Without this, a

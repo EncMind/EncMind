@@ -149,6 +149,24 @@ impl AppConfig {
                     "token_optimization.per_channel_max_output_tokens['{channel}'] must be > 0"
                 ));
             }
+            if *channel != channel.to_ascii_lowercase() {
+                errors.push(format!(
+                    "token_optimization.per_channel_max_output_tokens['{channel}']: channel key must be lowercase"
+                ));
+            }
+        }
+        for channel in self.token_optimization.per_channel_brief_mode.keys() {
+            if channel.trim().is_empty() {
+                errors.push(
+                    "token_optimization.per_channel_brief_mode: channel key must not be empty"
+                        .to_string(),
+                );
+            }
+            if *channel != channel.to_ascii_lowercase() {
+                errors.push(format!(
+                    "token_optimization.per_channel_brief_mode['{channel}']: channel key must be lowercase"
+                ));
+            }
         }
 
         if self.security.blocking_tool_cancel_grace_secs == 0 {
@@ -2283,6 +2301,15 @@ pub struct TokenOptimizationConfig {
     /// ```
     #[serde(default)]
     pub per_channel_max_output_tokens: HashMap<String, u32>,
+    /// Enable brief mode globally (default false). Brief mode injects
+    /// ultra-concise output constraints into the system prompt.
+    #[serde(default)]
+    pub brief_mode: bool,
+    /// Per-channel brief mode overrides. Channels listed here default to
+    /// brief mode regardless of the global setting.
+    /// Example: `{ "telegram": true, "slack": true, "cron": true }`
+    #[serde(default)]
+    pub per_channel_brief_mode: HashMap<String, bool>,
 }
 
 fn default_max_tool_iterations() -> u32 {
@@ -2309,6 +2336,8 @@ impl Default for TokenOptimizationConfig {
             inject_browser_safety_rules: true,
             inject_coordinator_mode: true,
             per_channel_max_output_tokens: HashMap::new(),
+            brief_mode: false,
+            per_channel_brief_mode: HashMap::new(),
         }
     }
 }
@@ -3830,6 +3859,74 @@ plugin_policy:
             "expected empty channel key validation error, got: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn validate_rejects_mixed_case_per_channel_keys() {
+        let mut config = valid_config();
+        config
+            .token_optimization
+            .per_channel_max_output_tokens
+            .insert("Telegram".to_string(), 2048);
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("channel key must be lowercase")),
+            "expected lowercase validation error for output tokens, got: {errors:?}"
+        );
+
+        let mut config2 = valid_config();
+        config2
+            .token_optimization
+            .per_channel_brief_mode
+            .insert("Slack".to_string(), true);
+        let errors = config2.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("channel key must be lowercase")),
+            "expected lowercase validation error for brief mode, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_per_channel_brief_mode_key() {
+        let mut config = valid_config();
+        config
+            .token_optimization
+            .per_channel_brief_mode
+            .insert("".to_string(), true);
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("per_channel_brief_mode") && e.contains("must not be empty")),
+            "expected empty key validation error, got: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn brief_mode_config_defaults() {
+        let config = TokenOptimizationConfig::default();
+        assert!(!config.brief_mode);
+        assert!(config.per_channel_brief_mode.is_empty());
+    }
+
+    #[test]
+    fn brief_mode_serde_roundtrip() {
+        let config = TokenOptimizationConfig {
+            brief_mode: true,
+            per_channel_brief_mode: [("telegram".to_string(), true), ("slack".to_string(), false)]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: TokenOptimizationConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.brief_mode);
+        assert_eq!(back.per_channel_brief_mode.get("telegram"), Some(&true));
+        assert_eq!(back.per_channel_brief_mode.get("slack"), Some(&false));
     }
 
     #[test]

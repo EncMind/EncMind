@@ -44,6 +44,10 @@ pub struct ContextConfig {
     /// trivial tasks, don't spawn workers to check each other).
     /// Default: true.
     pub inject_coordinator_mode: bool,
+    /// Enable brief mode — injects ultra-concise output constraints.
+    /// Resolved per-request from global config, per-channel overrides,
+    /// and request params.
+    pub brief_mode: bool,
 }
 
 impl Default for ContextConfig {
@@ -60,6 +64,7 @@ impl Default for ContextConfig {
             inject_tool_usage_grammar: true,
             inject_browser_safety_rules: true,
             inject_coordinator_mode: true,
+            brief_mode: false,
         }
     }
 }
@@ -67,16 +72,36 @@ impl Default for ContextConfig {
 /// Behavioral governance rules — codified to prevent common LLM failure modes.
 /// These are general AI assistant rules, not coding-specific.
 const BEHAVIORAL_GOVERNANCE: &str = "
-## Behavioral guidelines
+## Core behavior
 
 - Do exactly what was asked. No scope creep.
 - Read context before acting.
 - Report results honestly. Never fabricate tool output.
 - If unsure, ask instead of guessing.
 - If something fails, diagnose root cause before retrying.
-- Be concise. No filler.
 - Do not give time estimates unless asked.
-- Stop when the task is complete.";
+- Stop when the task is complete.
+
+## Output efficiency
+
+- Lead with the answer or action, not the reasoning.
+- Skip filler words, preamble, and unnecessary transitions.
+- Do not restate what the user said — just respond.
+- If you can say it in one sentence, don't use three.
+- Between tool calls, keep text to 25 words or fewer — or omit it entirely.
+- When explaining, include only what is necessary for the user to understand.";
+
+/// Brief mode constraints — injected when brief_mode is enabled.
+/// Produces ultra-concise output for messaging channels.
+const BRIEF_MODE: &str = "
+## Brief mode
+
+You are in brief mode. Responses must be extremely concise:
+- Maximum 2-3 sentences for simple answers.
+- Use bullet points, not paragraphs.
+- Omit pleasantries, transitions, and summaries.
+- For tool results, report only the outcome — not what you did or why.
+- If a one-word answer suffices, use it.";
 
 /// Coordinator-mode guidance — injected when the agent can spawn sub-agents.
 /// Prevents common multi-agent anti-patterns: trivial delegation, checker-on-checker
@@ -351,6 +376,11 @@ impl ContextManager {
         // of worker output.
         if self.config.inject_coordinator_mode && has_agents_spawn_tool(available_tools) {
             text.push_str(COORDINATOR_MODE);
+        }
+
+        // Brief mode — ultra-concise output for messaging channels.
+        if self.config.brief_mode {
+            text.push_str(BRIEF_MODE);
         }
 
         if let Some(channel_label) = self
@@ -693,7 +723,7 @@ mod tests {
         match &msg.content[0] {
             ContentBlock::Text { text } => {
                 assert!(text.starts_with("You are a test assistant."));
-                assert!(text.contains("Behavioral guidelines"));
+                assert!(text.contains("Core behavior"));
                 assert!(text.contains("Report results honestly"));
                 assert!(text.contains("Tool usage"));
                 assert!(text.contains("file_read"));
@@ -715,7 +745,7 @@ mod tests {
         let msg = cm.build_system_message(&agent);
         match &msg.content[0] {
             ContentBlock::Text { text } => {
-                assert!(!text.contains("Behavioral guidelines"));
+                assert!(!text.contains("Core behavior"));
                 assert!(!text.contains("Tool usage"));
             }
             _ => panic!("expected Text"),
@@ -800,7 +830,7 @@ mod tests {
             ContentBlock::Text { text } => {
                 assert!(!text.contains("Tool usage"));
                 // Behavioral guidelines still present.
-                assert!(text.contains("Behavioral guidelines"));
+                assert!(text.contains("Core behavior"));
             }
             _ => panic!("expected Text"),
         }
@@ -819,7 +849,7 @@ mod tests {
         let msg = cm.build_system_message_with_tools(&agent, &["file_read".to_string()]);
         match &msg.content[0] {
             ContentBlock::Text { text } => {
-                assert!(!text.contains("Behavioral guidelines"));
+                assert!(!text.contains("Core behavior"));
                 assert!(text.contains("Tool usage"));
             }
             _ => panic!("expected Text"),
@@ -1713,6 +1743,89 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ── Output efficiency + brief mode ────────────────────────
+
+    #[test]
+    fn output_efficiency_injected_with_governance() {
+        let cm = ContextManager::new(ContextConfig::default());
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(&agent, &[]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    text.contains("Output efficiency"),
+                    "governance enabled should include output efficiency section"
+                );
+                assert!(
+                    text.contains("Lead with the answer"),
+                    "should include length anchors"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn output_efficiency_omitted_without_governance() {
+        let cm = ContextManager::new(ContextConfig {
+            inject_behavioral_governance: false,
+            ..Default::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(&agent, &[]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    !text.contains("Output efficiency"),
+                    "governance disabled should omit output efficiency"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn brief_mode_section_injected_when_enabled() {
+        let cm = ContextManager::new(ContextConfig {
+            brief_mode: true,
+            ..Default::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(&agent, &[]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    text.contains("Brief mode"),
+                    "brief_mode=true should inject brief mode section"
+                );
+                assert!(
+                    text.contains("Maximum 2-3 sentences"),
+                    "brief section should include length constraint"
+                );
+            }
+            _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn brief_mode_section_omitted_when_disabled() {
+        let cm = ContextManager::new(ContextConfig {
+            brief_mode: false,
+            ..Default::default()
+        });
+        let agent = default_agent();
+        let msg = cm.build_system_message_with_tools(&agent, &[]);
+        match &msg.content[0] {
+            ContentBlock::Text { text } => {
+                assert!(
+                    !text.contains("Brief mode"),
+                    "brief_mode=false should not inject brief mode section"
+                );
+            }
+            _ => panic!("expected Text"),
         }
     }
 }

@@ -4200,6 +4200,7 @@ pub(crate) fn initialize_tool_registry(
                 inject_tool_usage_grammar: config.token_optimization.inject_tool_usage_grammar,
                 inject_browser_safety_rules: config.token_optimization.inject_browser_safety_rules,
                 inject_coordinator_mode: config.token_optimization.inject_coordinator_mode,
+                brief_mode: config.token_optimization.brief_mode,
                 ..ContextConfig::default()
             },
             tool_calls_per_run: Some(config.security.rate_limit.tool_calls_per_run),

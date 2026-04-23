@@ -126,6 +126,24 @@ pub trait SessionStore: Send + Sync {
         session_id: &SessionId,
         keep_last: usize,
     ) -> Result<(), StorageError>;
+    async fn archive_session(&self, _id: &SessionId) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported("archive_session".into()))
+    }
+    async fn unarchive_session(&self, _id: &SessionId) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported("unarchive_session".into()))
+    }
+    async fn add_session_tag(&self, _id: &SessionId, _tag: &str) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported("add_session_tag".into()))
+    }
+    async fn remove_session_tag(&self, _id: &SessionId, _tag: &str) -> Result<(), StorageError> {
+        Err(StorageError::NotSupported("remove_session_tag".into()))
+    }
+    async fn get_session_tags(&self, _id: &SessionId) -> Result<Vec<String>, StorageError> {
+        Err(StorageError::NotSupported("get_session_tags".into()))
+    }
+    async fn export_session(&self, _id: &SessionId) -> Result<SessionExport, StorageError> {
+        Err(StorageError::NotSupported("export_session".into()))
+    }
 }
 
 #[async_trait]

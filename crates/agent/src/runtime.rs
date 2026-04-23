@@ -3204,6 +3204,7 @@ pub(crate) mod test_helpers {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 archived: false,
+                tags: vec![],
             };
             self.sessions
                 .lock()
@@ -3228,6 +3229,7 @@ pub(crate) mod test_helpers {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 archived: false,
+                tags: vec![],
             };
             self.sessions
                 .lock()

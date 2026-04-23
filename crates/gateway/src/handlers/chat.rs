@@ -481,9 +481,10 @@ pub async fn handle_send_with_class(
     // Missing ceilings are ignored by the fold. The result is always
     // `<= default`, so operators retain the absolute upper bound.
     let default_output_tokens = ContextConfig::default().reserved_output_tokens;
+    let channel_lower = channel.to_ascii_lowercase();
     let channel_output_override = tok_config
         .per_channel_max_output_tokens
-        .get(channel.as_str())
+        .get(channel_lower.as_str())
         .copied();
     let reserved_output_tokens = [
         Some(default_output_tokens),
@@ -494,6 +495,25 @@ pub async fn handle_send_with_class(
     .flatten()
     .min()
     .unwrap_or(default_output_tokens);
+
+    // Resolve brief mode: request param > per-channel override > global default.
+    let brief_mode = if let Some(raw) = params.get("brief_mode") {
+        match raw.as_bool() {
+            Some(b) => b,
+            None => {
+                return ServerMessage::Error {
+                    id: Some(req_id.to_string()),
+                    error: ErrorPayload::new(ERR_INVALID_PARAMS, "brief_mode must be a boolean"),
+                };
+            }
+        }
+    } else {
+        tok_config
+            .per_channel_brief_mode
+            .get(channel_lower.as_str())
+            .copied()
+            .unwrap_or(tok_config.brief_mode)
+    };
 
     let runtime_config = RuntimeConfig {
         enforce_session_agent_match: true,
@@ -513,6 +533,7 @@ pub async fn handle_send_with_class(
             inject_tool_usage_grammar: tok_config.inject_tool_usage_grammar,
             inject_browser_safety_rules: tok_config.inject_browser_safety_rules,
             inject_coordinator_mode: tok_config.inject_coordinator_mode,
+            brief_mode,
             reserved_output_tokens,
             ..ContextConfig::default()
         },
