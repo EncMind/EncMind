@@ -16,7 +16,7 @@ use encmind_core::error::{AppError, LlmError, PluginError};
 use encmind_core::hooks::{HookContext, HookPoint, HookRegistry, HookResult};
 use encmind_core::traits::{
     ApprovalHandler, CompletionParams, FinishReason, LlmBackend, MemorySearchProvider,
-    SessionStore, ToolInterruptBehavior,
+    SessionStore, ThinkingConfig, ToolInterruptBehavior,
 };
 use encmind_core::types::*;
 
@@ -607,9 +607,27 @@ impl AgentRuntime {
             total_tokens = total_tokens.saturating_add(prompt_tokens);
 
             // 2c. Call LLM
+            // Resolve thinking: enabled in config AND supported by backend.
+            // Gate thinking on model capability. In multi-provider fallback
+            // mode, this checks the primary provider — if the request fails
+            // over to a different backend, thinking may be silently dropped
+            // by the fallback provider. This is acceptable: thinking is
+            // best-effort, and the fallback provider ignores unknown params.
+            let thinking = if self.context_manager.config().thinking_enabled
+                && self.llm.model_info().supports_thinking
+            {
+                Some(ThinkingConfig {
+                    enabled: true,
+                    budget_tokens: self.context_manager.config().thinking_budget_tokens,
+                })
+            } else {
+                None
+            };
+
             let params = CompletionParams {
                 model: agent_config.model.clone(),
                 max_tokens: max_output,
+                thinking,
                 tools: available_tools
                     .iter()
                     .filter_map(|name| self.tool_registry.tool_definition(name))
@@ -6713,5 +6731,66 @@ mod tests {
             is_error,
             "blocking tool timeout should fail-close with an error result"
         );
+    }
+
+    // ── Thinking resolution ──────────────────────────────────
+
+    #[test]
+    fn thinking_config_present_when_enabled_and_supported() {
+        let thinking_enabled = true;
+        let supports_thinking = true;
+        let budget = 15_000u32;
+
+        let thinking = if thinking_enabled && supports_thinking {
+            Some(ThinkingConfig {
+                enabled: true,
+                budget_tokens: budget,
+            })
+        } else {
+            None
+        };
+
+        assert!(thinking.is_some());
+        let tc = thinking.unwrap();
+        assert!(tc.enabled);
+        assert_eq!(tc.budget_tokens, 15_000);
+    }
+
+    #[test]
+    fn thinking_config_absent_when_backend_does_not_support() {
+        let thinking_enabled = true;
+        let supports_thinking = false;
+        let budget = 15_000u32;
+
+        let thinking = if thinking_enabled && supports_thinking {
+            Some(ThinkingConfig {
+                enabled: true,
+                budget_tokens: budget,
+            })
+        } else {
+            None
+        };
+
+        assert!(
+            thinking.is_none(),
+            "backend without thinking support should produce None"
+        );
+    }
+
+    #[test]
+    fn thinking_config_absent_when_disabled() {
+        let thinking_enabled = false;
+        let supports_thinking = true;
+
+        let thinking = if thinking_enabled && supports_thinking {
+            Some(ThinkingConfig {
+                enabled: true,
+                budget_tokens: 10_000,
+            })
+        } else {
+            None
+        };
+
+        assert!(thinking.is_none(), "disabled thinking should produce None");
     }
 }

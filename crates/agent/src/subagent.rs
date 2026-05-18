@@ -171,6 +171,9 @@ impl InternalToolHandler for SpawnAgentHandler {
             // runs on its own session (channel="subagent"). The global
             // brief_mode setting is the only knob that applies here.
             sub_runtime_config.context_config.brief_mode = guard.token_optimization.brief_mode;
+            // Thinking: inherit from live global config (same rationale as brief_mode).
+            sub_runtime_config.context_config.thinking_enabled = guard.thinking.enabled;
+            sub_runtime_config.context_config.thinking_budget_tokens = guard.thinking.budget_tokens;
             // Capture the local-bash enablement alongside bash_mode so the
             // nested runtime's approval checker matches the top-level
             // behavior set in gateway_approval_policy(). Without this, a

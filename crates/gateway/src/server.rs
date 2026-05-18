@@ -4201,6 +4201,8 @@ pub(crate) fn initialize_tool_registry(
                 inject_browser_safety_rules: config.token_optimization.inject_browser_safety_rules,
                 inject_coordinator_mode: config.token_optimization.inject_coordinator_mode,
                 brief_mode: config.token_optimization.brief_mode,
+                thinking_enabled: config.thinking.enabled,
+                thinking_budget_tokens: config.thinking.budget_tokens,
                 ..ContextConfig::default()
             },
             tool_calls_per_run: Some(config.security.rate_limit.tool_calls_per_run),

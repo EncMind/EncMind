@@ -46,6 +46,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub token_optimization: TokenOptimizationConfig,
     #[serde(default)]
+    pub thinking: ThinkingPolicyConfig,
+    #[serde(default)]
     pub plugin_policy: PluginPolicyConfig,
     #[serde(default)]
     pub skill_error_policy: SkillErrorPolicy,
@@ -165,6 +167,33 @@ impl AppConfig {
             if *channel != channel.to_ascii_lowercase() {
                 errors.push(format!(
                     "token_optimization.per_channel_brief_mode['{channel}']: channel key must be lowercase"
+                ));
+            }
+        }
+
+        // Thinking policy validation.
+        if self.thinking.budget_tokens == 0 {
+            errors.push("thinking.budget_tokens must be > 0".to_string());
+        }
+        if self.thinking.max_budget_tokens == 0 {
+            errors.push("thinking.max_budget_tokens must be > 0".to_string());
+        }
+        if self.thinking.budget_tokens > self.thinking.max_budget_tokens {
+            errors.push(format!(
+                "thinking.budget_tokens ({}) must be <= thinking.max_budget_tokens ({})",
+                self.thinking.budget_tokens, self.thinking.max_budget_tokens
+            ));
+        }
+        if self.thinking.max_budget_tokens > 200_000 {
+            errors.push("thinking.max_budget_tokens must be <= 200000".to_string());
+        }
+        for channel in self.thinking.per_channel.keys() {
+            if channel.trim().is_empty() {
+                errors.push("thinking.per_channel: channel key must not be empty".to_string());
+            }
+            if *channel != channel.to_ascii_lowercase() {
+                errors.push(format!(
+                    "thinking.per_channel['{channel}']: channel key must be lowercase"
                 ));
             }
         }
@@ -2342,6 +2371,44 @@ impl Default for TokenOptimizationConfig {
     }
 }
 
+// ── Thinking Policy ──────────────────────────────────────────────
+
+/// Controls extended thinking (chain-of-thought) for supported models.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ThinkingPolicyConfig {
+    /// Enable thinking globally (default false — opt-in).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Default thinking token budget when enabled. Default: 10000.
+    #[serde(default = "default_thinking_budget")]
+    pub budget_tokens: u32,
+    /// Maximum allowed thinking budget (hard cap, prevents cost spikes). Default: 50000.
+    #[serde(default = "default_max_thinking_budget")]
+    pub max_budget_tokens: u32,
+    /// Per-channel thinking overrides. Example: `{ "web": true, "cron": false }`.
+    #[serde(default)]
+    pub per_channel: HashMap<String, bool>,
+}
+
+fn default_thinking_budget() -> u32 {
+    10_000
+}
+
+fn default_max_thinking_budget() -> u32 {
+    50_000
+}
+
+impl Default for ThinkingPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            budget_tokens: default_thinking_budget(),
+            max_budget_tokens: default_max_thinking_budget(),
+            per_channel: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScreenshotPayloadMode {
@@ -3927,6 +3994,100 @@ plugin_policy:
         assert!(back.brief_mode);
         assert_eq!(back.per_channel_brief_mode.get("telegram"), Some(&true));
         assert_eq!(back.per_channel_brief_mode.get("slack"), Some(&false));
+    }
+
+    #[test]
+    fn thinking_policy_defaults() {
+        let config = ThinkingPolicyConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.budget_tokens, 10_000);
+        assert_eq!(config.max_budget_tokens, 50_000);
+        assert!(config.per_channel.is_empty());
+    }
+
+    #[test]
+    fn thinking_policy_serde_roundtrip() {
+        let config = ThinkingPolicyConfig {
+            enabled: true,
+            budget_tokens: 20_000,
+            max_budget_tokens: 80_000,
+            per_channel: [("web".to_string(), true), ("cron".to_string(), false)]
+                .into_iter()
+                .collect(),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let back: ThinkingPolicyConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.enabled);
+        assert_eq!(back.budget_tokens, 20_000);
+        assert_eq!(back.max_budget_tokens, 80_000);
+        assert_eq!(back.per_channel.get("web"), Some(&true));
+        assert_eq!(back.per_channel.get("cron"), Some(&false));
+    }
+
+    #[test]
+    fn validate_rejects_thinking_budget_exceeds_max() {
+        let mut config = valid_config();
+        config.thinking.budget_tokens = 60_000;
+        config.thinking.max_budget_tokens = 50_000;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("thinking.budget_tokens") && e.contains("<=")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_thinking_max_too_large() {
+        let mut config = valid_config();
+        config.thinking.max_budget_tokens = 300_000;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("thinking.max_budget_tokens") && e.contains("200000")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_thinking_mixed_case_channel() {
+        let mut config = valid_config();
+        config.thinking.per_channel.insert("Web".to_string(), true);
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("thinking.per_channel") && e.contains("lowercase")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_thinking_budget() {
+        let mut config = valid_config();
+        config.thinking.budget_tokens = 0;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("thinking.budget_tokens must be > 0")),
+            "errors={errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_zero_thinking_max_budget() {
+        let mut config = valid_config();
+        config.thinking.max_budget_tokens = 0;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("thinking.max_budget_tokens must be > 0")),
+            "errors={errors:?}"
+        );
     }
 
     #[test]

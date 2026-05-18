@@ -48,6 +48,10 @@ pub struct ContextConfig {
     /// Resolved per-request from global config, per-channel overrides,
     /// and request params.
     pub brief_mode: bool,
+    /// Enable extended thinking for supported models.
+    pub thinking_enabled: bool,
+    /// Thinking token budget (capped by config max_budget_tokens).
+    pub thinking_budget_tokens: u32,
 }
 
 impl Default for ContextConfig {
@@ -65,6 +69,8 @@ impl Default for ContextConfig {
             inject_browser_safety_rules: true,
             inject_coordinator_mode: true,
             brief_mode: false,
+            thinking_enabled: false,
+            thinking_budget_tokens: 10_000,
         }
     }
 }
@@ -315,6 +321,11 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
+    /// Access the context configuration.
+    pub fn config(&self) -> &ContextConfig {
+        &self.config
+    }
+
     pub fn new(config: ContextConfig) -> Self {
         Self {
             config,
