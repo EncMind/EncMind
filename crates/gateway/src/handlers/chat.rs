@@ -437,6 +437,7 @@ pub async fn handle_send_with_class(
         max_context_memories,
         api_provider_disclosure,
         tok_config,
+        thinking_policy,
         bash_mode,
         local_bash_effectively_enabled,
         workspace_trust,
@@ -455,6 +456,7 @@ pub async fn handle_send_with_class(
             config.memory.max_context_memories,
             disclosure,
             config.token_optimization.clone(),
+            config.thinking.clone(),
             config.security.bash_mode.clone(),
             config.security.local_bash_effectively_enabled(),
             config.security.workspace_trust.clone(),
@@ -515,6 +517,51 @@ pub async fn handle_send_with_class(
             .unwrap_or(tok_config.brief_mode)
     };
 
+    // Resolve thinking: request param > per-channel > global default.
+    let thinking_enabled = if let Some(raw) = params.get("thinking") {
+        match raw.as_bool() {
+            Some(b) => b,
+            None => {
+                return ServerMessage::Error {
+                    id: Some(req_id.to_string()),
+                    error: ErrorPayload::new(ERR_INVALID_PARAMS, "thinking must be a boolean"),
+                };
+            }
+        }
+    } else {
+        thinking_policy
+            .per_channel
+            .get(channel_lower.as_str())
+            .copied()
+            .unwrap_or(thinking_policy.enabled)
+    };
+
+    // Budget: request override (capped at max) or config default.
+    // Unlike max_output_tokens (which errors on oversized values), thinking
+    // budget silently clamps to max_budget_tokens — thinking is best-effort
+    // and the budget is an upper bound, not a billing guarantee.
+    let thinking_budget = if let Some(raw) = params.get("thinking_budget") {
+        let Some(v) = raw.as_u64() else {
+            return ServerMessage::Error {
+                id: Some(req_id.to_string()),
+                error: ErrorPayload::new(
+                    ERR_INVALID_PARAMS,
+                    "thinking_budget must be a positive integer",
+                ),
+            };
+        };
+        let v32 = u32::try_from(v).unwrap_or(u32::MAX);
+        if v32 == 0 {
+            return ServerMessage::Error {
+                id: Some(req_id.to_string()),
+                error: ErrorPayload::new(ERR_INVALID_PARAMS, "thinking_budget must be > 0"),
+            };
+        }
+        v32.min(thinking_policy.max_budget_tokens)
+    } else {
+        thinking_policy.budget_tokens
+    };
+
     let runtime_config = RuntimeConfig {
         enforce_session_agent_match: true,
         max_tool_iterations: tok_config.max_tool_iterations,
@@ -534,6 +581,8 @@ pub async fn handle_send_with_class(
             inject_browser_safety_rules: tok_config.inject_browser_safety_rules,
             inject_coordinator_mode: tok_config.inject_coordinator_mode,
             brief_mode,
+            thinking_enabled,
+            thinking_budget_tokens: thinking_budget,
             reserved_output_tokens,
             ..ContextConfig::default()
         },
